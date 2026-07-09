@@ -329,7 +329,8 @@ impl Parser {
         self.parse_postfix()
     }
 
-    /// 後置 `++`/`--`、TS の `as`/`satisfies`/`!` の連鎖。
+    /// 後置 `++`/`--`、TS の `as`/`satisfies` の連鎖（`!` 非 null アサーションは
+    /// `parse_call_member` 側で処理し、その後に続くメンバアクセスも読み進める）。
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
         let mut expr = self.parse_call_member()?;
@@ -365,11 +366,6 @@ impl Parser {
                 self.bump();
                 self.skip_type()?;
                 expr = self.mk_expr(start, ExprKind::TsAs(Box::new(expr)));
-                continue;
-            }
-            if self.is_punct(Punct::Bang) {
-                self.bump();
-                expr = self.mk_expr(start, ExprKind::TsNonNull(Box::new(expr)));
                 continue;
             }
             break;
@@ -469,6 +465,11 @@ impl Parser {
                     self.restore(mark);
                     break;
                 }
+            } else if self.is_punct(Punct::Bang) {
+                // 非 null アサーション `expr!`。後続の `.`/`[]`/`()` 連鎖も
+                // このループでそのまま読み進められるようにここで処理する。
+                self.bump();
+                expr = self.mk_expr(start, ExprKind::TsNonNull(Box::new(expr)));
             } else {
                 break;
             }
@@ -477,6 +478,11 @@ impl Parser {
     }
 
     fn parse_member_name(&mut self) -> PResult<String> {
+        if self.eat_punct(Punct::Hash) {
+            // プライベートフィールドアクセス `this.#x`。
+            let name = self.parse_binding_ident()?;
+            return Ok(format!("#{name}"));
+        }
         match self.ident_name() {
             Some(s) => {
                 self.bump();
