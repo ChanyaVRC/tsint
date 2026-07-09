@@ -108,6 +108,15 @@ pub enum PumpState {
     Waiting,
 }
 
+/// `Vm::start_module_task` の結果（T5: モジュールシステム）。
+#[derive(Debug)]
+pub enum ModuleTaskState {
+    /// トップレベル評価が（トップレベル await も含めて）完全に解決した。
+    Settled(Vec<(Rc<str>, Value)>),
+    /// ホスト Promise 待ちのまま中断された。
+    Pending,
+}
+
 /// ホストが後から解決/棄却できる Promise のハンドル
 /// （`Interpreter::register_native_async` 参照）。
 pub struct HostPromise {
@@ -203,13 +212,30 @@ impl Vm {
     /// モジュール実行には `Vm::run_event_loop` を直接使うこと。T5 で
     /// Noiria 統合する際はこちらの経路を使う想定）。
     pub fn run_module(&mut self, chunk: Rc<Chunk>) -> Result<Vec<(Rc<str>, Value)>, Value> {
+        match self.start_module_task(chunk)? {
+            ModuleTaskState::Settled(exports) => Ok(exports),
+            ModuleTaskState::Pending => Err(self.type_error(
+                "トップレベル await が解決しませんでした（保留中のホスト Promise があります。\
+                 run_module は同期 API のため続行できません — run_event_loop を使ってください）",
+            )),
+        }
+    }
+
+    /// `run_module` の下請け。モジュールのトップレベルチャンクをひとつの
+    /// タスクとして起動し、最初の完了/保留状態まで駆動する。`run_module` と
+    /// 違い、トップレベル await がホスト Promise 待ちのまま残っても
+    /// エラーにせず `ModuleTaskState::Pending` を返す（T5: モジュールグラフの
+    /// エントリポイントが実質「終わらないゲームループ」を抱えるケース用。
+    /// `src/module.rs` の `Interpreter::run_module_graph` 参照）。続きは
+    /// ホスト側が `run_event_loop` を繰り返し呼んで駆動する。
+    pub fn start_module_task(&mut self, chunk: Rc<Chunk>) -> Result<ModuleTaskState, Value> {
         let frame = Frame::new(chunk, Rc::new(Vec::new()), Rc::new(Vec::new()));
         self.frames = vec![frame];
         let (_, owner) = self.new_pending_promise();
         self.drive_current_task(owner.clone());
         // モジュール本体が同期的に完了した場合でも、Promise チェーンの
         // マイクロタスクは必ず 1 回汲み尽くす（`Promise.resolve().then(...)`
-        // のようなコードが `run_module` から戻る前に実行されることを保証する）。
+        // のようなコードが戻る前に実行されることを保証する）。
         self.run_event_loop();
         let state = {
             let b = owner.borrow();
@@ -223,12 +249,11 @@ impl Vm {
             }
         };
         match state {
-            Some(Ok(_)) => Ok(self.pending_module_exports.take().unwrap_or_default()),
-            Some(Err(e)) => Err(e),
-            None => Err(self.type_error(
-                "トップレベル await が解決しませんでした（保留中のホスト Promise があります。\
-                 run_module は同期 API のため続行できません — run_event_loop を使ってください）",
+            Some(Ok(_)) => Ok(ModuleTaskState::Settled(
+                self.pending_module_exports.take().unwrap_or_default(),
             )),
+            Some(Err(e)) => Err(e),
+            None => Ok(ModuleTaskState::Pending),
         }
     }
 

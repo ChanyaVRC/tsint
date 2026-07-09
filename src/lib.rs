@@ -10,6 +10,7 @@ pub mod builtins;
 pub mod bytecode;
 pub mod compiler;
 pub mod lexer;
+pub mod module;
 pub mod parser;
 pub mod regex;
 pub mod value;

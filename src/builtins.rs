@@ -566,6 +566,11 @@ fn install_number(vm: &mut Vm) {
     vm.define_global("NaN", Value::Number(f64::NAN));
     vm.define_global("Infinity", Value::Number(f64::INFINITY));
     vm.define_global("undefined", Value::Undefined);
+    // `globalThis`: 素のプレーンオブジェクトとして用意する（グローバル変数
+    // 表そのものとの双方向同期はしない — コーパスは `(globalThis as any).Deno`
+    // のようにホストが注入した値を読み書きする用途にしか使わないので、
+    // それで十分）。
+    vm.define_global("globalThis", Value::new_plain_object());
 }
 
 fn install_globals_misc(vm: &mut Vm) {
