@@ -34,6 +34,7 @@ pub fn install(vm: &mut Vm) {
     install_errors(vm);
     install_date(vm);
     install_promise(vm);
+    install_regexp(vm);
 }
 
 // =====================================================================
@@ -1364,30 +1365,41 @@ fn string_method(name: &str) -> Option<Value> {
             };
             Ok(Value::str(out))
         }),
-        "split" => native("split", 1, |vm, this, args| {
+        "split" => native("split", 2, |vm, this, args| {
             let s = vm.to_display_string(&this);
+            let limit = match args.get(1) {
+                None | Some(Value::Undefined) => usize::MAX,
+                Some(v) => {
+                    let n = to_number(v);
+                    if n.is_nan() {
+                        usize::MAX
+                    } else {
+                        n.max(0.0) as usize
+                    }
+                }
+            };
             match args.first() {
-                None | Some(Value::Undefined) => Ok(Value::new_array(vec![Value::str(s)])),
+                None | Some(Value::Undefined) => {
+                    let mut out = vec![Value::str(s)];
+                    out.truncate(limit);
+                    Ok(Value::new_array(out))
+                }
                 Some(Value::Object(o)) if matches!(o.borrow().kind, ObjKind::Regex(_)) => {
                     let re = match &o.borrow().kind {
                         ObjKind::Regex(r) => r.clone(),
                         _ => unreachable!(),
                     };
-                    let parts = re.split(&s);
-                    Ok(Value::new_array(
-                        parts.into_iter().map(Value::str).collect(),
-                    ))
+                    Ok(Value::new_array(regex_split(vm, &re, &s, limit)?))
                 }
                 Some(sep) => {
                     let sep_s = vm.to_display_string(sep);
-                    if sep_s.is_empty() {
-                        return Ok(Value::new_array(
-                            s.chars().map(|c| Value::str(c.to_string())).collect(),
-                        ));
-                    }
-                    Ok(Value::new_array(
-                        s.split(sep_s.as_str()).map(Value::str).collect(),
-                    ))
+                    let mut out: Vec<Value> = if sep_s.is_empty() {
+                        s.chars().map(|c| Value::str(c.to_string())).collect()
+                    } else {
+                        s.split(sep_s.as_str()).map(Value::str).collect()
+                    };
+                    out.truncate(limit);
+                    Ok(Value::new_array(out))
                 }
             }
         }),
@@ -1426,9 +1438,70 @@ fn string_method(name: &str) -> Option<Value> {
         }),
         "replace" => native("replace", 2, |vm, this, args| {
             let s = vm.to_display_string(&this);
-            let from = vm.to_display_string(&arg(args, 0));
-            let to = vm.to_display_string(&arg(args, 1));
-            Ok(Value::str(s.replacen(&from, &to, 1)))
+            let pattern = arg(args, 0);
+            let replacement = arg(args, 1);
+            string_replace(vm, &s, &pattern, &replacement, false)
+        }),
+        "replaceAll" => native("replaceAll", 2, |vm, this, args| {
+            let s = vm.to_display_string(&this);
+            let pattern = arg(args, 0);
+            let replacement = arg(args, 1);
+            if let Value::Object(o) = &pattern {
+                if let ObjKind::Regex(re) = &o.borrow().kind {
+                    if !re.global {
+                        return Err(vm.type_error(
+                            "String.prototype.replaceAll に渡す正規表現には g フラグが必要です",
+                        ));
+                    }
+                }
+            }
+            string_replace(vm, &s, &pattern, &replacement, true)
+        }),
+        "match" => native("match", 1, |vm, this, args| {
+            let s = vm.to_display_string(&this);
+            let re = coerce_to_regex(vm, &arg(args, 0))?;
+            let chars: Vec<char> = s.chars().collect();
+            if re.global {
+                let mut out = vec![];
+                let mut from = 0usize;
+                loop {
+                    if from > chars.len() {
+                        break;
+                    }
+                    match re.search(&chars, from).map_err(|e| regex_err(vm, e))? {
+                        Some(mat) => {
+                            out.push(Value::str(
+                                chars[mat.start..mat.end].iter().collect::<String>(),
+                            ));
+                            from = if mat.end == mat.start {
+                                mat.end + 1
+                            } else {
+                                mat.end
+                            };
+                        }
+                        None => break,
+                    }
+                }
+                if out.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::new_array(out))
+                }
+            } else {
+                match re.search(&chars, 0).map_err(|e| regex_err(vm, e))? {
+                    Some(mat) => Ok(build_match_array(&chars, &mat, &s)),
+                    None => Ok(Value::Null),
+                }
+            }
+        }),
+        "search" => native("search", 1, |vm, this, args| {
+            let s = vm.to_display_string(&this);
+            let re = coerce_to_regex(vm, &arg(args, 0))?;
+            let chars: Vec<char> = s.chars().collect();
+            match re.search(&chars, 0).map_err(|e| regex_err(vm, e))? {
+                Some(mat) => Ok(Value::Number(mat.start as f64)),
+                None => Ok(Value::Number(-1.0)),
+            }
         }),
         "toLowerCase" => native("toLowerCase", 0, |vm, this, _args| {
             Ok(Value::str(vm.to_display_string(&this).to_lowercase()))
@@ -1479,7 +1552,6 @@ fn string_method(name: &str) -> Option<Value> {
             let prefix: String = prefix.chars().take(target_len - cur_len).collect();
             Ok(Value::str(format!("{prefix}{s}")))
         }),
-        "test" => return regex_method("test"),
         _ => return None,
     })
 }
@@ -1667,19 +1739,507 @@ fn set_method(name: &str) -> Option<Value> {
     })
 }
 
-// ---------------- RegExp（最小サブセット） ----------------
+// ---------------- RegExp（T4 本実装） ----------------
+
+/// `new RegExp(...)` / `RegExp(...)` の実装。文字列（と省略可能な flags）、
+/// または既存の RegExp オブジェクト（flags 省略時はそれをそのまま踏襲、
+/// 指定時は上書き）を受け取る。
+fn install_regexp(vm: &mut Vm) {
+    vm.register_native(
+        "RegExp",
+        2,
+        Rc::new(|vm, _this, args| {
+            let (pattern, default_flags) = match args.first() {
+                Some(Value::Object(o)) if matches!(o.borrow().kind, ObjKind::Regex(_)) => {
+                    let re = match &o.borrow().kind {
+                        ObjKind::Regex(r) => r.clone(),
+                        _ => unreachable!(),
+                    };
+                    (re.source.clone(), re.flags.clone())
+                }
+                Some(v) => (vm.to_display_string(v), String::new()),
+                None => (String::new(), String::new()),
+            };
+            let flags = match args.get(1) {
+                None | Some(Value::Undefined) => default_flags,
+                Some(v) => vm.to_display_string(v),
+            };
+            match crate::regex::Regex::compile(&pattern, &flags) {
+                Ok(re) => Ok(crate::vm::new_regex_value(Rc::new(re))),
+                Err(e) => Err(vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0))),
+            }
+        }),
+    );
+}
+
+/// 文字列引数またはコンパイル済み正規表現を `Rc<Regex>` に統一する
+/// （`String.prototype.match`/`search` は文字列を渡された場合、それを
+/// パターンとして（フラグ無しで）コンパイルする、という JS 仕様に対応）。
+fn coerce_to_regex(vm: &mut Vm, v: &Value) -> Result<Rc<crate::regex::Regex>, Value> {
+    if let Value::Object(o) = v {
+        if let ObjKind::Regex(re) = &o.borrow().kind {
+            return Ok(re.clone());
+        }
+    }
+    let pattern = vm.to_display_string(v);
+    crate::regex::Regex::compile(&pattern, "")
+        .map(Rc::new)
+        .map_err(|e| vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0)))
+}
+
+fn regex_err(vm: &Vm, e: crate::regex::RegexError) -> Value {
+    vm.range_error(format!("正規表現の実行中にエラーが発生しました: {}", e.0))
+}
+
+fn regex_last_index(o: &ObjRef) -> usize {
+    match o.borrow().props.get("lastIndex") {
+        Some(PropSlot::Value(v)) => {
+            let n = to_number(v);
+            if n.is_finite() && n >= 0.0 {
+                n as usize
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn set_last_index(o: &ObjRef, n: usize) {
+    o.borrow_mut()
+        .props
+        .set_value(Rc::from("lastIndex"), Value::Number(n as f64));
+}
+
+/// `RegExp.prototype.exec` の戻り値の配列（`index`/`input`/`groups` プロパティ
+/// 付き）を組み立てる。
+fn build_match_array(chars: &[char], mat: &crate::regex::RegexMatch, input: &str) -> Value {
+    let whole: String = chars[mat.start..mat.end].iter().collect();
+    let mut items = vec![Value::str(whole)];
+    for g in &mat.groups {
+        items.push(match g {
+            Some((a, b)) => Value::str(chars[*a..*b].iter().collect::<String>()),
+            None => Value::Undefined,
+        });
+    }
+    let arr = Value::new_array(items);
+    if let Value::Object(o) = &arr {
+        let mut b = o.borrow_mut();
+        b.props
+            .set_value(Rc::from("index"), Value::Number(mat.start as f64));
+        b.props
+            .set_value(Rc::from("input"), Value::str(input.to_string()));
+        // 名前付きキャプチャグループは未対応のため常に undefined（実 JS の
+        // 「名前付きグループが 1 つも無ければ undefined」という挙動と一致する）。
+        b.props.set_value(Rc::from("groups"), Value::Undefined);
+    }
+    arr
+}
 
 fn regex_method(name: &str) -> Option<Value> {
     Some(match name {
         "test" => native("test", 1, |vm, this, args| {
             let s = vm.to_display_string(&arg(args, 0));
-            if let Value::Object(o) = &this {
-                if let ObjKind::Regex(re) = &o.borrow().kind {
-                    return Ok(Value::Bool(re.test(&s)));
+            let Value::Object(o) = &this else {
+                return Ok(Value::Bool(false));
+            };
+            let re = match &o.borrow().kind {
+                ObjKind::Regex(r) => r.clone(),
+                _ => return Ok(Value::Bool(false)),
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let from = if re.global { regex_last_index(o) } else { 0 };
+            if from > chars.len() {
+                if re.global {
+                    set_last_index(o, 0);
+                }
+                return Ok(Value::Bool(false));
+            }
+            match re.search(&chars, from).map_err(|e| regex_err(vm, e))? {
+                Some(mat) => {
+                    if re.global {
+                        set_last_index(o, mat.end);
+                    }
+                    Ok(Value::Bool(true))
+                }
+                None => {
+                    if re.global {
+                        set_last_index(o, 0);
+                    }
+                    Ok(Value::Bool(false))
                 }
             }
-            Ok(Value::Bool(false))
+        }),
+        "exec" => native("exec", 1, |vm, this, args| {
+            let s = vm.to_display_string(&arg(args, 0));
+            let Value::Object(o) = &this else {
+                return Err(vm.type_error("RegExp ではありません"));
+            };
+            let re = match &o.borrow().kind {
+                ObjKind::Regex(r) => r.clone(),
+                _ => return Err(vm.type_error("RegExp ではありません")),
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let from = if re.global { regex_last_index(o) } else { 0 };
+            if from > chars.len() {
+                if re.global {
+                    set_last_index(o, 0);
+                }
+                return Ok(Value::Null);
+            }
+            match re.search(&chars, from).map_err(|e| regex_err(vm, e))? {
+                Some(mat) => {
+                    if re.global {
+                        set_last_index(o, mat.end);
+                    }
+                    Ok(build_match_array(&chars, &mat, &s))
+                }
+                None => {
+                    if re.global {
+                        set_last_index(o, 0);
+                    }
+                    Ok(Value::Null)
+                }
+            }
+        }),
+        "toString" => native("toString", 0, |vm, this, _args| {
+            Ok(Value::str(vm.to_display_string(&this)))
         }),
         _ => return None,
     })
+}
+
+// ---------------- String.prototype.replace(All) の置換テンプレート ----------------
+
+/// `$&` `` $` `` `$'` `$1`〜 `$$` を展開する（コールバック関数でない、
+/// 文字列置換の場合）。`groups` は 1 番から順のキャプチャ文字列
+/// （`None` は未参加）。
+fn expand_replacement_template(
+    template: &str,
+    matched: &str,
+    before: &str,
+    after: &str,
+    groups: &[Option<String>],
+) -> String {
+    let tchars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < tchars.len() {
+        if tchars[i] == '$' && i + 1 < tchars.len() {
+            match tchars[i + 1] {
+                '$' => {
+                    out.push('$');
+                    i += 2;
+                    continue;
+                }
+                '&' => {
+                    out.push_str(matched);
+                    i += 2;
+                    continue;
+                }
+                '`' => {
+                    out.push_str(before);
+                    i += 2;
+                    continue;
+                }
+                '\'' => {
+                    out.push_str(after);
+                    i += 2;
+                    continue;
+                }
+                d if d.is_ascii_digit() => {
+                    let one = d.to_digit(10).unwrap() as usize;
+                    let two = if i + 2 < tchars.len() && tchars[i + 2].is_ascii_digit() {
+                        Some(one * 10 + tchars[i + 2].to_digit(10).unwrap() as usize)
+                    } else {
+                        None
+                    };
+                    // 2桁の番号が有効なキャプチャ番号ならそちらを優先する（JS 仕様）。
+                    if let Some(n2) = two {
+                        if n2 >= 1 && n2 <= groups.len() {
+                            if let Some(g) = groups.get(n2 - 1).and_then(|x| x.as_ref()) {
+                                out.push_str(g);
+                            }
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    if one >= 1 && one <= groups.len() {
+                        if let Some(g) = groups.get(one - 1).and_then(|x| x.as_ref()) {
+                            out.push_str(g);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    out.push(tchars[i]);
+                    i += 1;
+                }
+                _ => {
+                    out.push(tchars[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(tchars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 正規表現マッチ 1 件分の置換文字列を計算する（コールバック関数 or `$` 展開）。
+fn compute_replacement(
+    vm: &mut Vm,
+    replacement: &Value,
+    chars: &[char],
+    mat: &crate::regex::RegexMatch,
+    matched: &str,
+    whole_input: &str,
+) -> Result<String, Value> {
+    if is_callable(replacement) {
+        let mut cb_args = vec![Value::str(matched.to_string())];
+        for g in &mat.groups {
+            cb_args.push(match g {
+                Some((a, b)) => Value::str(chars[*a..*b].iter().collect::<String>()),
+                None => Value::Undefined,
+            });
+        }
+        cb_args.push(Value::Number(mat.start as f64));
+        cb_args.push(Value::str(whole_input.to_string()));
+        let r = vm.call_value(replacement.clone(), Value::Undefined, &cb_args)?;
+        Ok(vm.to_display_string(&r))
+    } else {
+        let template = vm.to_display_string(replacement);
+        let before: String = chars[..mat.start].iter().collect();
+        let after: String = chars[mat.end..].iter().collect();
+        let groups: Vec<Option<String>> = mat
+            .groups
+            .iter()
+            .map(|g| g.map(|(a, b)| chars[a..b].iter().collect()))
+            .collect();
+        Ok(expand_replacement_template(
+            &template, matched, &before, &after, &groups,
+        ))
+    }
+}
+
+/// 文字列パターン（正規表現でない）の 1 件分の置換文字列を計算する
+/// （キャプチャグループは無い）。
+fn compute_replacement_str(
+    vm: &mut Vm,
+    replacement: &Value,
+    matched: &str,
+    before: &str,
+    after: &str,
+    whole_input: &str,
+) -> Result<String, Value> {
+    if is_callable(replacement) {
+        let idx = before.chars().count();
+        let r = vm.call_value(
+            replacement.clone(),
+            Value::Undefined,
+            &[
+                Value::str(matched.to_string()),
+                Value::Number(idx as f64),
+                Value::str(whole_input.to_string()),
+            ],
+        )?;
+        Ok(vm.to_display_string(&r))
+    } else {
+        let template = vm.to_display_string(replacement);
+        Ok(expand_replacement_template(
+            &template,
+            matched,
+            before,
+            after,
+            &[],
+        ))
+    }
+}
+
+/// `String.prototype.replace`/`replaceAll` 本体。`pattern` が正規表現なら
+/// `force_all || pattern.global` の時に全置換、そうでなければ最初の 1 件のみ。
+/// `pattern` が文字列ならリテラル部分文字列として扱う（`force_all` の時のみ
+/// 全置換、それ以外は最初の 1 件のみ — JS 仕様通り、文字列パターンの
+/// `replace` はフラグを持てないので常に 1 件のみ）。
+fn string_replace(
+    vm: &mut Vm,
+    s: &str,
+    pattern: &Value,
+    replacement: &Value,
+    force_all: bool,
+) -> Result<Value, Value> {
+    let is_regex =
+        matches!(pattern, Value::Object(o) if matches!(o.borrow().kind, ObjKind::Regex(_)));
+    if is_regex {
+        let Value::Object(o) = pattern else {
+            unreachable!()
+        };
+        let re = match &o.borrow().kind {
+            ObjKind::Regex(r) => r.clone(),
+            _ => unreachable!(),
+        };
+        let global = force_all || re.global;
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut pos = 0usize;
+        let mut search_from = 0usize;
+        loop {
+            if search_from > chars.len() {
+                break;
+            }
+            let Some(mat) = re
+                .search(&chars, search_from)
+                .map_err(|e| regex_err(vm, e))?
+            else {
+                break;
+            };
+            out.push_str(&chars[pos..mat.start].iter().collect::<String>());
+            let matched: String = chars[mat.start..mat.end].iter().collect();
+            let rep = compute_replacement(vm, replacement, &chars, &mat, &matched, s)?;
+            out.push_str(&rep);
+            pos = mat.end;
+            search_from = if mat.end == mat.start {
+                mat.end + 1
+            } else {
+                mat.end
+            };
+            if !global {
+                break;
+            }
+        }
+        out.push_str(&chars[pos..].iter().collect::<String>());
+        Ok(Value::str(out))
+    } else {
+        let needle = vm.to_display_string(pattern);
+        if force_all {
+            if needle.is_empty() {
+                // 空文字列パターンの replaceAll は各文字の間（先頭・末尾含む）に挿入する。
+                let mut out = String::new();
+                let chars: Vec<char> = s.chars().collect();
+                for (i, c) in chars.iter().enumerate() {
+                    let before: String = chars[..i].iter().collect();
+                    let after: String = chars[i..].iter().collect();
+                    out.push_str(&compute_replacement_str(
+                        vm,
+                        replacement,
+                        "",
+                        &before,
+                        &after,
+                        s,
+                    )?);
+                    out.push(*c);
+                }
+                let before: String = chars.iter().collect();
+                out.push_str(&compute_replacement_str(
+                    vm,
+                    replacement,
+                    "",
+                    &before,
+                    "",
+                    s,
+                )?);
+                return Ok(Value::str(out));
+            }
+            let mut out = String::new();
+            let mut rest = s;
+            let mut consumed = String::new();
+            loop {
+                match rest.find(&needle) {
+                    Some(idx) => {
+                        out.push_str(&rest[..idx]);
+                        consumed.push_str(&rest[..idx]);
+                        let after = &rest[idx + needle.len()..];
+                        let rep =
+                            compute_replacement_str(vm, replacement, &needle, &consumed, after, s)?;
+                        out.push_str(&rep);
+                        consumed.push_str(&rest[idx..idx + needle.len()]);
+                        rest = after;
+                    }
+                    None => {
+                        out.push_str(rest);
+                        break;
+                    }
+                }
+            }
+            Ok(Value::str(out))
+        } else {
+            match s.find(&needle) {
+                Some(idx) => {
+                    let before = &s[..idx];
+                    let after = &s[idx + needle.len()..];
+                    let rep = compute_replacement_str(vm, replacement, &needle, before, after, s)?;
+                    Ok(Value::str(format!("{before}{rep}{after}")))
+                }
+                None => Ok(Value::str(s.to_string())),
+            }
+        }
+    }
+}
+
+/// `String.prototype.split(regex, limit)` 本体。捕捉されたキャプチャ
+/// グループも（`undefined` を挟みつつ）結果配列に含める（JS 仕様通り）。
+fn regex_split(
+    vm: &mut Vm,
+    re: &crate::regex::Regex,
+    s: &str,
+    limit: usize,
+) -> Result<Vec<Value>, Value> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        let mut out = vec![];
+        if re
+            .search(&chars, 0)
+            .map_err(|e| regex_err(vm, e))?
+            .is_none()
+        {
+            out.push(Value::str(String::new()));
+        }
+        out.truncate(limit);
+        return Ok(out);
+    }
+    let mut out: Vec<Value> = vec![];
+    let mut p = 0usize;
+    let mut search_from = 0usize;
+    loop {
+        if out.len() >= limit || search_from > chars.len() {
+            break;
+        }
+        let Some(mat) = re
+            .search(&chars, search_from)
+            .map_err(|e| regex_err(vm, e))?
+        else {
+            break;
+        };
+        if mat.start >= chars.len() {
+            break;
+        }
+        if mat.end == mat.start && mat.start == p {
+            // 直前の分割位置と同じ場所での空幅マッチはスキップする
+            // （そうしないと同じ位置で無限に分割してしまう）。
+            search_from = mat.start + 1;
+            continue;
+        }
+        out.push(Value::str(chars[p..mat.start].iter().collect::<String>()));
+        for g in &mat.groups {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(match g {
+                Some((a, b)) => Value::str(chars[*a..*b].iter().collect::<String>()),
+                None => Value::Undefined,
+            });
+        }
+        p = mat.end;
+        search_from = if mat.end == mat.start {
+            mat.end + 1
+        } else {
+            mat.end
+        };
+    }
+    if out.len() < limit {
+        out.push(Value::str(chars[p..].iter().collect::<String>()));
+    }
+    out.truncate(limit);
+    Ok(out)
 }

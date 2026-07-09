@@ -282,8 +282,8 @@ pub enum ObjKind {
     Set(SetData),
     /// Error 系オブジェクト（`message`/`name` は props に格納。マーカーのみ）。
     Error,
-    /// 正規表現（最小サブセット。`src/regex_mini.rs` 参照）。
-    Regex(Rc<crate::regex_mini::MiniRegex>),
+    /// 正規表現（T4 本実装。`src/regex.rs` 参照）。
+    Regex(Rc<crate::regex::Regex>),
     /// Promise（T3）。状態と pending 中の反応（reaction）を保持する。
     Promise(PromiseData),
 }

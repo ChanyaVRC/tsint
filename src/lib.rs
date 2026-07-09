@@ -11,7 +11,7 @@ pub mod bytecode;
 pub mod compiler;
 pub mod lexer;
 pub mod parser;
-pub mod regex_mini;
+pub mod regex;
 pub mod value;
 pub mod vm;
 

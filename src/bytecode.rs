@@ -197,7 +197,7 @@ pub enum Const {
     /// ネストした関数のバイトコード + アップバリュー捕捉記述。
     FunctionTemplate(Rc<FunctionTemplate>),
     ClassTemplate(Rc<ClassTemplate>),
-    Regex(Rc<crate::regex_mini::MiniRegex>),
+    Regex(Rc<crate::regex::Regex>),
 }
 
 impl Clone for Const {

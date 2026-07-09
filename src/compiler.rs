@@ -1517,7 +1517,7 @@ impl Compiler {
                 self.compile_template(quasis, exprs, line)?
             }
             ExprKind::RegexLit { pattern, flags } => {
-                let re = crate::regex_mini::MiniRegex::compile(pattern, flags).map_err(|e2| {
+                let re = crate::regex::Regex::compile(pattern, flags).map_err(|e2| {
                     err(
                         line,
                         format!("正規表現 /{pattern}/ を解釈できません: {}", e2.0),

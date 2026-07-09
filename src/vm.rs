@@ -865,8 +865,7 @@ impl Vm {
                         _ => panic!("LoadRegex: 定数が Regex ではありません"),
                     }
                 };
-                let o = ObjData::new(ObjKind::Regex(re));
-                self.push(Value::Object(Rc::new(RefCell::new(o))));
+                self.push(new_regex_value(re));
             }
             OpCode::Await => {
                 // ネイティブ関数の Rust 再帰呼び出し（`call_value`/`call_function_obj`）
@@ -1344,6 +1343,12 @@ impl Vm {
                 ObjKind::Regex(re) => match name {
                     "source" => Some(Value::str(re.source.clone())),
                     "flags" => Some(Value::str(re.flags.clone())),
+                    "global" => Some(Value::Bool(re.global)),
+                    "ignoreCase" => Some(Value::Bool(re.ignore_case)),
+                    "multiline" => Some(Value::Bool(re.multiline)),
+                    "dotAll" => Some(Value::Bool(re.dot_all)),
+                    "unicode" => Some(Value::Bool(re.unicode)),
+                    "sticky" => Some(Value::Bool(false)),
                     _ => None,
                 },
                 _ => None,
@@ -1903,6 +1908,16 @@ pub fn array_values(v: &Value) -> Vec<Value> {
         }
     }
     Vec::new()
+}
+
+/// コンパイル済み正規表現から `RegExp` インスタンスを作る（正規表現リテラル・
+/// `new RegExp(...)` の両方から使う共通ヘルパー）。`lastIndex` は own
+/// プロパティとして持たせる（`source`/`flags`/`global` 等は読み取り専用の
+/// `ObjKind::Regex` 側フォールバックで賄うため、own プロパティにはしない）。
+pub fn new_regex_value(re: Rc<crate::regex::Regex>) -> Value {
+    let mut o = ObjData::new(ObjKind::Regex(re));
+    o.props.set_value(Rc::from("lastIndex"), Value::Number(0.0));
+    Value::Object(Rc::new(RefCell::new(o)))
 }
 
 // =====================================================================
