@@ -19,7 +19,8 @@
 | T2 | 明示スタックのバイトコード VM（AST → バイトコードへコンパイルし、Rust の呼び出しスタックに頼らずに実行する） | 実装済み |
 | T3 | Promise / async・イベントループ（Noiria の `await sys.wait()` 等のゲームループ協調を実現） | 実装済み（本リポジトリの現状） |
 | T4 | 正規表現エンジン本実装（バックトラッキング方式。量指定子・グループ・キャプチャ・アンカー・後方参照・先読みに対応） | 実装済み |
-| T5 | Noiria 統合（`deno_core`/V8 を本インタプリタで置き換え、`runtime/` とサンプルゲームを実機で動作させる。import 文によるモジュール連携もここで対応） | 未着手 |
+| T5a | ES モジュールシステム（import/export の実行時解決・トップレベル await 対応のモジュール評価）+ Noiria の KAG ランタイム全体を tsint 上で完走させる統合テスト | 実装済み（本リポジトリの現状） |
+| T5b | Noiria 本体への組み込み（エンジン切替フラグ・`deno_core` ops の実配線・V8 との並走比較） | 未着手 |
 
 ## 使い方
 
@@ -45,8 +46,9 @@ let exports = interp.run_module(source, "runtime/kag/parser.ts")?;
 `Display` で `構文エラー <行>:<桁>: <メッセージ>` の形式に整形される。
 `Interpreter::run_module` は `Result<Vec<(Rc<str>, Value)>, InterpError>`
 （`InterpError` はパース/コンパイル/未捕捉例外の 3 種）。
-`import` 文を含むモジュールは T2 では明確なコンパイルエラーになる
-（モジュール連携は T5 で対応）。
+`import` 文を含むモジュールを `run_module`（単一ファイル API）に直接
+渡すと T2 と同じく明確なコンパイルエラーになる。複数モジュールにまたがる
+`import`/`export` は次節のモジュールシステム（T5a）を使うこと。
 
 Promise / async・await / イベントループ（T3 API）:
 
@@ -73,6 +75,55 @@ match interp.run_event_loop() {
 依存するなら）`run_module` はそれも待ってから戻る。ホスト側の
 `HostPromise` の解決を待ったまま残った場合はエラーになる（同期 API の
 限界。ホスト駆動の非同期実行には `run_event_loop` を直接使うこと）。
+
+ES モジュールシステム（T5a API、`src/module.rs`）:
+
+```rust
+struct MyHost { /* ファイルシステム等へのアクセス */ }
+impl tsint::module::ModuleHost for MyHost {
+    fn resolve(&self, specifier: &str, referrer: &str) -> Result<String, String> { /* ... */ }
+    fn load(&self, resolved: &str) -> Result<String, String> { /* ... */ }
+}
+
+let mut interp = tsint::Interpreter::new();
+let host = MyHost { /* ... */ };
+match interp.run_module_graph("entry-specifier", &host)? {
+    tsint::module::ModuleOutcome::Settled(exports) => { /* エントリが完全に解決した */ }
+    tsint::module::ModuleOutcome::Pending => {
+        // トップレベル await がホスト Promise 待ちのまま残っている
+        // （KagPlayer.run() のような終わらないゲームループを抱える
+        // main.ts が典型例）。host promise を解決しつつ
+        // interp.run_event_loop() を繰り返し呼んで駆動を続ける。
+    }
+}
+```
+
+設計の要点:
+
+- `import`/`export ... from`/`export * (as ns)` を含む AST を、依存
+  モジュールの評価が終わった後に「名前空間オブジェクトを保持する
+  グローバル変数から `const` で読み出す」形へ **AST レベルで書き換えて
+  から** `compiler::compile_module` に渡す。コンパイラ・VM 本体
+  （`compiler.rs`/`bytecode.rs`/`vm.rs`）にはほぼ手を入れていない
+  （`vm.rs` に追加したのは `Vm::start_module_task`/`ModuleTaskState`
+  という「トップレベル await が未解決でもエラーにしない `run_module`
+  の下請け」だけ）。
+- モジュールは resolved specifier ごとに 1 回だけ評価してキャッシュする
+  （ダイヤモンド依存でも評価は 1 回）。
+- 循環 import は「参照した時点でまだ埋まっていないプロパティは
+  `undefined`」という簡易挙動にする（名前空間オブジェクトを評価前に
+  空で確保してからキャッシュ登録し、評価完了後にプロパティを書き込む
+  ため）。Noiria コーパスの循環は型のみ（`import type`）なので実害はない。
+- `import type` / `export type { ... } from` はまるごと無視する
+  （依存モジュールを解決すらしない。存在しないファイルを指す
+  `.d.ts` 由来の型 import があっても壊れない）。値と型が同じ
+  `import { real, TypeOnlyThing } from "mod"` に混在していても
+  （TS の既定動作どおり）安全（型名は単に `undefined` を指す未使用の
+  `const` になるだけ）。
+- 依存モジュール（エントリ以外）はトップレベル await を使わないという
+  Noiria コーパスの前提の下、`Vm::run_module` と同じ「完全に解決する
+  はず」経路で評価する。エントリモジュールだけ `Vm::start_module_task`
+  を使い、`ModuleOutcome::Pending` を許す。
 
 ## リポジトリ構成
 
@@ -104,9 +155,12 @@ src/
                    Promise 系）
   regex.rs        T4: 正規表現エンジン本実装（パーサ + AST + Save/Jmp/Split
                    命令列へのコンパイル + バックトラッキング実行器）
+  module.rs       T5a: ES モジュールシステム（`ModuleHost` トレイト・
+                   import/export の AST 書き換え・モジュールキャッシュ・
+                   循環 import の簡易挙動・`Interpreter::run_module_graph`）
   lib.rs          公開 API: `parse_module` に加え `Interpreter`
                    （`new`/`register_native`/`register_native_async`/`run_module`/
-                   `run_event_loop` 等）
+                   `run_module_graph`/`run_event_loop` 等）
 tests/
   corpus.rs       T1: Noiria の runtime/*.ts・games/*/main.ts を実際にパースする
                    統合テスト（`../noiria` が無い環境では該当ケースを skip）
@@ -133,6 +187,23 @@ tests/
                    由来の正規表現の再現・壊滅的バックトラックのステップ上限
                    テストも含む）
   vm_common/mod.rs  T2/T3/T4 テスト共通ヘルパー
+  module_basics.rs  T5a: モジュールシステムのユニットテスト（13 ケース。
+                   named/default/namespace import・`export ... from`・
+                   `export * as ns from`・`export * from`・
+                   `import type`/`export type ... from` の無視・
+                   ダイヤモンド依存の 1 回評価・循環 import の簡易挙動・
+                   エントリモジュールのトップレベル await が
+                   `run_event_loop` で駆動できること 等。インメモリの
+                   `ModuleHost` のみを使い、Noiria リポジトリは不要）
+  kag_full.rs     T5a 最重要テスト: Noiria の実ファイル
+                   （`../noiria/runtime/api.ts`・`runtime/kag/*.ts`）を
+                   `tsint::module` 経由でそのままロードし、
+                   `(globalThis).Deno.core.ops` をモック ops テーブルとして
+                   注入して KAG プレイヤーを実際に走らせる（2 ケース。
+                   仮想クロック・入力イベント注入・`op_text_rects` の
+                   矩形に合わせたクリック座標でリンク選択・ファイル間
+                   `[jump]`・`[if]`/`[else]` の分岐・`op_quit` 到達までを
+                   検証。`../noiria` が無い環境では skip）
 ```
 
 ## 対応構文一覧
@@ -219,7 +290,7 @@ tests/
 - `==` の抽象等価演算は主要規則（`null == undefined`・数値⇄文字列⇄真偽値の
   相互変換・オブジェクトの ToPrimitive）のみ実装。Symbol は非対応。
 - `class` の `extends`/`super` は未実装（コーパスに無いため明確なエラーに
-  する方針。T5 までに必要になれば追加）。
+  する方針。T5b までに必要になれば追加）。
 - ~~正規表現は `.test()`/`String.split()` に必要な最小サブセットのみ
   （文字クラス・代替・エスケープショートハンド。量指定子・グループ・
   アンカーは非対応で明確なエラーになる）~~ → **T4 で本実装**（量指定子・
@@ -335,7 +406,7 @@ T2 の設計メモにあった通り、`Vm.frames: Vec<Frame>` は既に
 - `Vm::run_event_loop`/`Interpreter::run_event_loop`: マイクロタスク
   キューを空になるまで処理し、`PumpState::Idle`（もう進む処理が無い）か
   `PumpState::Waiting`（`HostPromise` の解決待ちが残っている）を返す。
-  T5 で Noiria のゲームループへ統合する際は、ホストのフレームループから
+  T5b で Noiria のゲームループへ統合する際は、ホストのフレームループから
   「入力/タイマー等のイベントで該当する `HostPromise` を resolve →
   `run_event_loop` を呼ぶ」を繰り返す形になる想定。
 - テストでは `tests/vm_async.rs` に「仮想タイマー」（`wait(ms)` を
@@ -364,7 +435,8 @@ T2 の設計メモにあった通り、`Vm.frames: Vec<Frame>` は既に
   対応しない）。
 - `queueMicrotask`/`setTimeout` のようなグローバル関数は用意していない
   （ホストが `register_native_async` で必要な名前を注入する方針。
-  T5 で Noiria の `sys.wait` 等をこの形で載せる）。
+  T5b で Noiria の `sys.wait` 等をこの形で載せる。実例は
+  `tests/kag_full.rs` の `op_wait`/`op_input_next_event` モック）。
 - Promise オブジェクトの `Symbol.toStringTag` 等、内部スロットの
   細部は省略。`console.log`/文字列化は `Promise { <pending> }` 等の
   簡易表示のみ。
@@ -492,49 +564,79 @@ T2 の設計メモにあった通り、`Vm.frames: Vec<Frame>` は既に
   （`exec`/`test`/`g` フラグ付きループ等、ユーザーが明示的に `lastIndex`
   を使う典型パターンはステートフルに正しく動作する）。
 
-## T5（Noiria 統合）への引き継ぎメモ
+## T5b（Noiria 本体への組み込み）への引き継ぎメモ
 
-- `run_module` は「トップレベル await がホスト Promise 待ちのまま残ると
-  エラーになる」同期 API のままなので、Noiria 本体の統合では使わず、
-  `Interpreter::run_event_loop` を直接使うか、`run_module` 相当の処理を
-  ホスト側のゲームループに合わせて再実装すること（モジュールの
-  トップレベルタスクを「完了するまで」ではなく「1 フレーム分だけ進める」
-  形に分解する必要がある）。
+T5a で「モジュールシステム」と「KAG ランタイム全体を tsint 上で走らせる
+統合テスト」は完了した。`tests/kag_full.rs` が Noiria の実ファイルを
+モック ops で実際に走らせて検証済みなので、T5b は主に「本物の
+`deno_core`/V8 をこのインタプリタで置き換える配線」が中心になる。
+
+- **エンジン切替フラグ**: Noiria 本体（`../noiria/crates/...`）に
+  「V8 (`deno_core`) で実行するか tsint で実行するか」を選べるフラグ
+  （CLI 引数 or 環境変数）を追加し、両エンジンを同一のゲームスクリプトで
+  比較できるようにすること。`tests/kag_full.rs` のモック ops テーブルは
+  「どの ops をどんな型で呼ぶか」の実例になっているので、本物の ops
+  実装（Rust 側）とほぼ同じシグネチャで `Interpreter::register_native`/
+  自前の `Value::native_fn` 経由で `globalThis.Deno.core.ops` に生やせば
+  よい。
+- **ops の実配線**: `tests/kag_full.rs::install_mock_ops` が全 ops の
+  一覧・シグネチャ・戻り値の形（`op_text_print` の `{total,added}`、
+  `op_layer_load_image` の `[w,h]`、`op_save_read` の `string|null` 等）の
+  リファレンス実装になっている。非同期 ops
+  （`op_wait`/`op_input_next_event`/`op_trans_wait`/`op_audio_wait_end`）は
+  `register_native_async`/`HostPromise` で実装し、実際のゲームループ
+  （フレームごとに `run_event_loop()` を呼び、入力キューやタイマーを
+  そのフレームの実時間で解決する）に配線すること。テストの仮想クロック
+  ロジック（`advance`/`resolve_trans` 相当）をそのまま「1 フレーム分の
+  実時間経過」に置き換える形になる見込み。
+- **モジュール解決**: `ModuleHost::resolve`/`load` を実ファイルシステム
+  向けに実装する際は `tests/kag_full.rs::NoiriaHost` がそのまま雛形になる
+  （`noiria:api` → `runtime/api.ts` 等の specifier マッピング、
+  `noiria:kag` → `kag/mod.ts` のエイリアス）。ゲーム側の `main.ts` からの
+  相対 import（`./foo.ts` 等）が今後増える場合は `resolve` の `referrer`
+  引数を使った相対パス解決を追加すること（現状の Noiria コーパスには
+  相対 import が無いため未実装）。
+- **V8 との並走比較**: Noiria の V8 統合テスト
+  （`noiria/crates/noiria-app/src/script/mod.rs` の `js_tests`、
+  `tests/vm_corpus.rs` が既に個別ロジック単位で突き合わせている）と
+  同様に、`tests/kag_full.rs` の .ks シナリオ・期待 ops 列を V8 版でも
+  再現し、同一シナリオ・同一シードで両エンジンの ops 呼び出し列が
+  一致することを確認するテストを Noiria 側に追加するのが望ましい。
 - `Interpreter::register_native_async` + `HostPromise` がそのまま
-  `op_wait`/`op_input_next_event` 等の実装の土台になる想定
-  （`tests/vm_async.rs` の仮想タイマー・`waitClick`/`waitForFlag`
-  パターンを参照）。
-- `import` 文の実装（モジュール間の値の受け渡し）と、async 関数の
-  タスク分離の仕組み（`Vm.frames` の退避・復元）は独立した関心事なので、
-  モジュールシステムの導入で `run_module`/`drive_current_task` 周りを
-  大きく変える必要は無いはず（モジュールごとに `Interpreter`/`Vm` を
-  共有しつつ複数の `run_module` 相当の呼び出しを行う形になる見込み）。
+  `op_wait`/`op_input_next_event` 等の実装の土台になる（`tests/vm_async.rs`
+  の仮想タイマー・`waitClick`/`waitForFlag` パターン、
+  `tests/kag_full.rs` の仮想クロック・入力イベントキューを参照）。
 - `class` の `extends`/`super` が必要になった場合、コンストラクタ内で
   `super(...)` 呼び出し前は `this` にアクセスできない、という TDZ 的な
-  制約は今のところ考慮していない（extends 自体が T2 時点で明確な
-  コンパイルエラーのため）。
-- 正規表現エンジン（T4）は Noiria コーパスで実際に使われている構文
-  （`\s` 系のショートハンド・`|` の代替・`^` アンカー）はすべて動作を
-  確認済み（`tests/vm_corpus.rs` が `runtime/kag/parser.ts` を実際に実行し
-  間接的に検証している他、`tests/vm_regex.rs` に同じパターンをピンポイントで
-  再現したテストもある）。`runtime/kag/player.ts` 自体は `import` 文を
-  含むため T2/T4 の時点ではまだ実行できないが（T5 のモジュール連携待ち）、
-  そこで使われる `.replace(/^scenario\//, "")` / `.replace(/^\*/, "")` は
-  `tests/vm_regex.rs` の `corpus_scenario_prefix_replace`/
-  `corpus_label_star_prefix_replace` で個別に検証済み。T5 で
-  `player.ts` を実際に動かす際、想定外の正規表現があれば
+  制約は今のところ考慮していない（`player.ts`/`tags.ts`/`vars.ts` は
+  いずれも `extends` を使わないため実害は無かった）。
+- 正規表現エンジン（T4）は `runtime/kag/player.ts` の
+  `.replace(/^scenario\//, "")` / `.replace(/^\*/, "")` を含め、
+  `tests/kag_full.rs` の完走テストで実際に通っている
+  （`resolveStorage`/ジャンプ処理の正規表現も間接的に検証済み）。
+  T5b でゲーム側スクリプトを増やす際、想定外の正規表現があれば
   `src/regex.rs` の対応構文表と照らして追加対応を検討すること。
+- T5a 実装中に見つかった不足 builtin は `globalThis`（プレーンオブジェクト
+  として追加。`src/builtins.rs::install_globals_misc`）のみ。
+  `Date`/`toLocaleString`・`JSON.parse`/`stringify`・`new Function`・
+  `Map`/`Set` のスプレッド展開はすべて T2/T3 の時点で既に動作していた
+  （`makeSnapshot()`/`vars.evalExpr`/`vars.evalStmt` 等、`player.ts`/
+  `vars.ts` が実際に使う経路が `tests/kag_full.rs` を通じて確認済み）。
 
 ## テスト
 
 ```sh
 cargo test                              # 全テスト（T1: 71 + T2 単体: 89 + T3: 77 +
                                          # T4: 45(内蔵) + 54(vm_regex) +
-                                         # コーパス: 4 + プログラム: 5 + 内蔵: 数件）
+                                         # コーパス: 4 + プログラム: 5 +
+                                         # T5a モジュール基礎: 13 +
+                                         # T5a KAG 完走: 2 + 内蔵: 数件）
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-コーパステスト・fuzz テストは `../noiria`（Noiria リポジトリ）が
-存在する前提。無い環境では該当ケースを skip するか、fuzz テストは
-内蔵の合成ソースにフォールバックする。
+コーパステスト・fuzz テスト・`tests/kag_full.rs` は `../noiria`
+（Noiria リポジトリ）が存在する前提。無い環境では該当ケースを skip
+するか、fuzz テストは内蔵の合成ソースにフォールバックする
+（`tests/module_basics.rs` はインメモリの `ModuleHost` のみを使うので
+`../noiria` が無くても常に実行される）。
