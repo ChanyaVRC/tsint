@@ -138,6 +138,7 @@ pub fn compile_module(module: &Module) -> CResult<Rc<Chunk>> {
     let mut c = Compiler {
         funcs: vec![FuncCtx::new(module.name.clone())],
     };
+    c.cur().chunk.is_module = true;
     // モジュールトップレベルの `this` は undefined（strict mode 相当）。
     // スロット 0 を this 用として予約しておく（LoadThis が読む）。
     let this_slot = c.cur().alloc_slot();
@@ -635,12 +636,21 @@ impl Compiler {
     ) -> CResult<()> {
         let line = body.span.start.line;
         let saved_len = self.cur().locals.len();
+        // let/const で宣言されたループ変数のスロット（`var` は対象外）。
+        // JS の for 文は「イテレーションごとに新しい束縛」を要求する
+        // （closure がループ変数を捕捉した場合に観測できる違い）ため、
+        // 初回テスト直前と各イテレーション末尾（continue の合流点）で
+        // セルを丸ごと差し替える（`OpCode::RebindLocal`）。
+        let mut per_iter_slots: Vec<LocalIdx> = Vec::new();
         if let Some(init) = init {
             match init {
-                ForInit::VarDecl(_, decls) => {
+                ForInit::VarDecl(kind, decls) => {
                     for d in decls {
                         for name in pattern_names(&d.name) {
-                            self.declare_local(&name);
+                            let slot = self.declare_local(&name);
+                            if *kind != ast::VarKind::Var {
+                                per_iter_slots.push(slot);
+                            }
                         }
                         if let Some(e) = &d.init {
                             self.compile_expr(e)?;
@@ -655,6 +665,9 @@ impl Compiler {
                     self.emit(OpCode::Pop, line);
                 }
             }
+        }
+        for &slot in &per_iter_slots {
+            self.emit(OpCode::RebindLocal(slot), line);
         }
         let test_addr = self.cur_addr();
         let jf = if let Some(test) = test {
@@ -671,6 +684,9 @@ impl Compiler {
         self.compile_stmt(body)?;
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
+        for &slot in &per_iter_slots {
+            self.emit(OpCode::RebindLocal(slot), line);
+        }
         if let Some(u) = update {
             self.compile_expr(u)?;
             self.emit(OpCode::Pop, line);
@@ -1353,6 +1369,7 @@ impl Compiler {
             chunk: Rc::new(fctx.chunk),
             upvalues: fctx.upvalues,
             is_arrow: f.is_arrow,
+            is_async: f.is_async,
             param_count: f.params.iter().filter(|p| !p.rest).count(),
             has_rest,
         })
@@ -1453,6 +1470,7 @@ impl Compiler {
             chunk: Rc::new(fctx.chunk),
             upvalues: fctx.upvalues,
             is_arrow: false,
+            is_async: false,
             param_count: 0,
             has_rest: false,
         }))
@@ -1877,14 +1895,53 @@ impl Compiler {
                 }
             }
             ExprKind::Member { obj, prop, .. } => {
-                if matches!(prop, PropertyKey::Computed(_)) {
-                    // computed member（`obj[expr]`）への複合代入/論理代入は T2 では
-                    // 未対応（コーパス未使用のため、obj/key の二重評価問題を
-                    // 一時ローカル方式できちんと解くのは T3 以降に回す）。
-                    return Err(err(
-                        line,
-                        "computed member への複合代入/論理代入は現時点で未対応です",
-                    ));
+                if let PropertyKey::Computed(ke) = prop {
+                    // `obj[expr] += v` 等: obj/key を一時ローカルへ保存して
+                    // 二重評価を避ける（`compile_update` の Member 分岐と同じ
+                    // 「新しい値も一時ローカルへ束縛してから正しい順序で
+                    // 積み直す」パターンを使う）。
+                    let tmp_obj = self.temp_slot();
+                    self.compile_expr(obj)?;
+                    self.emit(OpCode::BindLocal(tmp_obj), line);
+                    let tmp_key = self.temp_slot();
+                    self.compile_expr(ke)?;
+                    self.emit(OpCode::BindLocal(tmp_key), line);
+                    if is_logical {
+                        self.emit(OpCode::GetLocal(tmp_obj), line);
+                        self.emit(OpCode::GetLocal(tmp_key), line);
+                        self.emit(OpCode::GetIndex, line);
+                        let j = match op {
+                            AssignOp::AndAssign => self.emit_jump(OpCode::JumpIfFalsyKeep, line),
+                            AssignOp::OrAssign => self.emit_jump(OpCode::JumpIfTruthyKeep, line),
+                            AssignOp::NullishAssign => {
+                                self.emit_jump(OpCode::JumpIfNotNullishKeep, line)
+                            }
+                            _ => unreachable!(),
+                        };
+                        self.emit(OpCode::Pop, line);
+                        self.compile_expr(value)?;
+                        let tmp_new = self.temp_slot();
+                        self.emit(OpCode::BindLocal(tmp_new), line);
+                        self.emit(OpCode::GetLocal(tmp_obj), line);
+                        self.emit(OpCode::GetLocal(tmp_key), line);
+                        self.emit(OpCode::GetLocal(tmp_new), line);
+                        self.emit(OpCode::SetIndex, line);
+                        let end = self.cur_addr();
+                        self.patch_jump(j, end);
+                    } else {
+                        self.emit(OpCode::GetLocal(tmp_obj), line);
+                        self.emit(OpCode::GetLocal(tmp_key), line);
+                        self.emit(OpCode::GetIndex, line);
+                        self.compile_expr(value)?;
+                        self.emit(plain_op.unwrap(), line);
+                        let tmp_new = self.temp_slot();
+                        self.emit(OpCode::BindLocal(tmp_new), line);
+                        self.emit(OpCode::GetLocal(tmp_obj), line);
+                        self.emit(OpCode::GetLocal(tmp_key), line);
+                        self.emit(OpCode::GetLocal(tmp_new), line);
+                        self.emit(OpCode::SetIndex, line);
+                    }
+                    return Ok(());
                 }
                 let name = property_key_static_name(prop);
                 let tmp_obj = self.temp_slot();

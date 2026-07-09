@@ -48,6 +48,10 @@ pub enum OpCode {
     SetLocal(LocalIdx),
     /// 宣言（let/const/var/パラメータ/分割代入の束縛）用。pop して書き込み、push し直さない。
     BindLocal(LocalIdx),
+    /// `for (let i ...)` の per-iteration 束縛用: このスロットの現在値を
+    /// コピーした「新しいセル」に差し替える（既存のセルを指すクロージャは
+    /// 古い値を保持したまま、以後の書き込みからは切り離される）。
+    RebindLocal(LocalIdx),
     GetUpvalue(UpvalueIdx),
     SetUpvalue(UpvalueIdx),
     /// グローバル（モジュールトップレベル・ビルトイン）変数の参照/代入。
@@ -222,6 +226,7 @@ pub struct FunctionTemplate {
     pub chunk: Rc<Chunk>,
     pub upvalues: Vec<UpvalueDesc>,
     pub is_arrow: bool,
+    pub is_async: bool,
     pub param_count: usize,
     pub has_rest: bool,
 }
@@ -283,6 +288,11 @@ pub struct Chunk {
     /// モジュールのトップレベルチャンクにのみ意味を持つ:
     /// export 名 -> ローカルスロット の対応表。
     pub exports: Vec<(Rc<str>, LocalIdx)>,
+    /// これがモジュールのトップレベルチャンクなら true（T3: `Return` 実行時に
+    /// 「このタスクはモジュール本体である」を `frames.len() == 1` という
+    /// 深さだけに頼らず判定するためのマーカー。async 関数呼び出しも
+    /// 専用のフレーム列を新規に持つため、深さだけでは区別できない）。
+    pub is_module: bool,
 }
 
 impl Chunk {
@@ -295,6 +305,7 @@ impl Chunk {
             exception_table: Vec::new(),
             num_locals: 0,
             exports: Vec::new(),
+            is_module: false,
         }
     }
 }

@@ -79,6 +79,48 @@ impl Interpreter {
         self.vm.now_fn = Some(Rc::new(f));
     }
 
+    /// 未捕捉の Promise reject をホストへ報告するフックを差し替える
+    /// （既定は何もしない）。`Vm::run_event_loop` がマイクロタスクを
+    /// 汲み尽くした時点でまだ誰も観測していない reject に対して呼ばれる。
+    pub fn set_unhandled_rejection_hook(&mut self, f: impl FnMut(&value::Value) + 'static) {
+        self.vm.on_unhandled_rejection = Box::new(f);
+    }
+
+    /// ホスト側が非同期に解決する `Promise` を返すネイティブ関数を登録する
+    /// （T3: `sys.wait` のようなホスト API のための口。T5 で Noiria の
+    /// `op_wait`/`op_input_next_event` 等をここに載せる想定）。
+    ///
+    /// `f` は呼び出しの度に `HostPromise` ハンドルを受け取る。呼び出し自体は
+    /// 即座にその Promise を返す（同期）。ハンドルはホスト側で保持しておき、
+    /// 後で（タイマー発火・入力イベント等のタイミングで）
+    /// `HostPromise::resolve`/`reject` を呼んで解決する。
+    pub fn register_native_async(
+        &mut self,
+        name: &str,
+        arity: usize,
+        f: impl Fn(&mut vm::Vm, value::Value, &[value::Value], vm::HostPromise) + 'static,
+    ) {
+        let f = Rc::new(f);
+        self.vm.register_native(
+            name,
+            arity,
+            Rc::new(move |vm, this, args| {
+                let (promise_val, handle) = vm.new_host_promise();
+                f(vm, this, args, handle);
+                Ok(promise_val)
+            }),
+        );
+    }
+
+    /// マイクロタスクキューを汲み尽くす（`.then` 反応・`await` の再開等）。
+    /// 保留中のホスト Promise（`register_native_async` 由来）がまだ残って
+    /// いれば `PumpState::Waiting`、無ければ `PumpState::Idle` を返す。
+    /// Noiria 統合（T5）ではゲームループの 1 フレームごとにこれを呼び、
+    /// ホスト Promise を解決してからまた呼ぶ、という形で駆動する想定。
+    pub fn run_event_loop(&mut self) -> vm::PumpState {
+        self.vm.run_event_loop()
+    }
+
     pub fn vm(&mut self) -> &mut vm::Vm {
         &mut self.vm
     }

@@ -2,7 +2,7 @@
 name = "tsint"
 version = "0.1.0"
 edition = "2021"
-description = "完全自作 TypeScript インタプリタ（Noiria エンジン用）。T2: バイトコードコンパイラ + 明示スタック VM。"
+description = "完全自作 TypeScript インタプリタ（Noiria エンジン用）。T2: バイトコードコンパイラ + 明示スタック VM。T3: Promise / async・await / イベントループ。"
 license = "MIT"
 
 # 方針: 依存クレートはゼロ。dev-dependencies も追加しない（std のみで完結させる）。

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::value::*;
-use crate::vm::{array_values, number_to_js_string, to_number, KindTag, Vm};
+use crate::vm::{array_values, is_callable, number_to_js_string, to_number, KindTag, Vm};
 
 fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
@@ -33,6 +33,7 @@ pub fn install(vm: &mut Vm) {
     install_map_set_ctors(vm);
     install_errors(vm);
     install_date(vm);
+    install_promise(vm);
 }
 
 // =====================================================================
@@ -683,6 +684,7 @@ fn install_globals_misc(vm: &mut Vm) {
                         chunk,
                         upvalues: Rc::new(Vec::new()),
                         is_arrow: false,
+                        is_async: false,
                     });
                     Ok(Value::Object(Rc::new(RefCell::new(ObjData::new(
                         ObjKind::Function(fo),
@@ -859,6 +861,215 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 // =====================================================================
+// Promise（T3）
+// =====================================================================
+
+fn install_promise(vm: &mut Vm) {
+    let ctor = native("Promise", 1, |vm, _this, args| {
+        let executor = arg(args, 0);
+        let (promise_val, promise_obj) = vm.new_pending_promise();
+        let p_res = promise_obj.clone();
+        let resolve_fn = Value::native_fn(
+            "",
+            1,
+            Rc::new(move |vm, _this, args| {
+                vm.resolve_promise(p_res.clone(), arg(args, 0));
+                Ok(Value::Undefined)
+            }),
+        );
+        let p_rej = promise_obj.clone();
+        let reject_fn = Value::native_fn(
+            "",
+            1,
+            Rc::new(move |vm, _this, args| {
+                vm.settle_promise(p_rej.clone(), Err(arg(args, 0)));
+                Ok(Value::Undefined)
+            }),
+        );
+        if let Err(e) = vm.call_value(executor, Value::Undefined, &[resolve_fn, reject_fn]) {
+            vm.settle_promise(promise_obj, Err(e));
+        }
+        Ok(promise_val)
+    });
+
+    let resolve = native("resolve", 1, |vm, _this, args| {
+        let v = arg(args, 0);
+        if let Value::Object(o) = &v {
+            if matches!(o.borrow().kind, ObjKind::Promise(_)) {
+                return Ok(v);
+            }
+        }
+        let p = vm.coerce_to_promise(v);
+        Ok(Value::Object(p))
+    });
+    let reject = native("reject", 1, |vm, _this, args| {
+        let (v, obj) = vm.new_pending_promise();
+        vm.settle_promise(obj, Err(arg(args, 0)));
+        Ok(v)
+    });
+    let race = native("race", 1, |vm, _this, args| {
+        let items = vm.materialize_iter_array(&arg(args, 0))?;
+        let (result_val, result_obj) = vm.new_pending_promise();
+        let (_, dummy) = vm.new_pending_promise();
+        for item in items {
+            let p = vm.coerce_to_promise(item);
+            let on_fulfilled = settle_forward_fn(result_obj.clone(), false);
+            let on_rejected = settle_forward_fn(result_obj.clone(), true);
+            vm.add_promise_reaction(
+                &p,
+                PromiseReaction::Then {
+                    on_fulfilled: Some(on_fulfilled),
+                    on_rejected: Some(on_rejected),
+                    result_promise: dummy.clone(),
+                },
+            );
+        }
+        Ok(result_val)
+    });
+    let all = native("all", 1, |vm, _this, args| {
+        let items = vm.materialize_iter_array(&arg(args, 0))?;
+        let (result_val, result_obj) = vm.new_pending_promise();
+        if items.is_empty() {
+            vm.resolve_promise(result_obj, Value::new_array(Vec::new()));
+            return Ok(result_val);
+        }
+        let total = items.len();
+        let results: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(vec![Value::Undefined; total]));
+        let remaining: Rc<RefCell<usize>> = Rc::new(RefCell::new(total));
+        let (_, dummy) = vm.new_pending_promise();
+        for (i, item) in items.into_iter().enumerate() {
+            let p = vm.coerce_to_promise(item);
+            let results_c = results.clone();
+            let remaining_c = remaining.clone();
+            let result_obj_c = result_obj.clone();
+            let on_fulfilled = native("", 1, move |vm, _this, args| {
+                results_c.borrow_mut()[i] = arg(args, 0);
+                *remaining_c.borrow_mut() -= 1;
+                if *remaining_c.borrow() == 0 {
+                    let arr = Value::new_array(results_c.borrow().clone());
+                    vm.resolve_promise(result_obj_c.clone(), arr);
+                }
+                Ok(Value::Undefined)
+            });
+            let result_obj_r = result_obj.clone();
+            let on_rejected = native("", 1, move |vm, _this, args| {
+                vm.settle_promise(result_obj_r.clone(), Err(arg(args, 0)));
+                Ok(Value::Undefined)
+            });
+            vm.add_promise_reaction(
+                &p,
+                PromiseReaction::Then {
+                    on_fulfilled: Some(on_fulfilled),
+                    on_rejected: Some(on_rejected),
+                    result_promise: dummy.clone(),
+                },
+            );
+        }
+        Ok(result_val)
+    });
+    if let Value::Object(o) = &ctor {
+        let mut b = o.borrow_mut();
+        b.props.set_value(Rc::from("resolve"), resolve);
+        b.props.set_value(Rc::from("reject"), reject);
+        b.props.set_value(Rc::from("race"), race);
+        b.props.set_value(Rc::from("all"), all);
+    }
+    vm.define_global("Promise", ctor);
+}
+
+/// `Promise.race` 用: 自分（引数の値/例外）で `target` を確定させ、戻り値は
+/// 捨てる（呼び出し元は使い捨ての `result_promise` にぶら下げる）。
+fn settle_forward_fn(target: ObjRef, is_reject: bool) -> Value {
+    native("", 1, move |vm, _this, args| {
+        let v = arg(args, 0);
+        if is_reject {
+            vm.settle_promise(target.clone(), Err(v));
+        } else {
+            vm.resolve_promise(target.clone(), v);
+        }
+        Ok(Value::Undefined)
+    })
+}
+
+fn promise_method(name: &str) -> Option<Value> {
+    Some(match name {
+        "then" => native("then", 2, |vm, this, args| {
+            let Value::Object(p) = &this else {
+                return Err(vm.type_error("Promise ではありません"));
+            };
+            let on_fulfilled = match arg(args, 0) {
+                v if is_callable(&v) => Some(v),
+                _ => None,
+            };
+            let on_rejected = match arg(args, 1) {
+                v if is_callable(&v) => Some(v),
+                _ => None,
+            };
+            let (result_val, result_obj) = vm.new_pending_promise();
+            vm.add_promise_reaction(
+                p,
+                PromiseReaction::Then {
+                    on_fulfilled,
+                    on_rejected,
+                    result_promise: result_obj,
+                },
+            );
+            Ok(result_val)
+        }),
+        "catch" => native("catch", 1, |vm, this, args| {
+            let Value::Object(p) = &this else {
+                return Err(vm.type_error("Promise ではありません"));
+            };
+            let on_rejected = match arg(args, 0) {
+                v if is_callable(&v) => Some(v),
+                _ => None,
+            };
+            let (result_val, result_obj) = vm.new_pending_promise();
+            vm.add_promise_reaction(
+                p,
+                PromiseReaction::Then {
+                    on_fulfilled: None,
+                    on_rejected,
+                    result_promise: result_obj,
+                },
+            );
+            Ok(result_val)
+        }),
+        "finally" => native("finally", 1, |vm, this, args| {
+            let Value::Object(p) = &this else {
+                return Err(vm.type_error("Promise ではありません"));
+            };
+            let cb = arg(args, 0);
+            let (result_val, result_obj) = vm.new_pending_promise();
+            let cb_f = cb.clone();
+            // finally のコールバックは引数無しで呼ばれ、戻り値は無視される
+            // （投げた場合のみそれが新しい結果を上書きする）。元の値/例外は
+            // そのまま透過する（`then`/`catch` と違い finally は値を変えない）。
+            let on_fulfilled = native("", 1, move |vm, _this, args| {
+                let v = arg(args, 0);
+                vm.call_value(cb_f.clone(), Value::Undefined, &[])?;
+                Ok(v)
+            });
+            let on_rejected = native("", 1, move |vm, _this, args| {
+                let e = arg(args, 0);
+                vm.call_value(cb.clone(), Value::Undefined, &[])?;
+                Err(e)
+            });
+            vm.add_promise_reaction(
+                p,
+                PromiseReaction::Then {
+                    on_fulfilled: Some(on_fulfilled),
+                    on_rejected: Some(on_rejected),
+                    result_promise: result_obj,
+                },
+            );
+            Ok(result_val)
+        }),
+        _ => return None,
+    })
+}
+
+// =====================================================================
 // Array.prototype / String.prototype / Map.prototype / Set.prototype / RegExp
 // =====================================================================
 
@@ -869,6 +1080,7 @@ pub fn method_for(tag: KindTag, name: &str) -> Option<Value> {
         KindTag::Map => map_method(name),
         KindTag::Set => set_method(name),
         KindTag::Regex => regex_method(name),
+        KindTag::Promise => promise_method(name),
     }
 }
 

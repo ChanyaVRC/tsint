@@ -240,6 +240,10 @@ pub struct FunctionObj {
     pub chunk: Rc<Chunk>,
     pub upvalues: Rc<Vec<Rc<RefCell<Value>>>>,
     pub is_arrow: bool,
+    /// `async function`/`async () => {}`/`async` メソッド。呼び出すと本体を
+    /// 即座には実行せず、専用のフレーム列（タスク）で駆動して Promise を返す
+    /// （`vm.rs` の `spawn_async_task_from_function` 参照）。
+    pub is_async: bool,
 }
 
 /// Map/Set はコーパスで使う分の操作を素朴な Vec で実装する（挿入順保持）。
@@ -280,6 +284,57 @@ pub enum ObjKind {
     Error,
     /// 正規表現（最小サブセット。`src/regex_mini.rs` 参照）。
     Regex(Rc<crate::regex_mini::MiniRegex>),
+    /// Promise（T3）。状態と pending 中の反応（reaction）を保持する。
+    Promise(PromiseData),
+}
+
+/// Promise の 3 状態。
+pub enum PromiseState {
+    Pending,
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+/// pending 中に登録された「解決/棄却時にやること」。
+/// `.then`/`.catch`/`.finally` はハンドラ呼び出し＋新しい Promise の解決、
+/// `await` は中断していたフレーム列の再開として扱う。
+pub enum PromiseReaction {
+    Then {
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+        result_promise: ObjRef,
+    },
+    Await(AwaitContinuation),
+}
+
+/// `await` で中断した実行単位（1 回の async 関数呼び出し、またはモジュール
+/// トップレベル）の継続。`frames` は中断時点のフレーム列そのもの
+/// （`Vm.frames` を丸ごと `std::mem::take` したもの）。
+pub struct AwaitContinuation {
+    pub frames: Vec<crate::vm::Frame>,
+    /// この継続が属するタスク全体が完了した時に確定させる Promise
+    /// （async 関数自身の戻り値 Promise、またはモジュールトップレベル用の
+    /// 内部 Promise）。
+    pub owner_promise: ObjRef,
+}
+
+pub struct PromiseData {
+    pub state: PromiseState,
+    pub reactions: Vec<PromiseReaction>,
+    /// 一度でも `.then`/`.catch`/`.finally`/`await` の対象になったかどうか。
+    /// reject 時にこれが false のままだと「未捕捉の reject」としてホストへ
+    /// 報告する（`Vm::run_event_loop` 参照）。
+    pub handled: bool,
+}
+
+impl PromiseData {
+    pub fn pending() -> Self {
+        PromiseData {
+            state: PromiseState::Pending,
+            reactions: Vec::new(),
+            handled: false,
+        }
+    }
 }
 
 pub struct ClassData {

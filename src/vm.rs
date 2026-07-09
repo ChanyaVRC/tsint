@@ -11,7 +11,7 @@
 //! 拡張が自然に可能になる。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::bytecode::*;
@@ -47,6 +47,22 @@ impl Frame {
     }
 }
 
+/// `Vm::step` の結果。
+enum StepSignal {
+    /// 通常の 1 命令実行（フレームはまだ継続中）。
+    None,
+    /// 現在のフレームが `Return` で完全に戻った。
+    Returned(Value),
+    /// `await` によりタスク全体（`self.frames`）が中断された。
+    Suspended,
+}
+
+/// `Vm::run_until` の結果。
+pub enum RunOutcome {
+    Value(Value),
+    Suspended,
+}
+
 /// ビルトインメソッドのディスパッチ先を区別するタグ（`builtins.rs` 参照）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KindTag {
@@ -55,6 +71,56 @@ pub enum KindTag {
     Map,
     Set,
     Regex,
+    Promise,
+}
+
+/// T3: マイクロタスクキューに積まれる仕事の単位。
+pub enum MicrotaskJob {
+    /// `.then`/`.catch`/`.finally` が登録した反応。
+    Then {
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+        result_promise: ObjRef,
+        outcome: Result<Value, Value>,
+    },
+    /// `resolve(thenable)` された時の「相手の then を叩く」ジョブ
+    /// （PromiseResolveThenableJob 相当）。
+    ResolveThenable {
+        promise: ObjRef,
+        thenable: Value,
+        then_fn: Value,
+    },
+    /// `await` で中断していたタスクの再開。
+    ResumeAwait {
+        cont: AwaitContinuation,
+        outcome: Result<Value, Value>,
+    },
+}
+
+/// `run_event_loop` の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpState {
+    /// マイクロタスクキューが空で、保留中のホスト Promise も無い
+    /// （これ以上ホストが何かしない限り進む処理は無い）。
+    Idle,
+    /// マイクロタスクキューは空だが、`HostPromise` がまだ解決されていない
+    /// ものが残っている（ホストが時間を進める・入力を与える等すれば続行できる）。
+    Waiting,
+}
+
+/// ホストが後から解決/棄却できる Promise のハンドル
+/// （`Interpreter::register_native_async` 参照）。
+pub struct HostPromise {
+    promise: ObjRef,
+}
+
+impl HostPromise {
+    pub fn resolve(&self, vm: &mut Vm, value: Value) {
+        vm.settle_host_promise(self.promise.clone(), Ok(value));
+    }
+    pub fn reject(&self, vm: &mut Vm, value: Value) {
+        vm.settle_host_promise(self.promise.clone(), Err(value));
+    }
 }
 
 pub struct Vm {
@@ -67,6 +133,29 @@ pub struct Vm {
     /// モジュールのトップレベルフレームが `Return` した瞬間に export 値を
     /// 確定させておくための一時置き場（フレームは Return 直後に pop されるため）。
     pending_module_exports: Option<Vec<(Rc<str>, Value)>>,
+
+    // ---------------- T3: Promise / イベントループ ----------------
+    /// マイクロタスクキュー（FIFO）。
+    pub microtasks: VecDeque<MicrotaskJob>,
+    /// reject 時に reaction が 1 つも無かった Promise の一覧。マイクロタスク
+    /// キューが完全にはけた時点でまだ handled になっていなければ
+    /// 「未捕捉の reject」としてホストへ報告する。
+    maybe_unhandled: Vec<ObjRef>,
+    /// 未捕捉 reject の報告フック（既定は何もしない）。
+    pub on_unhandled_rejection: Box<dyn FnMut(&Value)>,
+    /// `HostPromise` のうちまだ解決されていない数（`run_event_loop` が
+    /// `PumpState::Waiting` を返すかどうかの判定に使う）。
+    pending_host_count: usize,
+    /// 現在実行中のタスク（フレーム列）が、ネイティブ関数の Rust 再帰呼び出し
+    /// （`call_value`/`call_function_obj`）の内側で動いている深さ。0 より
+    /// 大きい間は `await` によるフレーム列の中断ができない（Rust の呼び出し
+    /// スタックを巻き戻す手段が無いため）。async 関数呼び出しは常に新しい
+    /// 独立したフレーム列で駆動されるため、この深さは async 呼び出しの
+    /// たびに 0 へリセットされる（`drive_current_task` 参照）。
+    native_call_depth: u32,
+    /// 現在駆動中のタスクが完了した時に確定させる Promise
+    /// （`await` 中断時に継続へ持たせる）。
+    current_owner_promise: Option<ObjRef>,
 }
 
 impl Vm {
@@ -77,6 +166,12 @@ impl Vm {
             on_log: Box::new(|s: &str| println!("{s}")),
             now_fn: None,
             pending_module_exports: None,
+            microtasks: VecDeque::new(),
+            maybe_unhandled: Vec::new(),
+            on_unhandled_rejection: Box::new(|_v: &Value| {}),
+            pending_host_count: 0,
+            native_call_depth: 0,
+            current_owner_promise: None,
         };
         crate::builtins::install(&mut vm);
         vm
@@ -98,11 +193,43 @@ impl Vm {
     // =================================================================
 
     /// モジュールのトップレベルチャンクを実行し、export された値の一覧を返す。
+    ///
+    /// T3: モジュール本体もひとつの「タスク」として駆動する。トップレベル
+    /// `await` に出会うと（他の async 関数と同じ仕組みで）中断し、
+    /// マイクロタスクキュー（Promise チェーン）を汲み尽くしてから完了状態を
+    /// 確認する。トップレベル `await` がホスト側の `HostPromise`
+    /// （まだ誰も resolve/reject していないもの）待ちのまま残った場合は
+    /// エラーになる（`run_module` は同期 API のため。ホスト駆動の非同期
+    /// モジュール実行には `Vm::run_event_loop` を直接使うこと。T5 で
+    /// Noiria 統合する際はこちらの経路を使う想定）。
     pub fn run_module(&mut self, chunk: Rc<Chunk>) -> Result<Vec<(Rc<str>, Value)>, Value> {
         let frame = Frame::new(chunk, Rc::new(Vec::new()), Rc::new(Vec::new()));
-        self.frames.push(frame);
-        self.run_until(0)?;
-        Ok(self.pending_module_exports.take().unwrap_or_default())
+        self.frames = vec![frame];
+        let (_, owner) = self.new_pending_promise();
+        self.drive_current_task(owner.clone());
+        // モジュール本体が同期的に完了した場合でも、Promise チェーンの
+        // マイクロタスクは必ず 1 回汲み尽くす（`Promise.resolve().then(...)`
+        // のようなコードが `run_module` から戻る前に実行されることを保証する）。
+        self.run_event_loop();
+        let state = {
+            let b = owner.borrow();
+            match &b.kind {
+                ObjKind::Promise(pd) => match &pd.state {
+                    PromiseState::Pending => None,
+                    PromiseState::Fulfilled(v) => Some(Ok(v.clone())),
+                    PromiseState::Rejected(e) => Some(Err(e.clone())),
+                },
+                _ => None,
+            }
+        };
+        match state {
+            Some(Ok(_)) => Ok(self.pending_module_exports.take().unwrap_or_default()),
+            Some(Err(e)) => Err(e),
+            None => Err(self.type_error(
+                "トップレベル await が解決しませんでした（保留中のホスト Promise があります。\
+                 run_module は同期 API のため続行できません — run_event_loop を使ってください）",
+            )),
+        }
     }
 
     // =================================================================
@@ -113,14 +240,22 @@ impl Vm {
     /// 例外は各フレームの例外テーブルで処理を試み、処理できなければ
     /// フレームを 1 つ捨てて外側へ伝播する。`stop_depth` より外側まで
     /// 伝播したら `Err` で返す。
-    pub fn run_until(&mut self, stop_depth: usize) -> Result<Value, Value> {
+    ///
+    /// T3: `await` によってタスク全体が中断された場合は
+    /// `Ok(RunOutcome::Suspended)` を返す（この時点で `self.frames` は
+    /// 空になっている）。これは `native_call_depth == 0`（＝ Rust の
+    /// 再帰呼び出しの内側ではない、タスク駆動ループ自身の呼び出し）の
+    /// 場合にのみ起こる。`call_value`/`call_function_obj` の中では
+    /// `native_call_depth` を必ずインクリメントしてから `run_until` を
+    /// 呼ぶため、そちらの経路で `Suspended` が返ることは無い。
+    pub fn run_until(&mut self, stop_depth: usize) -> Result<RunOutcome, Value> {
         let mut last_value = Value::Undefined;
         loop {
             if self.frames.len() <= stop_depth {
-                return Ok(last_value);
+                return Ok(RunOutcome::Value(last_value));
             }
             match self.step() {
-                Ok(Some(v)) => {
+                Ok(StepSignal::Returned(v)) => {
                     // 関数が 1 つ完了した。まだこの run_until の管轄内
                     // （stop_depth より深い位置）にフレームが残っているなら、
                     // それは通常のバイトコード `Call`/`New` から戻ってきた
@@ -138,7 +273,8 @@ impl Vm {
                         last_value = v;
                     }
                 }
-                Ok(None) => {}
+                Ok(StepSignal::None) => {}
+                Ok(StepSignal::Suspended) => return Ok(RunOutcome::Suspended),
                 Err(thrown) => {
                     self.unwind(thrown, stop_depth)?;
                 }
@@ -172,9 +308,11 @@ impl Vm {
     }
 
     /// 1 命令だけ実行する。`Return` でフレームが完全に返った場合のみ
-    /// その戻り値を `Ok(Some(v))` で伝える（呼び出し元 `run_until` のトップレベル
-    /// 戻り値を組み立てるため）。
-    fn step(&mut self) -> Result<Option<Value>, Value> {
+    /// その戻り値を `StepSignal::Returned(v)` で伝える（呼び出し元 `run_until` の
+    /// トップレベル戻り値を組み立てるため）。`await` によるタスク全体の中断は
+    /// `StepSignal::Suspended` で伝える（この時点で `self.frames` は既に
+    /// 空になっている — 継続はどこかの Promise の reaction として登録済み）。
+    fn step(&mut self) -> Result<StepSignal, Value> {
         let frame = self.frames.last_mut().unwrap();
         let ip = frame.ip;
         let op = frame.chunk.code[ip];
@@ -246,6 +384,11 @@ impl Vm {
             OpCode::BindLocal(slot) => {
                 let v = self.pop();
                 *self.frames.last().unwrap().locals[slot as usize].borrow_mut() = v;
+            }
+            OpCode::RebindLocal(slot) => {
+                let f = self.frames.last_mut().unwrap();
+                let cur = f.locals[slot as usize].borrow().clone();
+                f.locals[slot as usize] = Rc::new(RefCell::new(cur));
             }
             OpCode::GetUpvalue(idx) => {
                 let cell = self.frames.last().unwrap().upvalues[idx as usize].clone();
@@ -521,9 +664,12 @@ impl Vm {
             }
             OpCode::Return => {
                 let v = self.pop();
-                if self.frames.len() == 1 {
+                if self.frames.len() == 1 && self.frames.last().unwrap().chunk.is_module {
                     // モジュールのトップレベルフレームが終了する。export 値を
                     // pop してしまう前にここで確定させておく（`run_module` 参照）。
+                    // 深さだけでなく `chunk.is_module` も見る理由: T3 では
+                    // async 関数呼び出しも専用の（深さ 1 から始まる）フレーム列で
+                    // 駆動されるため、深さだけではモジュール本体と区別できない。
                     let frame = self.frames.last().unwrap();
                     let exports = frame
                         .chunk
@@ -536,7 +682,7 @@ impl Vm {
                     self.pending_module_exports = Some(exports);
                 }
                 self.frames.pop();
-                return Ok(Some(v));
+                return Ok(StepSignal::Returned(v));
             }
             OpCode::Throw => {
                 let v = self.pop();
@@ -723,16 +869,30 @@ impl Vm {
                 self.push(Value::Object(Rc::new(RefCell::new(o))));
             }
             OpCode::Await => {
-                let v = self.pop();
-                if is_thenable(&v) {
+                // ネイティブ関数の Rust 再帰呼び出し（`call_value`/`call_function_obj`）
+                // の内側では、Rust の呼び出しスタックを巻き戻す手段が無いため
+                // 中断できない（README の既知の制約を参照）。
+                if self.native_call_depth > 0 {
                     return Err(self.type_error(
-                        "await によるサスペンドは T3 で実装予定です（T2 は同期実行のみ）",
+                        "await はネイティブコールバックの内側では中断できません（T3 の既知の制約）",
                     ));
                 }
-                self.push(v);
+                let v = self.pop();
+                let promise = self.coerce_to_promise(v);
+                let owner = self
+                    .current_owner_promise
+                    .clone()
+                    .expect("await はタスク駆動ループの外では実行されないはず");
+                let frames = std::mem::take(&mut self.frames);
+                let cont = AwaitContinuation {
+                    frames,
+                    owner_promise: owner,
+                };
+                self.add_reaction(&promise, PromiseReaction::Await(cont));
+                return Ok(StepSignal::Suspended);
             }
         }
-        Ok(None)
+        Ok(StepSignal::None)
     }
 
     // =================================================================
@@ -778,6 +938,7 @@ impl Vm {
             chunk: tpl.chunk.clone(),
             upvalues: Rc::new(ups),
             is_arrow: tpl.is_arrow,
+            is_async: tpl.is_async,
         })
     }
 
@@ -897,7 +1058,21 @@ impl Vm {
         let depth_before = self.frames.len();
         match self.dispatch_call(callee, this, args.to_vec())? {
             CallOutcome::Immediate(v) => Ok(v),
-            CallOutcome::FramePushed => self.run_until(depth_before),
+            CallOutcome::FramePushed => {
+                // ここから先は「ネイティブ関数の Rust 再帰呼び出しの内側」
+                // 扱いになる。await によるタスク中断はサポートしない
+                // （`OpCode::Await` 参照）。
+                self.native_call_depth += 1;
+                let r = self.run_until(depth_before);
+                self.native_call_depth -= 1;
+                match r {
+                    Ok(RunOutcome::Value(v)) => Ok(v),
+                    Ok(RunOutcome::Suspended) => {
+                        Err(self.type_error("内部エラー: 予期しないタスク中断です"))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 
@@ -909,16 +1084,93 @@ impl Vm {
     ) -> Result<Value, Value> {
         let depth_before = self.frames.len();
         self.push_function_frame(&f, this, args.to_vec());
-        self.run_until(depth_before)
+        self.native_call_depth += 1;
+        let r = self.run_until(depth_before);
+        self.native_call_depth -= 1;
+        match r {
+            Ok(RunOutcome::Value(v)) => Ok(v),
+            Ok(RunOutcome::Suspended) => {
+                Err(self.type_error("内部エラー: 予期しないタスク中断です"))
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    fn push_function_frame(&mut self, f: &Rc<FunctionObj>, this: Value, args: Vec<Value>) {
+    fn make_function_frame(f: &Rc<FunctionObj>, this: Value, args: Vec<Value>) -> Frame {
         let raw_args = Rc::new(args);
         let mut frame = Frame::new(f.chunk.clone(), f.upvalues.clone(), raw_args);
         if !f.is_arrow && !frame.locals.is_empty() {
             frame.locals[0] = Rc::new(RefCell::new(this));
         }
-        self.frames.push(frame);
+        frame
+    }
+
+    fn push_function_frame(&mut self, f: &Rc<FunctionObj>, this: Value, args: Vec<Value>) {
+        self.frames.push(Self::make_function_frame(f, this, args));
+    }
+
+    /// async 関数呼び出し: 呼び出し元のフレーム列を退避し、この呼び出し
+    /// 専用の新しいフレーム列で本体を「最初の await または完了」まで
+    /// 同期的に駆動してから、呼び出し元のフレーム列を復元する
+    /// （async 関数はここまでを呼び出し時点で同期的に実行し、Promise を
+    /// 返した時点で呼び出し元へ制御を戻す、という JS の意味論どおり）。
+    fn spawn_async_task_from_function(
+        &mut self,
+        f: &Rc<FunctionObj>,
+        this: Value,
+        args: Vec<Value>,
+    ) -> Value {
+        let frame = Self::make_function_frame(f, this, args);
+        let caller_frames = std::mem::replace(&mut self.frames, vec![frame]);
+        let (promise_val, promise_obj) = self.new_pending_promise();
+        self.drive_current_task(promise_obj);
+        self.frames = caller_frames;
+        promise_val
+    }
+
+    /// `self.frames` に既にセットされているフレーム列（1 つのタスク）を、
+    /// 完了または次の `await` での中断まで駆動する。完了したらその結果で
+    /// `owner_promise` を確定させる。中断した場合は何もしない（継続は
+    /// `OpCode::Await` の処理内で既に登録済み）。
+    fn drive_current_task(&mut self, owner_promise: ObjRef) {
+        let saved_owner = self.current_owner_promise.replace(owner_promise.clone());
+        let saved_depth = self.native_call_depth;
+        self.native_call_depth = 0;
+        let outcome = self.run_until(0);
+        self.native_call_depth = saved_depth;
+        self.current_owner_promise = saved_owner;
+        match outcome {
+            Ok(RunOutcome::Value(v)) => self.resolve_promise(owner_promise, v),
+            Ok(RunOutcome::Suspended) => {}
+            Err(e) => self.settle_promise(owner_promise, Err(e)),
+        }
+    }
+
+    /// マイクロタスク `ResumeAwait` の処理本体: 保存しておいたフレーム列を
+    /// 復元し、await の結果（解決値 or 例外）を渡してタスクを再開する。
+    fn resume_continuation(&mut self, cont: AwaitContinuation, outcome: Result<Value, Value>) {
+        let AwaitContinuation {
+            frames,
+            owner_promise,
+        } = cont;
+        let caller_frames = std::mem::replace(&mut self.frames, frames);
+        let mut already_done = false;
+        match outcome {
+            Ok(v) => self.push(v),
+            Err(e) => {
+                // await 地点で投げ直す。unwind が例外テーブルで捕まえられなければ
+                // タスク全体が例外で終了する（このタスクの frames は既に
+                // 空になっている）。
+                if let Err(final_err) = self.unwind(e, 0) {
+                    self.settle_promise(owner_promise.clone(), Err(final_err));
+                    already_done = true;
+                }
+            }
+        }
+        if !already_done {
+            self.drive_current_task(owner_promise);
+        }
+        self.frames = caller_frames;
     }
 
     fn dispatch_call(
@@ -935,6 +1187,10 @@ impl Vm {
                         ObjKind::Function(f) => f.clone(),
                         _ => unreachable!(),
                     };
+                    if fo.is_async {
+                        let promise = self.spawn_async_task_from_function(&fo, this, args);
+                        return Ok(CallOutcome::Immediate(promise));
+                    }
                     self.push_function_frame(&fo, this, args);
                     return Ok(CallOutcome::FramePushed);
                 }
@@ -1103,6 +1359,7 @@ impl Vm {
                 ObjKind::Map(_) => Some(KindTag::Map),
                 ObjKind::Set(_) => Some(KindTag::Set),
                 ObjKind::Regex(_) => Some(KindTag::Regex),
+                ObjKind::Promise(_) => Some(KindTag::Promise),
                 _ => None,
             }
         };
@@ -1327,6 +1584,292 @@ impl Vm {
     pub fn reference_error(&self, msg: impl Into<String>) -> Value {
         self.make_error("ReferenceError", msg.into())
     }
+
+    // =================================================================
+    // T3: Promise / マイクロタスクキュー / イベントループ
+    // =================================================================
+
+    /// pending 状態の新しい Promise を作る。
+    pub fn new_pending_promise(&mut self) -> (Value, ObjRef) {
+        let obj: ObjRef = Rc::new(RefCell::new(ObjData::new(ObjKind::Promise(
+            PromiseData::pending(),
+        ))));
+        (Value::Object(obj.clone()), obj)
+    }
+
+    /// ホストが後から resolve/reject する Promise を作る
+    /// （`Interpreter::register_native_async` から使う）。
+    pub fn new_host_promise(&mut self) -> (Value, HostPromise) {
+        let (v, obj) = self.new_pending_promise();
+        self.pending_host_count += 1;
+        (v, HostPromise { promise: obj })
+    }
+
+    fn settle_host_promise(&mut self, promise: ObjRef, outcome: Result<Value, Value>) {
+        let was_pending = matches!(
+            promise.borrow().kind,
+            ObjKind::Promise(ref pd) if matches!(pd.state, PromiseState::Pending)
+        );
+        if was_pending {
+            self.pending_host_count = self.pending_host_count.saturating_sub(1);
+        }
+        match outcome {
+            Ok(v) => self.resolve_promise(promise, v),
+            Err(e) => self.settle_promise(promise, Err(e)),
+        }
+    }
+
+    /// 値を Promise へ強制変換する（`await` と `Promise.resolve` が共有する）。
+    /// 既に本物の Promise ならそれ自身を返す。それ以外は新しい Promise を
+    /// 作って `resolve_promise` に解決させる。
+    pub fn coerce_to_promise(&mut self, v: Value) -> ObjRef {
+        if let Value::Object(o) = &v {
+            if matches!(o.borrow().kind, ObjKind::Promise(_)) {
+                return o.clone();
+            }
+        }
+        let (_, p) = self.new_pending_promise();
+        self.resolve_promise(p.clone(), v);
+        p
+    }
+
+    /// Promise の「解決」手続き（thenable の吸収込み）。
+    /// - `value` が本物の Promise なら、その決着を待って自分もそれで決着する
+    ///   （チェーン連結）。
+    /// - `value` が汎用 thenable（呼び出し可能な `then` プロパティを持つ
+    ///   オブジェクト）なら、`then(resolve, reject)` をマイクロタスクとして
+    ///   呼び出す。
+    /// - それ以外はプレーンな値として即座に fulfill する。
+    pub fn resolve_promise(&mut self, promise: ObjRef, value: Value) {
+        if let Value::Object(o) = &value {
+            if Rc::ptr_eq(o, &promise) {
+                let err = self.type_error("Promise を自分自身の解決値にすることはできません");
+                self.settle_promise(promise, Err(err));
+                return;
+            }
+            let is_native_promise = matches!(o.borrow().kind, ObjKind::Promise(_));
+            if is_native_promise {
+                self.add_reaction(
+                    o,
+                    PromiseReaction::Then {
+                        on_fulfilled: None,
+                        on_rejected: None,
+                        result_promise: promise,
+                    },
+                );
+                return;
+            }
+            let then_fn = {
+                let b = o.borrow();
+                match b.props.get("then") {
+                    Some(PropSlot::Value(v)) if is_callable(v) => Some(v.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(then_fn) = then_fn {
+                self.microtasks.push_back(MicrotaskJob::ResolveThenable {
+                    promise,
+                    thenable: value,
+                    then_fn,
+                });
+                return;
+            }
+        }
+        self.settle_promise(promise, Ok(value));
+    }
+
+    /// Promise を直接 fulfilled/rejected へ確定させる（thenable 吸収はしない。
+    /// `resolve_promise` の内部実装、および reject 専用パスから使う）。
+    /// 既に決着済みなら無視する（二重解決は無効）。
+    pub fn settle_promise(&mut self, promise: ObjRef, outcome: Result<Value, Value>) {
+        let reactions = {
+            let mut b = promise.borrow_mut();
+            let ObjKind::Promise(pd) = &mut b.kind else {
+                return;
+            };
+            if !matches!(pd.state, PromiseState::Pending) {
+                return;
+            }
+            pd.state = match &outcome {
+                Ok(v) => PromiseState::Fulfilled(v.clone()),
+                Err(e) => PromiseState::Rejected(e.clone()),
+            };
+            std::mem::take(&mut pd.reactions)
+        };
+        if reactions.is_empty() && outcome.is_err() {
+            self.maybe_unhandled.push(promise.clone());
+        }
+        for r in reactions {
+            self.schedule_reaction(r, outcome.clone());
+        }
+    }
+
+    /// Promise に反応（`.then`/`.catch`/`.finally`/`await`）を登録する。
+    /// 既に決着済みならすぐにマイクロタスクとしてスケジュールする。
+    pub fn add_promise_reaction(&mut self, promise: &ObjRef, reaction: PromiseReaction) {
+        self.add_reaction(promise, reaction);
+    }
+
+    fn add_reaction(&mut self, promise: &ObjRef, reaction: PromiseReaction) {
+        enum St {
+            Pending,
+            Settled(Result<Value, Value>),
+        }
+        let st = {
+            let mut b = promise.borrow_mut();
+            let ObjKind::Promise(pd) = &mut b.kind else {
+                return;
+            };
+            pd.handled = true;
+            match &pd.state {
+                PromiseState::Pending => St::Pending,
+                PromiseState::Fulfilled(v) => St::Settled(Ok(v.clone())),
+                PromiseState::Rejected(e) => St::Settled(Err(e.clone())),
+            }
+        };
+        match st {
+            St::Pending => {
+                let mut b = promise.borrow_mut();
+                if let ObjKind::Promise(pd) = &mut b.kind {
+                    pd.reactions.push(reaction);
+                }
+            }
+            St::Settled(outcome) => self.schedule_reaction(reaction, outcome),
+        }
+    }
+
+    fn schedule_reaction(&mut self, reaction: PromiseReaction, outcome: Result<Value, Value>) {
+        match reaction {
+            PromiseReaction::Then {
+                on_fulfilled,
+                on_rejected,
+                result_promise,
+            } => self.microtasks.push_back(MicrotaskJob::Then {
+                on_fulfilled,
+                on_rejected,
+                result_promise,
+                outcome,
+            }),
+            PromiseReaction::Await(cont) => self
+                .microtasks
+                .push_back(MicrotaskJob::ResumeAwait { cont, outcome }),
+        }
+    }
+
+    fn run_microtask_job(&mut self, job: MicrotaskJob) {
+        match job {
+            MicrotaskJob::Then {
+                on_fulfilled,
+                on_rejected,
+                result_promise,
+                outcome,
+            } => match outcome {
+                Ok(v) => match on_fulfilled {
+                    Some(f) => match self.call_value(f, Value::Undefined, &[v]) {
+                        Ok(r) => self.resolve_promise(result_promise, r),
+                        Err(e) => self.settle_promise(result_promise, Err(e)),
+                    },
+                    None => self.resolve_promise(result_promise, v),
+                },
+                Err(e) => match on_rejected {
+                    Some(f) => match self.call_value(f, Value::Undefined, &[e]) {
+                        Ok(r) => self.resolve_promise(result_promise, r),
+                        Err(e2) => self.settle_promise(result_promise, Err(e2)),
+                    },
+                    None => self.settle_promise(result_promise, Err(e)),
+                },
+            },
+            MicrotaskJob::ResolveThenable {
+                promise,
+                thenable,
+                then_fn,
+            } => self.run_resolve_thenable(promise, thenable, then_fn),
+            MicrotaskJob::ResumeAwait { cont, outcome } => self.resume_continuation(cont, outcome),
+        }
+    }
+
+    /// PromiseResolveThenableJob 相当: `thenable.then(resolve, reject)` を
+    /// 呼び出す。resolve/reject はどちらか一方が最初の 1 回しか効かない。
+    fn run_resolve_thenable(&mut self, promise: ObjRef, thenable: Value, then_fn: Value) {
+        let called: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let p1 = promise.clone();
+        let called1 = called.clone();
+        let resolve_fn = Value::native_fn(
+            "",
+            1,
+            Rc::new(move |vm, _this, args| {
+                if *called1.borrow() {
+                    return Ok(Value::Undefined);
+                }
+                *called1.borrow_mut() = true;
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                vm.resolve_promise(p1.clone(), v);
+                Ok(Value::Undefined)
+            }),
+        );
+        let p2 = promise.clone();
+        let called2 = called.clone();
+        let reject_fn = Value::native_fn(
+            "",
+            1,
+            Rc::new(move |vm, _this, args| {
+                if *called2.borrow() {
+                    return Ok(Value::Undefined);
+                }
+                *called2.borrow_mut() = true;
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                vm.settle_promise(p2.clone(), Err(v));
+                Ok(Value::Undefined)
+            }),
+        );
+        if let Err(e) = self.call_value(then_fn, thenable, &[resolve_fn, reject_fn]) {
+            if !*called.borrow() {
+                *called.borrow_mut() = true;
+                self.settle_promise(promise, Err(e));
+            }
+        }
+    }
+
+    /// マイクロタスクキューを完全に汲み尽くす。キューが空になった時点で
+    /// まだ誰にも observe されていない reject があればホストへ報告する。
+    /// 戻り値は「これ以上ホストが介入しない限り進められる処理が残っているか」。
+    pub fn run_event_loop(&mut self) -> PumpState {
+        while let Some(job) = self.microtasks.pop_front() {
+            self.run_microtask_job(job);
+        }
+        if !self.maybe_unhandled.is_empty() {
+            let list = std::mem::take(&mut self.maybe_unhandled);
+            for p in list {
+                let report = {
+                    let b = p.borrow();
+                    match &b.kind {
+                        ObjKind::Promise(pd) => {
+                            !pd.handled && matches!(pd.state, PromiseState::Rejected(_))
+                        }
+                        _ => false,
+                    }
+                };
+                if report {
+                    let val = {
+                        let b = p.borrow();
+                        match &b.kind {
+                            ObjKind::Promise(pd) => match &pd.state {
+                                PromiseState::Rejected(v) => v.clone(),
+                                _ => Value::Undefined,
+                            },
+                            _ => Value::Undefined,
+                        }
+                    };
+                    (self.on_unhandled_rejection)(&val);
+                }
+            }
+        }
+        if self.pending_host_count > 0 {
+            PumpState::Waiting
+        } else {
+            PumpState::Idle
+        }
+    }
 }
 
 impl Default for Vm {
@@ -1344,15 +1887,13 @@ fn wrap_function(fo: Rc<FunctionObj>) -> Value {
     Value::Object(Rc::new(RefCell::new(ObjData::new(ObjKind::Function(fo)))))
 }
 
-fn is_thenable(v: &Value) -> bool {
-    if let Value::Object(o) = v {
-        matches!(
-            o.borrow().props.get("then"),
-            Some(PropSlot::Value(Value::Object(_)))
-        )
-    } else {
-        false
-    }
+/// 呼び出し可能（関数・ネイティブ関数）かどうか。クラスは `new` 経由でしか
+/// 呼べないのでここには含めない。
+pub fn is_callable(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Object(o) if matches!(o.borrow().kind, ObjKind::Function(_) | ObjKind::Native(_))
+    )
 }
 
 pub fn array_values(v: &Value) -> Vec<Value> {
@@ -1500,6 +2041,13 @@ pub fn to_string_basic(v: &Value) -> String {
                 ObjKind::Map(_) => "[object Map]".to_string(),
                 ObjKind::Set(_) => "[object Set]".to_string(),
                 ObjKind::Plain => "[object Object]".to_string(),
+                ObjKind::Promise(pd) => match &pd.state {
+                    PromiseState::Pending => "Promise { <pending> }".to_string(),
+                    PromiseState::Fulfilled(v) => format!("Promise {{ {} }}", to_string_basic(v)),
+                    PromiseState::Rejected(v) => {
+                        format!("Promise {{ <rejected> {} }}", to_string_basic(v))
+                    }
+                },
             }
         }
     }
