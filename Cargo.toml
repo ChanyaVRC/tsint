@@ -1,0 +1,13 @@
+[package]
+name = "tsint"
+version = "0.1.0"
+edition = "2021"
+description = "完全自作 TypeScript インタプリタ（Noiria エンジン用）。T1: レキサ + パーサ。"
+license = "MIT"
+
+# 方針: 依存クレートはゼロ。dev-dependencies も追加しない（std のみで完結させる）。
+[dependencies]
+
+[lib]
+name = "tsint"
+path = "src/lib.rs"
