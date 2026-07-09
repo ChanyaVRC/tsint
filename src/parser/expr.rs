@@ -288,7 +288,13 @@ impl Parser {
             if let Some(op) = op {
                 self.bump();
                 let arg = self.parse_unary()?;
-                return Ok(self.mk_expr(start, ExprKind::Unary { op, arg: Box::new(arg) }));
+                return Ok(self.mk_expr(
+                    start,
+                    ExprKind::Unary {
+                        op,
+                        arg: Box::new(arg),
+                    },
+                ));
             }
             if matches!(p, Punct::PlusPlus | Punct::MinusMinus) {
                 let op = if *p == Punct::PlusPlus {
@@ -318,7 +324,13 @@ impl Parser {
             if let Some(op) = op {
                 self.bump();
                 let arg = self.parse_unary()?;
-                return Ok(self.mk_expr(start, ExprKind::Unary { op, arg: Box::new(arg) }));
+                return Ok(self.mk_expr(
+                    start,
+                    ExprKind::Unary {
+                        op,
+                        arg: Box::new(arg),
+                    },
+                ));
             }
             if word == "await" {
                 self.bump();
@@ -742,7 +754,10 @@ impl Parser {
             let is_get = self.is_word("get");
             let mark = self.save();
             self.bump();
-            if !self.is_punct(Punct::Colon) && !self.is_punct(Punct::Comma) && !self.is_punct(Punct::RBrace) && !self.is_punct(Punct::LParen)
+            if !self.is_punct(Punct::Colon)
+                && !self.is_punct(Punct::Comma)
+                && !self.is_punct(Punct::RBrace)
+                && !self.is_punct(Punct::LParen)
             {
                 if let Ok(key) = self.parse_property_key() {
                     if self.is_punct(Punct::LParen) {
@@ -750,7 +765,11 @@ impl Parser {
                         return Ok(ObjectProp::Method {
                             key,
                             function: Box::new(function),
-                            kind: if is_get { MethodKind::Get } else { MethodKind::Set },
+                            kind: if is_get {
+                                MethodKind::Get
+                            } else {
+                                MethodKind::Set
+                            },
                         });
                     }
                 }
@@ -758,7 +777,11 @@ impl Parser {
             self.restore(mark);
         }
 
-        let is_async = if self.is_word("async") && !self.peek_kind_newline(1) && !self.peek_is_punct(1, Punct::Colon) && !self.peek_is_punct(1, Punct::Comma) {
+        let is_async = if self.is_word("async")
+            && !self.peek_kind_newline(1)
+            && !self.peek_is_punct(1, Punct::Colon)
+            && !self.peek_is_punct(1, Punct::Comma)
+        {
             self.bump();
             true
         } else {
@@ -802,7 +825,8 @@ impl Parser {
         let start = self.cur_span();
         let mut is_async = false;
         let async_arrow_head = self.peek_is_punct(1, Punct::LParen)
-            || (matches!(self.peek_kind(1), TokenKind::Ident(_)) && self.peek_is_punct(2, Punct::Arrow));
+            || (matches!(self.peek_kind(1), TokenKind::Ident(_))
+                && self.peek_is_punct(2, Punct::Arrow));
         if self.is_word("async") && !self.peek_kind_newline(1) && async_arrow_head {
             self.bump();
             is_async = true;
@@ -879,7 +903,11 @@ impl Parser {
         while !self.is_punct(Punct::RParen) {
             // アクセス修飾子 (constructor 引数プロパティ) は読み飛ばす。
             loop {
-                if self.is_word("public") || self.is_word("private") || self.is_word("protected") || self.is_word("readonly") {
+                if self.is_word("public")
+                    || self.is_word("private")
+                    || self.is_word("protected")
+                    || self.is_word("readonly")
+                {
                     self.bump();
                 } else {
                     break;
@@ -919,7 +947,11 @@ impl Parser {
     /// `function` の次のトークン（関数名の可能性がある識別子、または `(`）から、
     /// ジェネリクス・引数リスト・戻り値型・本体までを読む共通処理。
     /// `name_optional` は式（無名可）か宣言（有名前提）かの違いに使う。
-    pub(super) fn parse_function_tail(&mut self, is_async: bool, name_optional: bool) -> PResult<Function> {
+    pub(super) fn parse_function_tail(
+        &mut self,
+        is_async: bool,
+        name_optional: bool,
+    ) -> PResult<Function> {
         let start = self.cur_span();
         self.eat_punct(Punct::Star); // generator の '*' は読み飛ばす（非対応）
         let name = if !self.is_punct(Punct::LParen) && !self.is_punct(Punct::Lt) {

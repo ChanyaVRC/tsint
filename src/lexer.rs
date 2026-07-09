@@ -138,8 +138,22 @@ fn regex_allowed_after(prev: Option<&TokenKind>) -> bool {
             // ほとんどの識別子の後ろは除算だが、キーワードの後ろは正規表現。
             matches!(
                 name.as_str(),
-                "return" | "typeof" | "instanceof" | "in" | "of" | "new" | "delete" | "void"
-                    | "throw" | "case" | "do" | "else" | "yield" | "await" | "extends" | "default"
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "new"
+                    | "delete"
+                    | "void"
+                    | "throw"
+                    | "case"
+                    | "do"
+                    | "else"
+                    | "yield"
+                    | "await"
+                    | "extends"
+                    | "default"
             )
         }
         Some(TokenKind::Number(_)) | Some(TokenKind::Str(_)) => false,
@@ -190,7 +204,10 @@ impl<'a> Lexer<'a> {
         Pos {
             line: self.line,
             col: self.col,
-            byte: *self.byte_offsets.get(self.pos).unwrap_or(&(self.src.len() as u32)),
+            byte: *self
+                .byte_offsets
+                .get(self.pos)
+                .unwrap_or(&(self.src.len() as u32)),
         }
     }
 
@@ -311,7 +328,9 @@ impl<'a> Lexer<'a> {
             self.brace_stack.pop();
             self.advance();
             self.read_template_part(false)?
-        } else if c.is_ascii_digit() || (c == '.' && self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false)) {
+        } else if c.is_ascii_digit()
+            || (c == '.' && self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false))
+        {
             self.read_number()?
         } else if c == '"' || c == '\'' {
             self.read_string(c)?
@@ -347,7 +366,10 @@ impl<'a> Lexer<'a> {
     fn read_number(&mut self) -> Result<TokenKind, LexError> {
         let mut s = String::new();
         if self.peek() == Some('0')
-            && matches!(self.peek_at(1), Some('x') | Some('X') | Some('o') | Some('O') | Some('b') | Some('B'))
+            && matches!(
+                self.peek_at(1),
+                Some('x') | Some('X') | Some('o') | Some('O') | Some('b') | Some('B')
+            )
         {
             s.push(self.advance().unwrap()); // '0'
             let radix_char = self.advance().unwrap(); // x/o/b
@@ -415,7 +437,9 @@ impl<'a> Lexer<'a> {
             }
         }
         self.eat('n'); // BigInt サフィックス
-        let v: f64 = s.parse().map_err(|_| self.err(format!("不正な数値リテラル: {s}")))?;
+        let v: f64 = s
+            .parse()
+            .map_err(|_| self.err(format!("不正な数値リテラル: {s}")))?;
         Ok(TokenKind::Number(v))
     }
 
@@ -630,7 +654,9 @@ impl<'a> Lexer<'a> {
             }
             ':' => Colon,
             '?' => {
-                if self.peek() == Some('.') && !self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false) {
+                if self.peek() == Some('.')
+                    && !self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false)
+                {
                     self.advance();
                     QuestionDot
                 } else if self.peek() == Some('?') {

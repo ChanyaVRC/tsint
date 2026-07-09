@@ -372,11 +372,18 @@ pub enum StmtKind {
     /// `export const x = ...` / `export function f() {}` / `export class C {}`
     ExportDecl(Box<Stmt>),
     /// TS interface 宣言。中身は捨てて名前と span だけ残す。
-    TsInterface { name: String },
+    TsInterface {
+        name: String,
+    },
     /// TS type エイリアス宣言。
-    TsTypeAlias { name: String },
+    TsTypeAlias {
+        name: String,
+    },
     /// `declare module "..." { ... }` / `declare namespace ... { ... }`
-    TsModule { name: String, body: Vec<Stmt> },
+    TsModule {
+        name: String,
+        body: Vec<Stmt>,
+    },
     /// `declare` が付いた素のアンビエント宣言（module 以外）。中身は捨てる。
     TsAmbientDecl,
 }

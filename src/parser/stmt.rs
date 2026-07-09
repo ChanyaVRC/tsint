@@ -555,7 +555,14 @@ impl Parser {
         while let Some(word) = self.ident_name() {
             let is_modifier = matches!(
                 word.as_str(),
-                "public" | "private" | "protected" | "readonly" | "abstract" | "override" | "declare" | "static"
+                "public"
+                    | "private"
+                    | "protected"
+                    | "readonly"
+                    | "abstract"
+                    | "override"
+                    | "declare"
+                    | "static"
             );
             if is_modifier && !self.next_token_is_member_boundary() {
                 if word == "static" {
@@ -590,7 +597,10 @@ impl Parser {
         }
 
         let mut is_async = false;
-        if self.is_word("async") && !self.next_token_is_member_boundary() && !self.peek_kind_newline(1) {
+        if self.is_word("async")
+            && !self.next_token_is_member_boundary()
+            && !self.peek_kind_newline(1)
+        {
             is_async = true;
             self.bump();
         }
@@ -608,9 +618,14 @@ impl Parser {
 
         if self.is_punct(Punct::LParen) || self.is_punct(Punct::Lt) {
             let function = self.parse_function_tail_no_name(is_async)?;
-            let is_ctor = matches!(&name, PropertyKey::Ident(n) if n == "constructor") && kind == ClassMemberKind::Method;
+            let is_ctor = matches!(&name, PropertyKey::Ident(n) if n == "constructor")
+                && kind == ClassMemberKind::Method;
             return Ok(ClassMember {
-                kind: if is_ctor { ClassMemberKind::Constructor } else { kind },
+                kind: if is_ctor {
+                    ClassMemberKind::Constructor
+                } else {
+                    kind
+                },
                 is_static,
                 name,
                 function: Some(function),
@@ -716,7 +731,9 @@ impl Parser {
         }
 
         let mut type_only = false;
-        if self.is_word("type") && (self.peek_is_punct(1, Punct::LBrace) || self.peek_is_punct(1, Punct::Star)) {
+        if self.is_word("type")
+            && (self.peek_is_punct(1, Punct::LBrace) || self.peek_is_punct(1, Punct::Star))
+        {
             self.bump();
             type_only = true;
         }

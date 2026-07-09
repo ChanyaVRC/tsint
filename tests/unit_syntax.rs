@@ -28,8 +28,20 @@ fn first_expr_stmt(m: &Module) -> &Expr {
 fn asi_inserts_semicolons_between_lines() {
     let m = parse("let a = 1\nlet b = 2\n");
     assert_eq!(m.body.len(), 2);
-    assert!(matches!(m.body[0].kind, StmtKind::VarDecl { kind: VarKind::Let, .. }));
-    assert!(matches!(m.body[1].kind, StmtKind::VarDecl { kind: VarKind::Let, .. }));
+    assert!(matches!(
+        m.body[0].kind,
+        StmtKind::VarDecl {
+            kind: VarKind::Let,
+            ..
+        }
+    ));
+    assert!(matches!(
+        m.body[1].kind,
+        StmtKind::VarDecl {
+            kind: VarKind::Let,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -61,7 +73,10 @@ fn division_after_identifier_is_binary_op() {
     let e = first_expr_stmt(&m);
     assert!(matches!(
         &e.kind,
-        ExprKind::Binary { op: BinaryOp::Div, .. }
+        ExprKind::Binary {
+            op: BinaryOp::Div,
+            ..
+        }
     ));
 }
 
@@ -71,7 +86,10 @@ fn division_after_paren_is_binary_op() {
     let e = first_expr_stmt(&m);
     assert!(matches!(
         &e.kind,
-        ExprKind::Binary { op: BinaryOp::Div, .. }
+        ExprKind::Binary {
+            op: BinaryOp::Div,
+            ..
+        }
     ));
 }
 
@@ -244,11 +262,19 @@ fn function_param_destructuring_with_rest() {
 fn optional_chaining_member_then_call() {
     let m = parse("a?.b?.();");
     let e = first_expr_stmt(&m);
-    let ExprKind::Call { callee, optional: call_opt, .. } = &e.kind else {
+    let ExprKind::Call {
+        callee,
+        optional: call_opt,
+        ..
+    } = &e.kind
+    else {
         panic!("call を期待")
     };
     assert!(*call_opt);
-    assert!(matches!(&callee.kind, ExprKind::Member { optional: true, .. }));
+    assert!(matches!(
+        &callee.kind,
+        ExprKind::Member { optional: true, .. }
+    ));
 }
 
 #[test]
@@ -257,7 +283,11 @@ fn optional_chaining_computed_member() {
     let e = first_expr_stmt(&m);
     assert!(matches!(
         &e.kind,
-        ExprKind::Member { optional: true, prop: PropertyKey::Computed(_), .. }
+        ExprKind::Member {
+            optional: true,
+            prop: PropertyKey::Computed(_),
+            ..
+        }
     ));
 }
 
@@ -267,7 +297,10 @@ fn nullish_coalescing_operator() {
     let e = first_expr_stmt(&m);
     assert!(matches!(
         &e.kind,
-        ExprKind::Logical { op: LogicalOp::Nullish, .. }
+        ExprKind::Logical {
+            op: LogicalOp::Nullish,
+            ..
+        }
     ));
 }
 
@@ -277,7 +310,10 @@ fn nullish_assign_operator() {
     let e = first_expr_stmt(&m);
     assert!(matches!(
         &e.kind,
-        ExprKind::Assign { op: AssignOp::NullishAssign, .. }
+        ExprKind::Assign {
+            op: AssignOp::NullishAssign,
+            ..
+        }
     ));
 }
 
@@ -319,7 +355,10 @@ fn labeled_break() {
         panic!("ラベル文を期待")
     };
     assert_eq!(label, "outer");
-    let StmtKind::While { body: while_body, .. } = &body.kind else {
+    let StmtKind::While {
+        body: while_body, ..
+    } = &body.kind
+    else {
         panic!()
     };
     let StmtKind::Block(stmts) = &while_body.kind else {
@@ -478,7 +517,10 @@ fn import_side_effect_only() {
 #[test]
 fn export_named_list() {
     let m = parse("export { a, b as c };");
-    let StmtKind::ExportNamed { specifiers, source, .. } = &m.body[0].kind else {
+    let StmtKind::ExportNamed {
+        specifiers, source, ..
+    } = &m.body[0].kind
+    else {
         panic!("named export を期待")
     };
     assert!(source.is_none());
@@ -684,7 +726,10 @@ fn switch_with_multiple_cases_and_default() {
 #[test]
 fn try_catch_without_binding() {
     let m = parse("try { f(); } catch { g(); }");
-    let StmtKind::Try { handler, finalizer, .. } = &m.body[0].kind else {
+    let StmtKind::Try {
+        handler, finalizer, ..
+    } = &m.body[0].kind
+    else {
         panic!("try を期待")
     };
     assert!(finalizer.is_none());
@@ -695,7 +740,10 @@ fn try_catch_without_binding() {
 #[test]
 fn try_finally_without_catch() {
     let m = parse("try { f(); } finally { g(); }");
-    let StmtKind::Try { handler, finalizer, .. } = &m.body[0].kind else {
+    let StmtKind::Try {
+        handler, finalizer, ..
+    } = &m.body[0].kind
+    else {
         panic!()
     };
     assert!(handler.is_none());
@@ -733,7 +781,10 @@ fn do_while_statement() {
 #[test]
 fn classic_for_loop_shape() {
     let m = parse("for (let i = 0; i < 10; i++) { sum += i; }");
-    let StmtKind::For { init, test, update, .. } = &m.body[0].kind else {
+    let StmtKind::For {
+        init, test, update, ..
+    } = &m.body[0].kind
+    else {
         panic!("for を期待")
     };
     assert!(init.is_some());
@@ -773,7 +824,10 @@ fn computed_member_assignment() {
     };
     assert!(matches!(
         target.kind,
-        ExprKind::Member { prop: PropertyKey::Computed(_), .. }
+        ExprKind::Member {
+            prop: PropertyKey::Computed(_),
+            ..
+        }
     ));
 }
 
@@ -793,13 +847,21 @@ fn exponent_operator_is_right_associative() {
     let StmtKind::VarDecl { decls, .. } = &m.body[0].kind else {
         panic!()
     };
-    let ExprKind::Binary { op: BinaryOp::Pow, right, .. } = &decls[0].init.as_ref().unwrap().kind else {
+    let ExprKind::Binary {
+        op: BinaryOp::Pow,
+        right,
+        ..
+    } = &decls[0].init.as_ref().unwrap().kind
+    else {
         panic!("べき乗を期待")
     };
     // 右結合なので right 自体もべき乗であるはず (2 ** (3 ** 2))。
     assert!(matches!(
         right.kind,
-        ExprKind::Binary { op: BinaryOp::Pow, .. }
+        ExprKind::Binary {
+            op: BinaryOp::Pow,
+            ..
+        }
     ));
 }
 
@@ -816,7 +878,10 @@ fn unary_operators_typeof_instanceof_in_delete_void() {
     );
     assert!(matches!(
         first_expr_stmt(&m).kind,
-        ExprKind::Binary { op: BinaryOp::StrictEq, .. }
+        ExprKind::Binary {
+            op: BinaryOp::StrictEq,
+            ..
+        }
     ));
     assert!(matches!(
         m.body[1].kind,
@@ -885,8 +950,20 @@ fn object_literal_method_shorthand_and_getter() {
         panic!("オブジェクトリテラルを期待")
     };
     assert_eq!(props.len(), 4);
-    assert!(matches!(props[1], ObjectProp::Method { kind: MethodKind::Normal, .. }));
-    assert!(matches!(props[2], ObjectProp::Method { kind: MethodKind::Get, .. }));
+    assert!(matches!(
+        props[1],
+        ObjectProp::Method {
+            kind: MethodKind::Normal,
+            ..
+        }
+    ));
+    assert!(matches!(
+        props[2],
+        ObjectProp::Method {
+            kind: MethodKind::Get,
+            ..
+        }
+    ));
     assert!(matches!(props[3], ObjectProp::Spread(_)));
 }
 
