@@ -1,6 +1,10 @@
 //! テスト間で共有する小さなヘルパー（`tests/common/mod.rs` は cargo に
 //! 独立したテストバイナリとして扱われないため、複数の統合テストから
 //! `mod common;` で読み込める）。
+//!
+//! バイナリごとに使わない関数があっても dead_code 警告にしない
+//! （T2 追加後は vm_corpus.rs が `noiria_root` だけを使う等の理由で発生する）。
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
