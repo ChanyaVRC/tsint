@@ -754,13 +754,25 @@ fn resolve_trans(interp: &mut Interpreter, h: &Rc<Harness>) -> PumpState {
 /// 保持される）として現れることを検証する。バックグラウンドの
 /// `wait ...`/`text_is_done ...`/`text_rects ...` 等のノイズを気にせず、
 /// 意味のある呼び出し列だけを検証するために部分列一致にしている。
+///
+/// 期待値の末尾が `*` の場合は前方一致（prefix）で比較する。メッセージ
+/// ウィンドウの寸法など、将来の計算式変更で変わりうる具体的な数値を
+/// アサートせずに「その呼び出しがこの位置で起きた」ことだけを検証したい
+/// 場合に使う（例: `"layer_msgbox 3 fore *"`）。
 fn assert_subsequence(log: &[String], expected: &[&str]) {
+    fn matches(got: &str, want: &str) -> bool {
+        match want.strip_suffix('*') {
+            Some(prefix) => got.starts_with(prefix),
+            None => got == want,
+        }
+    }
+
     let mut it = log.iter().enumerate();
     let mut last_idx = 0usize;
     for want in expected {
         loop {
             match it.next() {
-                Some((idx, got)) if got == want => {
+                Some((idx, got)) if matches(got, want) => {
                     last_idx = idx;
                     break;
                 }
@@ -879,8 +891,13 @@ fn kag_player_runs_full_scenario_to_close_via_module_graph() {
             "layer_set_props 2 fore {z=10,visible=false}",
             "layer_set_props 2 back {z=10,visible=false}",
             "layer_new text -> 3",
-            "layer_msgbox 3 fore 1200x176",
-            "layer_set_props 3 fore {x=40,y=520}",
+            // msgbox の具体的な寸法 (幅/高さ) はフォントメトリクスからの計算式
+            // に依存するので、値そのものではなく「msgbox が呼ばれたこと」だけ
+            // を検証する（将来の寸法計算式変更で壊れないように）。
+            "layer_msgbox 3 fore *",
+            // x は左マージンの既定値で固定だが、y はメッセージウィンドウの
+            // 高さ計算に連動するので前方一致に留める。
+            "layer_set_props 3 fore {x=40,y=*",
             "text_style 3",
             "layer_set_props 3 fore {z=100,visible=true}",
             "save_read sys",
@@ -922,7 +939,8 @@ fn kag_player_runs_full_scenario_to_close_via_module_graph() {
         &dump(),
         &[
             "text_rects 3",
-            "audio_play se assets/se/click.wav loop=false vol=1 fade=0",
+            // seVol の既定値が 80% になったため、実効音量は 1 * 0.8 = 0.8。
+            "audio_play se assets/se/click.wav loop=false vol=0.8 fade=0",
             "text_clear 3",
         ],
     );
