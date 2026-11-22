@@ -695,6 +695,18 @@ fn string_methods_group_b() {
 }
 
 #[test]
+fn string_index_of_needle_longer_than_haystack() {
+    let src = r#"
+        export const result =
+            ("ab".indexOf("abc") === -1) + ':' +
+            ("".indexOf("a") === -1) + ':' +
+            ("ab".indexOf("ab") === 0) + ':' +
+            ("ab".indexOf("") === 0);
+    "#;
+    assert_eq!(eval_str_of(src), "true:true:true:true");
+}
+
+#[test]
 fn string_slice_split_replace() {
     let src = r#"
         const s = "a,b,c";

@@ -1482,7 +1482,10 @@ fn string_method(name: &str) -> Option<Value> {
             if needle.is_empty() {
                 return Ok(Value::Number(0.0));
             }
-            for i in 0..=chars.len().saturating_sub(needle.len()) {
+            if needle.len() > chars.len() {
+                return Ok(Value::Number(-1.0));
+            }
+            for i in 0..=chars.len() - needle.len() {
                 if chars[i..i + needle.len()] == needle[..] {
                     return Ok(Value::Number(i as f64));
                 }
