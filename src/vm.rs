@@ -395,9 +395,7 @@ impl Vm {
         self.gc_objects
             .borrow()
             .iter()
-            .filter(|w| {
-                w.strong_count() > 0 && seen.insert(w.as_ptr() as usize)
-            })
+            .filter(|w| w.strong_count() > 0 && seen.insert(w.as_ptr() as usize))
             .count()
     }
 
@@ -1412,7 +1410,9 @@ impl Vm {
                 continue;
             }
             let fo = self.build_closure(&m.func);
-            proto.props.set_value(m.name.clone(), self.wrap_function(fo));
+            proto
+                .props
+                .set_value(m.name.clone(), self.wrap_function(fo));
         }
         for a in &tpl.accessors {
             if a.is_static {
@@ -2062,9 +2062,8 @@ impl Vm {
 
     /// pending 状態の新しい Promise を作る。
     pub fn new_pending_promise(&mut self) -> (Value, ObjRef) {
-        let obj: ObjRef = self.alloc_obj_ref(ObjData::new(ObjKind::Promise(
-            PromiseData::pending(),
-        )));
+        let obj: ObjRef =
+            self.alloc_obj_ref(ObjData::new(ObjKind::Promise(PromiseData::pending())));
         (Value::Object(obj.clone()), obj)
     }
 
@@ -2541,17 +2540,16 @@ fn gc_visit_obj_data_dedup(
     seen_raw_args: &mut HashSet<usize>,
     f: &mut impl FnMut(&ObjRef),
 ) {
-    let visit_cell = |cell: &Rc<RefCell<Value>>,
-                      seen_cells: &mut HashSet<usize>,
-                      f: &mut dyn FnMut(&ObjRef)| {
-        if seen_cells.insert(Rc::as_ptr(cell) as usize) {
-            if let Ok(v) = cell.try_borrow() {
-                if let Value::Object(o) = &*v {
-                    f(o);
+    let visit_cell =
+        |cell: &Rc<RefCell<Value>>, seen_cells: &mut HashSet<usize>, f: &mut dyn FnMut(&ObjRef)| {
+            if seen_cells.insert(Rc::as_ptr(cell) as usize) {
+                if let Ok(v) = cell.try_borrow() {
+                    if let Value::Object(o) = &*v {
+                        f(o);
+                    }
                 }
             }
-        }
-    };
+        };
     let visit_fn = |fo: &Rc<FunctionObj>,
                     seen_fns: &mut HashSet<usize>,
                     seen_cells: &mut HashSet<usize>,
@@ -2955,13 +2953,24 @@ mod tests {
             .iter()
             .filter(|&&c| !c)
             .count();
-        assert_eq!(boxed_count, 1, "captured_locals: {:?}", demo_tpl.chunk.captured_locals);
+        assert_eq!(
+            boxed_count, 1,
+            "captured_locals: {:?}",
+            demo_tpl.chunk.captured_locals
+        );
         assert!(direct_count >= 5, "non-captured locals should stay Direct");
 
         // Frame::new が実際に Direct / Boxed を正しく作り分けることも直接確認
-        let frame = Frame::new(demo_tpl.chunk.clone(), Rc::new(Vec::new()), Rc::new(Vec::new()));
+        let frame = Frame::new(
+            demo_tpl.chunk.clone(),
+            Rc::new(Vec::new()),
+            Rc::new(Vec::new()),
+        );
         assert_eq!(frame.locals.iter().filter(|s| s.is_boxed()).count(), 1);
-        assert_eq!(frame.locals.iter().filter(|s| s.is_direct()).count(), direct_count);
+        assert_eq!(
+            frame.locals.iter().filter(|s| s.is_direct()).count(),
+            direct_count
+        );
 
         // 実行結果が正しいことを確認: (7 + 20 + 5) + ((3 + 10) * 2) = 32 + 26 = 58
         let mut interp = Interpreter::new();
@@ -3153,7 +3162,10 @@ mod tests {
         }
 
         let before = interp.vm().live_tracked_objects();
-        assert!(before >= baseline + 600, "before={before}, baseline={baseline}");
+        assert!(
+            before >= baseline + 600,
+            "before={before}, baseline={baseline}"
+        );
         let collected = interp.collect_garbage();
         let after = interp.vm().live_tracked_objects();
         assert!(collected >= 600, "collected={collected}");
@@ -3200,7 +3212,10 @@ mod tests {
         let _ = run_exports(&mut interp, src);
 
         let before = interp.vm().live_tracked_objects();
-        assert!(before >= baseline + 500, "before={before}, baseline={baseline}");
+        assert!(
+            before >= baseline + 500,
+            "before={before}, baseline={baseline}"
+        );
 
         let collected = interp.collect_garbage();
         let after = interp.vm().live_tracked_objects();
@@ -3274,7 +3289,10 @@ mod tests {
         drop(b_val);
         drop(held);
         let collected2 = interp.collect_garbage();
-        assert_eq!(collected2, 2, "外部参照解放後は a と b の 2 個が回収されるべき");
+        assert_eq!(
+            collected2, 2,
+            "外部参照解放後は a と b の 2 個が回収されるべき"
+        );
         assert_eq!(interp.vm().live_tracked_objects(), baseline);
     }
 

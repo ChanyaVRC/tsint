@@ -234,10 +234,8 @@ fn count_capturing_groups(chars: &[char]) -> usize {
             }
             '[' if !in_class => in_class = true,
             ']' if in_class => in_class = false,
-            '(' if !in_class => {
-                if chars.get(i + 1) != Some(&'?') {
-                    count += 1;
-                }
+            '(' if !in_class && chars.get(i + 1) != Some(&'?') => {
+                count += 1;
             }
             _ => {}
         }
@@ -1067,11 +1065,7 @@ impl<'a> Exec<'a> {
                             let len = e - s;
                             let matched = sp + len <= self.chars.len()
                                 && (0..len).all(|i| {
-                                    char_eq(
-                                        self.chars[sp + i],
-                                        self.chars[s + i],
-                                        self.ignore_case,
-                                    )
+                                    char_eq(self.chars[sp + i], self.chars[s + i], self.ignore_case)
                                 });
                             if matched {
                                 pc += 1;
@@ -1647,10 +1641,7 @@ mod tests {
     #[test]
     fn positive_lookahead_commits_captures_and_rolls_back_on_outer_backtrack() {
         // JS 仕様: 肯定先読み内のキャプチャは後続の後方参照や結果に保持される。
-        assert_eq!(
-            groups(r"(?=(a+))\1b", "", "aaab"),
-            vec![Some("aaa".into())]
-        );
+        assert_eq!(groups(r"(?=(a+))\1b", "", "aaab"), vec![Some("aaa".into())]);
         // 肯定先読みが一度成功してキャプチャを確定しても、後続が失敗して外側の枝へ
         // バックトラックした場合は、先読み内のキャプチャも巻き戻されること。
         assert_eq!(

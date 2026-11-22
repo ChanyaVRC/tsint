@@ -143,6 +143,9 @@ const PROP_MAP_LINEAR_THRESHOLD: usize = 16;
 pub struct PropMap {
     entries: Vec<Option<(Rc<str>, PropSlot)>>,
     live_len: usize,
+    // Keep `PropMap` compact (1 pointer width when `None`) for small objects below
+    // `PROP_MAP_LINEAR_THRESHOLD`, which make up the vast majority of JS objects.
+    #[allow(clippy::box_collection)]
     index: Option<Box<HashMap<Rc<str>, usize>>>,
 }
 
@@ -528,7 +531,7 @@ mod tests {
         // 削除して再挿入すると末尾に移動する（JS 仕様）
         assert!(m.delete("k2"));
         assert!(!m.delete("k2"));
-        assert_eq!(m.get("k2").is_none(), true);
+        assert!(m.get("k2").is_none());
         assert_eq!(m.len(), PROP_MAP_LINEAR_THRESHOLD - 1);
 
         m.set_value(Rc::from("k2"), Value::Number(201.0));
@@ -607,7 +610,11 @@ mod tests {
         }
         assert_eq!(m.len(), 50);
         assert!(m.index.is_some());
-        assert!(m.entries.len() < 120, "圧縮されているべき: {}", m.entries.len());
+        assert!(
+            m.entries.len() < 120,
+            "圧縮されているべき: {}",
+            m.entries.len()
+        );
 
         let expected_50: Vec<String> = (150..200).map(|i| format!("k{i}")).collect();
         assert_eq!(key_vec(&m), expected_50);
@@ -674,13 +681,19 @@ mod tests {
 
         // 偶数キーを更新し、3 の倍数のキーを削除して再挿入
         for i in (0..count).step_by(2) {
-            m.set_value(Rc::from(format!("prop_{i}")), Value::Number((i * 10) as f64));
+            m.set_value(
+                Rc::from(format!("prop_{i}")),
+                Value::Number((i * 10) as f64),
+            );
         }
         for i in (0..count).step_by(3) {
             assert!(m.delete(&format!("prop_{i}")));
         }
         for i in (0..count).step_by(3) {
-            m.set_value(Rc::from(format!("prop_{i}")), Value::Number((i + 100_000) as f64));
+            m.set_value(
+                Rc::from(format!("prop_{i}")),
+                Value::Number((i + 100_000) as f64),
+            );
         }
 
         assert_eq!(m.len(), count);

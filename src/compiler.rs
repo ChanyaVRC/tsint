@@ -98,7 +98,9 @@ impl FuncCtx {
         self.next_slot += 1;
         if self.next_slot as usize > self.chunk.num_locals {
             self.chunk.num_locals = self.next_slot as usize;
-            self.chunk.captured_locals.resize(self.chunk.num_locals, false);
+            self.chunk
+                .captured_locals
+                .resize(self.chunk.num_locals, false);
         }
         s
     }
