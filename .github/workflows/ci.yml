@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test (debug)
+        run: cargo test
+      - name: Test (release)
+        run: cargo test --release
+
+  test-aarch64:
+    name: test / ubuntu-24.04-arm (native aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify runner architecture
+        run: |
+          test "$(uname -m)" = "aarch64"
+          rustc -vV | grep -q "^host: aarch64-unknown-linux-gnu$"
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        run: cargo test

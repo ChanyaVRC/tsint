@@ -1,0 +1,68 @@
+name: Release
+
+# Publishes to crates.io and cuts a GitHub Release when a `vX.Y.Z` tag is pushed.
+# Idempotent: skips `cargo publish` if that version is already on crates.io (or if
+# `CARGO_REGISTRY_TOKEN` is unset), and skips the GitHub Release if it already exists,
+# so rerunning the same tag is safe. Published tags themselves must never be moved.
+# Prerequisites:
+#   - the pushed tag must match the `version` in Cargo.toml (guarded below)
+#   - a `CARGO_REGISTRY_TOKEN` repo secret -- only needed when publishing a new version to crates.io
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io and GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the GitHub Release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify tag matches crate version
+        run: |
+          crate_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "v$crate_ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version v$crate_ver"
+            exit 1
+          fi
+      - name: Test source tree
+        run: cargo test --locked
+      - name: Verify packaged crate
+        run: |
+          crate_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          cargo package --locked
+          package_root="$(mktemp -d)"
+          tar -xzf "target/package/tsint-$crate_ver.crate" -C "$package_root"
+          package_manifest="$package_root/tsint-$crate_ver/Cargo.toml"
+          cargo test --locked --manifest-path "$package_manifest"
+      - name: Publish to crates.io (skip if already published or token unset)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          code="$(curl -sS -H 'User-Agent: tsint release workflow' \
+            -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/tsint/$ver")"
+          if [ "$code" = "200" ]; then
+            echo "tsint $ver is already on crates.io -- skipping publish."
+          elif [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set -- skipping crates.io publish for tsint $ver."
+          else
+            echo "Publishing tsint $ver to crates.io..."
+            cargo publish --locked
+          fi
+      - name: Create GitHub Release (skip if it already exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists -- skipping."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
