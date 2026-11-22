@@ -126,6 +126,11 @@ impl Interpreter {
         &mut self.vm
     }
 
+    /// 到達不能な循環参照を明示的に回収し、解放（参照切断）したオブジェクト数を返す。
+    pub fn collect_garbage(&mut self) -> usize {
+        self.vm.collect_garbage()
+    }
+
     /// ソースをパース・コンパイル・実行し、export された値の一覧を返す。
     /// import 文を含むモジュールは明確なエラーになる（T5 で対応予定）。
     pub fn run_module(

@@ -6,10 +6,9 @@
 //! - オブジェクト系（プレーンオブジェクト・配列・関数・クラス・Map/Set・
 //!   エラー）はすべて `Rc<RefCell<ObjData>>` を共有する `Value::Object` に
 //!   統一する。`ObjKind` で実体の種類を分岐する。
-//! - ローカル変数スロットはすべて `Rc<RefCell<Value>>`（"boxed local"）で
-//!   持つ（`vm.rs` 参照）。クロージャのアップバリュー捕捉はこのセルを
-//!   共有するだけで済み、CLox 的な open/closed upvalue の作り分けが不要になる
-//!   （多少のアロケーションコストと引き換えに実装を大幅に単純化する判断）。
+//! - ローカル変数スロットは内側クロージャから捕捉されるものだけを
+//!   `Rc<RefCell<Value>>`（`LocalSlot::Boxed`）で持ち、非キャプチャ変数は
+//!   ヒープ確保なしの `LocalSlot::Direct(Value)` として保持する（`vm.rs` 参照）。
 //! - `Value::Uninit` は TDZ 判定専用の内部マーカー。JS コードから直接
 //!   観測されることはない。
 
@@ -96,6 +95,7 @@ impl Value {
                 name: name.into(),
                 arity,
                 f,
+                captures: Vec::new(),
             },
         )))))
     }
@@ -308,6 +308,12 @@ impl PropMap {
     pub fn is_empty(&self) -> bool {
         self.live_len == 0
     }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.live_len = 0;
+        self.index = None;
+    }
 }
 
 /// クラス／プロトタイプ相当。`ObjData::proto` で連鎖する。
@@ -334,6 +340,9 @@ pub struct NativeObj {
     pub name: Rc<str>,
     pub arity: usize,
     pub f: NativeFn,
+    /// ビルトイン（Promise の resolve/reject/finally 等）が Rust クロージャ内に
+    /// Weak で参照している JS オブジェクトの強い参照を GC から可視化するためのリスト。
+    pub(crate) captures: Vec<ObjRef>,
 }
 
 /// バイトコード関数（クロージャ）。

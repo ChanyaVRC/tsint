@@ -285,6 +285,10 @@ pub struct Chunk {
     pub exception_table: Vec<ExceptionEntry>,
     /// このフレームで確保するローカルスロット数（`this` やパラメータ含む）。
     pub num_locals: usize,
+    /// 各ローカルスロットが内側クロージャにキャプチャされるかどうか（長さ == `num_locals`）。
+    /// `true` のスロットのみ実行時に `Rc<RefCell<Value>>` でボックス化され、
+    /// `false` のスロットは非ボックス（`LocalSlot::Direct`）のまま保持される。
+    pub captured_locals: Vec<bool>,
     /// モジュールのトップレベルチャンクにのみ意味を持つ:
     /// export 名 -> ローカルスロット の対応表。
     pub exports: Vec<(Rc<str>, LocalIdx)>,
@@ -304,6 +308,7 @@ impl Chunk {
             consts: Vec::new(),
             exception_table: Vec::new(),
             num_locals: 0,
+            captured_locals: Vec::new(),
             exports: Vec::new(),
             is_module: false,
         }

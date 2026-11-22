@@ -1,8 +1,10 @@
 //! AST → バイトコードのコンパイラ。
 //!
 //! 設計の要点は `bytecode.rs` の冒頭コメントを参照。ここでは:
-//! - ローカル変数はすべて「ボックス化」（`Rc<RefCell<Value>>`）される前提で
-//!   スロット番号だけを管理する（実際の確保は `vm.rs` のフレーム生成時）。
+//! - ローカル変数はデフォルトで非ボックス（`LocalSlot::Direct`）とし、内側
+//!   クロージャから `resolve_upvalue` で実際に捕捉されたスロットだけを
+//!   `Chunk::captured_locals` に記録する（`vm.rs` のフレーム生成時にその
+//!   スロットのみ `Rc<RefCell<Value>>` を確保する）。
 //! - `let`/`const`/`var`/関数宣言/クラス宣言は「ブロック先頭でスロットを
 //!   予約してから本体を順にコンパイルする」2 パス方式で処理し、
 //!   `let`/`const`/クラスは Uninit のまま予約する（TDZ）。
@@ -96,6 +98,7 @@ impl FuncCtx {
         self.next_slot += 1;
         if self.next_slot as usize > self.chunk.num_locals {
             self.chunk.num_locals = self.next_slot as usize;
+            self.chunk.captured_locals.resize(self.chunk.num_locals, false);
         }
         s
     }
@@ -323,6 +326,7 @@ impl Compiler {
             return Some(idx as UpvalueIdx);
         }
         if let Some(slot) = self.funcs[parent].find_local(name) {
+            self.funcs[parent].chunk.captured_locals[slot as usize] = true;
             let f = &mut self.funcs[level];
             f.upvalues.push(UpvalueDesc::ParentLocal(slot));
             f.upvalue_names.push(Rc::from(name));

@@ -10,18 +10,70 @@
 //! 抜けて `Vm`（frames を含む）をまるごと保存し、後で再開する」という
 //! 拡張が自然に可能になる。
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::{Rc, Weak};
 
 use crate::bytecode::*;
 use crate::value::*;
+
+/// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。
+const GC_MIN_THRESHOLD: usize = 2048;
+
+/// ローカル変数スロットの表現。
+///
+/// 内側クロージャにキャプチャされないローカル変数は `Direct(Value)` として直接保持し、
+/// `Rc<RefCell<Value>>` のヒープ確保・参照カウント操作・borrow チェックを完全に省く。
+/// キャプチャされる変数のみ `Boxed(Rc<RefCell<Value>>)` とし、クロージャとセルを共有する。
+#[derive(Clone)]
+pub enum LocalSlot {
+    Direct(Value),
+    Boxed(Rc<RefCell<Value>>),
+}
+
+impl LocalSlot {
+    #[inline]
+    pub fn get(&self) -> Value {
+        match self {
+            LocalSlot::Direct(v) => v.clone(),
+            LocalSlot::Boxed(cell) => cell.borrow().clone(),
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, value: Value) {
+        match self {
+            LocalSlot::Direct(v) => *v = value,
+            LocalSlot::Boxed(cell) => *cell.borrow_mut() = value,
+        }
+    }
+
+    #[inline]
+    pub fn is_direct(&self) -> bool {
+        matches!(self, LocalSlot::Direct(_))
+    }
+
+    #[inline]
+    pub fn is_boxed(&self) -> bool {
+        matches!(self, LocalSlot::Boxed(_))
+    }
+
+    #[inline]
+    pub fn as_boxed_cell(&self) -> Rc<RefCell<Value>> {
+        match self {
+            LocalSlot::Boxed(cell) => cell.clone(),
+            LocalSlot::Direct(_) => {
+                panic!("内部エラー: 非キャプチャ（Direct）のローカルスロットがクロージャに捕捉されました")
+            }
+        }
+    }
+}
 
 /// 1 関数呼び出し分のフレーム。すべてヒープ上（`Vm.frames` という `Vec` の要素）。
 pub struct Frame {
     pub chunk: Rc<Chunk>,
     pub ip: usize,
-    pub locals: Vec<Rc<RefCell<Value>>>,
+    pub locals: Vec<LocalSlot>,
     pub upvalues: Rc<Vec<Rc<RefCell<Value>>>>,
     pub stack: Vec<Value>,
     pub raw_args: Rc<Vec<Value>>,
@@ -34,12 +86,19 @@ impl Frame {
         raw_args: Rc<Vec<Value>>,
     ) -> Self {
         let num_locals = chunk.num_locals;
+        let locals = (0..num_locals)
+            .map(|i| {
+                if chunk.captured_locals.get(i).copied().unwrap_or(false) {
+                    LocalSlot::Boxed(Rc::new(RefCell::new(Value::Uninit)))
+                } else {
+                    LocalSlot::Direct(Value::Uninit)
+                }
+            })
+            .collect();
         Frame {
             chunk,
             ip: 0,
-            locals: (0..num_locals)
-                .map(|_| Rc::new(RefCell::new(Value::Uninit)))
-                .collect(),
+            locals,
             upvalues,
             stack: Vec::new(),
             raw_args,
@@ -165,6 +224,15 @@ pub struct Vm {
     /// 現在駆動中のタスクが完了した時に確定させる Promise
     /// （`await` 中断時に継続へ持たせる）。
     current_owner_promise: Option<ObjRef>,
+
+    // ---------------- 循環参照回収 (GC) ----------------
+    /// VM 上で生成・登録された全オブジェクトへの弱参照リスト。
+    /// `&self` メソッド（`make_error` 等）からも追跡できるよう `RefCell` で包む。
+    gc_objects: RefCell<Vec<Weak<RefCell<ObjData>>>>,
+    /// 前回の GC 以降に追跡登録されたオブジェクト数。
+    gc_allocs_since_last: Cell<usize>,
+    /// 次回自動 GC を発火する確保数閾値（生存数に応じて成長する）。
+    gc_threshold: usize,
 }
 
 impl Vm {
@@ -181,18 +249,373 @@ impl Vm {
             pending_host_count: 0,
             native_call_depth: 0,
             current_owner_promise: None,
+            gc_objects: RefCell::new(Vec::new()),
+            gc_allocs_since_last: Cell::new(0),
+            gc_threshold: GC_MIN_THRESHOLD,
         };
         crate::builtins::install(&mut vm);
         vm
     }
 
+    /// オブジェクトを GC 追跡リストに登録する。
+    pub fn track_object(&self, obj: &ObjRef) {
+        self.gc_objects.borrow_mut().push(Rc::downgrade(obj));
+        self.gc_allocs_since_last
+            .set(self.gc_allocs_since_last.get() + 1);
+    }
+
+    /// 未追跡（`Rc::weak_count == 0`）のオブジェクトとその配下の未追跡オブジェクトを
+    /// GC 追跡リストへ登録する。既に追跡済みのノードは O(1) でスキップする。
+    pub fn track_value_tree(&self, v: &Value) {
+        let Value::Object(root) = v else {
+            return;
+        };
+        if Rc::weak_count(root) > 0 {
+            return;
+        }
+        let mut stack = vec![root.clone()];
+        while let Some(obj) = stack.pop() {
+            if Rc::weak_count(&obj) > 0 {
+                continue;
+            }
+            self.track_object(&obj);
+            if let Ok(b) = obj.try_borrow() {
+                for (_, slot) in b.props.iter() {
+                    match slot {
+                        PropSlot::Value(Value::Object(child)) => {
+                            if Rc::weak_count(child) == 0 {
+                                stack.push(child.clone());
+                            }
+                        }
+                        PropSlot::Accessor { get, set } => {
+                            if let Some(Value::Object(child)) = get {
+                                if Rc::weak_count(child) == 0 {
+                                    stack.push(child.clone());
+                                }
+                            }
+                            if let Some(Value::Object(child)) = set {
+                                if Rc::weak_count(child) == 0 {
+                                    stack.push(child.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(proto) = &b.proto {
+                    if Rc::weak_count(proto) == 0 {
+                        stack.push(proto.clone());
+                    }
+                }
+                match &b.kind {
+                    ObjKind::Array(items) => {
+                        for it in items {
+                            if let Value::Object(child) = it {
+                                if Rc::weak_count(child) == 0 {
+                                    stack.push(child.clone());
+                                }
+                            }
+                        }
+                    }
+                    ObjKind::Map(m) => {
+                        for (k, val) in &m.entries {
+                            if let Value::Object(child) = k {
+                                if Rc::weak_count(child) == 0 {
+                                    stack.push(child.clone());
+                                }
+                            }
+                            if let Value::Object(child) = val {
+                                if Rc::weak_count(child) == 0 {
+                                    stack.push(child.clone());
+                                }
+                            }
+                        }
+                    }
+                    ObjKind::Set(s) => {
+                        for val in &s.values {
+                            if let Value::Object(child) = val {
+                                if Rc::weak_count(child) == 0 {
+                                    stack.push(child.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub(crate) fn alloc_obj_ref(&self, data: ObjData) -> ObjRef {
+        let rc = Rc::new(RefCell::new(data));
+        self.track_object(&rc);
+        rc
+    }
+
+    pub(crate) fn alloc_obj(&self, data: ObjData) -> Value {
+        Value::Object(self.alloc_obj_ref(data))
+    }
+
+    pub(crate) fn alloc_plain_object(&self) -> Value {
+        self.alloc_obj(ObjData::new(ObjKind::Plain))
+    }
+
+    pub(crate) fn alloc_array(&self, items: Vec<Value>) -> Value {
+        self.alloc_obj(ObjData::new(ObjKind::Array(items)))
+    }
+
+    pub(crate) fn alloc_regex_value(&self, re: Rc<crate::regex::Regex>) -> Value {
+        let mut o = ObjData::new(ObjKind::Regex(re));
+        o.props.set_value(Rc::from("lastIndex"), Value::Number(0.0));
+        self.alloc_obj(o)
+    }
+
+    pub(crate) fn alloc_native_with_captures(
+        &self,
+        name: &str,
+        arity: usize,
+        captures: Vec<ObjRef>,
+        f: NativeFn,
+    ) -> Value {
+        self.alloc_obj(ObjData::new(ObjKind::Native(NativeObj {
+            name: name.into(),
+            arity,
+            f,
+            captures,
+        })))
+    }
+
+    fn wrap_function(&self, fo: Rc<FunctionObj>) -> Value {
+        self.alloc_obj(ObjData::new(ObjKind::Function(fo)))
+    }
+
+    /// 現在 GC 追跡リスト上で生存しているオブジェクト数を返す（テスト・診断用）。
+    pub fn live_tracked_objects(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.gc_objects
+            .borrow()
+            .iter()
+            .filter(|w| {
+                w.strong_count() > 0 && seen.insert(w.as_ptr() as usize)
+            })
+            .count()
+    }
+
+    /// 自動 GC のトリガー閾値を設定する（テスト・チューニング用）。
+    pub fn set_gc_threshold(&mut self, threshold: usize) {
+        self.gc_threshold = threshold.max(1);
+    }
+
+    #[inline]
+    fn maybe_collect_garbage(&mut self) {
+        if self.gc_allocs_since_last.get() >= self.gc_threshold {
+            self.collect_garbage();
+        }
+    }
+
+    /// マーク＋厳密外部参照カウント検査（trial-deletion）による循環参照回収。
+    ///
+    /// 1. VM ルート（`frames`, `globals`, `pending_module_exports`, `microtasks`,
+    ///    `maybe_unhandled`, `current_owner_promise`）から到達可能な全オブジェクトをマーク。
+    /// 2. 弱参照リストから死亡済みエントリを除去し、未マークかつ生存中の候補を収集。
+    /// 3. 各候補 `o` の外部参照数 `Rc::strong_count(o) - 1` から、候補集合内部の
+    ///    エッジ（共有 `FunctionObj` / アップバリューセル / `raw_args` は重複排除）を
+    ///    厳密に差し引く。
+    /// 4. 差し引き後に外部参照数が 0 より大きい候補（ホスト Rust コードが直接保持する
+    ///    `Value` や `HostPromise`、不透明なネイティブクロージャが保持する参照など）から
+    ///    到達可能な候補はすべて生存扱いとして保護する。
+    /// 5. 残った「外部参照 0 かつ外部生存集合からも非到達」な候補のみが 100% 到達不能な
+    ///    循環ゴミであるため、それらの発信参照（`props`/`proto`/`kind`）を切断して
+    ///    `Rc` により即時解放する。
+    ///
+    /// 戻り値は今回参照切断（回収）した循環オブジェクトの個数。
+    pub fn collect_garbage(&mut self) -> usize {
+        // ---- Phase 1: VM ルートからのマーク ----
+        let mut marked: HashSet<usize> = HashSet::new();
+        let mut worklist: Vec<ObjRef> = Vec::new();
+
+        for frame in &self.frames {
+            gc_mark_frame(frame, &mut marked, &mut worklist);
+        }
+        for cell in self.globals.values() {
+            if let Ok(v) = cell.try_borrow() {
+                gc_mark_value(&v, &mut marked, &mut worklist);
+            }
+        }
+        if let Some(exports) = &self.pending_module_exports {
+            for (_, v) in exports {
+                gc_mark_value(v, &mut marked, &mut worklist);
+            }
+        }
+        for job in &self.microtasks {
+            match job {
+                MicrotaskJob::Then {
+                    on_fulfilled,
+                    on_rejected,
+                    result_promise,
+                    outcome,
+                } => {
+                    if let Some(v) = on_fulfilled {
+                        gc_mark_value(v, &mut marked, &mut worklist);
+                    }
+                    if let Some(v) = on_rejected {
+                        gc_mark_value(v, &mut marked, &mut worklist);
+                    }
+                    gc_mark_obj(result_promise, &mut marked, &mut worklist);
+                    match outcome {
+                        Ok(v) | Err(v) => gc_mark_value(v, &mut marked, &mut worklist),
+                    }
+                }
+                MicrotaskJob::ResolveThenable {
+                    promise,
+                    thenable,
+                    then_fn,
+                } => {
+                    gc_mark_obj(promise, &mut marked, &mut worklist);
+                    gc_mark_value(thenable, &mut marked, &mut worklist);
+                    gc_mark_value(then_fn, &mut marked, &mut worklist);
+                }
+                MicrotaskJob::ResumeAwait { cont, outcome } => {
+                    for frame in &cont.frames {
+                        gc_mark_frame(frame, &mut marked, &mut worklist);
+                    }
+                    gc_mark_obj(&cont.owner_promise, &mut marked, &mut worklist);
+                    match outcome {
+                        Ok(v) | Err(v) => gc_mark_value(v, &mut marked, &mut worklist),
+                    }
+                }
+            }
+        }
+        for p in &self.maybe_unhandled {
+            gc_mark_obj(p, &mut marked, &mut worklist);
+        }
+        if let Some(p) = &self.current_owner_promise {
+            gc_mark_obj(p, &mut marked, &mut worklist);
+        }
+
+        while let Some(obj) = worklist.pop() {
+            gc_visit_obj_outgoing(&obj, &mut |target| {
+                gc_mark_obj(target, &mut marked, &mut worklist);
+            });
+        }
+
+        // ---- Phase 2: 死亡済み弱参照の除去と未マーク候補の収集 ----
+        let raw_weaks = std::mem::take(&mut *self.gc_objects.borrow_mut());
+        let mut live_weaks: Vec<Weak<RefCell<ObjData>>> = Vec::with_capacity(raw_weaks.len());
+        let mut seen_weaks: HashSet<usize> = HashSet::with_capacity(raw_weaks.len());
+        let mut candidates: Vec<(usize, ObjRef)> = Vec::new();
+        let mut candidate_idx: HashMap<usize, usize> = HashMap::new();
+
+        for w in raw_weaks {
+            if let Some(rc) = w.upgrade() {
+                let ptr = Rc::as_ptr(&rc) as usize;
+                if !seen_weaks.insert(ptr) {
+                    continue;
+                }
+                live_weaks.push(w);
+                if !marked.contains(&ptr) {
+                    let idx = candidates.len();
+                    candidate_idx.insert(ptr, idx);
+                    candidates.push((ptr, rc));
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            let live_count = live_weaks.len();
+            *self.gc_objects.borrow_mut() = live_weaks;
+            self.gc_allocs_since_last.set(0);
+            self.gc_threshold = (live_count * 2).max(GC_MIN_THRESHOLD);
+            return 0;
+        }
+
+        // ---- Phase 3: 候補集合内部の参照カウントを差し引く（trial-deletion） ----
+        let mut external_refs: Vec<usize> = candidates
+            .iter()
+            .map(|(_, rc)| Rc::strong_count(rc).saturating_sub(1))
+            .collect();
+
+        // 共有される中間 Rc コンテナ（FunctionObj / アップバリューセル / raw_args）は
+        // 内部に持つ ObjRef の strong_count を 1 回分しか増やさないため重複排除する。
+        let mut seen_fns: HashSet<usize> = HashSet::new();
+        let mut seen_cells: HashSet<usize> = HashSet::new();
+        let mut seen_raw_args: HashSet<usize> = HashSet::new();
+
+        for (i, (_, rc)) in candidates.iter().enumerate() {
+            let Ok(b) = rc.try_borrow() else {
+                // 現在借用中のオブジェクトは保守的に外部生存扱いとする。
+                external_refs[i] = external_refs[i].saturating_add(1);
+                continue;
+            };
+            gc_visit_obj_data_dedup(
+                &b,
+                &mut seen_fns,
+                &mut seen_cells,
+                &mut seen_raw_args,
+                &mut |target| {
+                    let tptr = Rc::as_ptr(target) as usize;
+                    if let Some(&tidx) = candidate_idx.get(&tptr) {
+                        debug_assert!(external_refs[tidx] > 0);
+                        external_refs[tidx] = external_refs[tidx].saturating_sub(1);
+                    }
+                },
+            );
+        }
+
+        // ---- Phase 4: 外部参照が残る候補から到達可能なものをすべて生存保護 ----
+        let mut externally_alive = vec![false; candidates.len()];
+        let mut ext_worklist: Vec<usize> = Vec::new();
+        for (i, &ext) in external_refs.iter().enumerate() {
+            if ext > 0 {
+                externally_alive[i] = true;
+                ext_worklist.push(i);
+            }
+        }
+        while let Some(i) = ext_worklist.pop() {
+            gc_visit_obj_outgoing(&candidates[i].1, &mut |target| {
+                let tptr = Rc::as_ptr(target) as usize;
+                if let Some(&j) = candidate_idx.get(&tptr) {
+                    if !externally_alive[j] {
+                        externally_alive[j] = true;
+                        ext_worklist.push(j);
+                    }
+                }
+            });
+        }
+
+        // ---- Phase 5: 完全に到達不能な循環ゴミの参照を切断して解放 ----
+        let mut collected = 0usize;
+        for (i, (_, rc)) in candidates.iter().enumerate() {
+            if !externally_alive[i] {
+                if let Ok(mut b) = rc.try_borrow_mut() {
+                    b.props.clear();
+                    b.proto = None;
+                    b.kind = ObjKind::Plain;
+                    collected += 1;
+                }
+            }
+        }
+        // `candidates` を先にドロップすることで、参照切断済みオブジェクトの
+        // strong_count が 0 になり即時解放される。
+        drop(candidates);
+        live_weaks.retain(|w| w.strong_count() > 0);
+
+        let live_count = live_weaks.len();
+        *self.gc_objects.borrow_mut() = live_weaks;
+        self.gc_allocs_since_last.set(0);
+        self.gc_threshold = (live_count * 2).max(GC_MIN_THRESHOLD);
+        collected
+    }
+
     pub fn register_native(&mut self, name: &str, arity: usize, f: NativeFn) {
         let v = Value::native_fn(name, arity, f);
+        self.track_value_tree(&v);
         self.globals
             .insert(Rc::from(name), Rc::new(RefCell::new(v)));
     }
 
     pub fn define_global(&mut self, name: &str, value: Value) {
+        self.track_value_tree(&value);
         self.globals
             .insert(Rc::from(name), Rc::new(RefCell::new(value)));
     }
@@ -278,6 +701,9 @@ impl Vm {
         loop {
             if self.frames.len() <= stop_depth {
                 return Ok(RunOutcome::Value(last_value));
+            }
+            if self.native_call_depth == 0 {
+                self.maybe_collect_garbage();
             }
             match self.step() {
                 Ok(StepSignal::Returned(v)) => {
@@ -393,8 +819,7 @@ impl Vm {
             OpCode::LoadThis => unreachable!("This は Ident 解決経由でコンパイルされます"),
 
             OpCode::GetLocal(slot) => {
-                let cell = self.frames.last().unwrap().locals[slot as usize].clone();
-                let v = cell.borrow().clone();
+                let v = self.frames.last().unwrap().locals[slot as usize].get();
                 if matches!(v, Value::Uninit) {
                     return Err(
                         self.reference_error("変数が初期化される前にアクセスされました（TDZ）")
@@ -404,16 +829,18 @@ impl Vm {
             }
             OpCode::SetLocal(slot) => {
                 let v = self.top().clone();
-                *self.frames.last().unwrap().locals[slot as usize].borrow_mut() = v;
+                self.frames.last_mut().unwrap().locals[slot as usize].set(v);
             }
             OpCode::BindLocal(slot) => {
                 let v = self.pop();
-                *self.frames.last().unwrap().locals[slot as usize].borrow_mut() = v;
+                self.frames.last_mut().unwrap().locals[slot as usize].set(v);
             }
             OpCode::RebindLocal(slot) => {
                 let f = self.frames.last_mut().unwrap();
-                let cur = f.locals[slot as usize].borrow().clone();
-                f.locals[slot as usize] = Rc::new(RefCell::new(cur));
+                if let LocalSlot::Boxed(cell) = &mut f.locals[slot as usize] {
+                    let cur = cell.borrow().clone();
+                    *cell = Rc::new(RefCell::new(cur));
+                }
             }
             OpCode::GetUpvalue(idx) => {
                 let cell = self.frames.last().unwrap().upvalues[idx as usize].clone();
@@ -480,7 +907,8 @@ impl Vm {
                 } else {
                     Vec::new()
                 };
-                self.push(Value::new_array(rest));
+                let arr = self.alloc_array(rest);
+                self.push(arr);
             }
 
             OpCode::GetProp(cidx) => {
@@ -700,9 +1128,7 @@ impl Vm {
                         .chunk
                         .exports
                         .iter()
-                        .map(|(name, slot)| {
-                            (name.clone(), frame.locals[*slot as usize].borrow().clone())
-                        })
+                        .map(|(name, slot)| (name.clone(), frame.locals[*slot as usize].get()))
                         .collect();
                     self.pending_module_exports = Some(exports);
                 }
@@ -723,7 +1149,8 @@ impl Vm {
                     }
                 };
                 let fo = self.build_closure(&tpl);
-                self.push(wrap_function(fo));
+                let v = self.wrap_function(fo);
+                self.push(v);
             }
             OpCode::Call(argc) => self.exec_call(argc as usize)?,
             OpCode::CallSpread => {
@@ -742,8 +1169,14 @@ impl Vm {
                 let r = self.dispatch_new(callee, args)?;
                 self.push(r);
             }
-            OpCode::NewObject => self.push(Value::new_plain_object()),
-            OpCode::NewArray => self.push(Value::new_array(Vec::new())),
+            OpCode::NewObject => {
+                let o = self.alloc_plain_object();
+                self.push(o);
+            }
+            OpCode::NewArray => {
+                let a = self.alloc_array(Vec::new());
+                self.push(a);
+            }
             OpCode::ArrayPush => {
                 let v = self.pop();
                 let arr = self.top().clone();
@@ -832,12 +1265,14 @@ impl Vm {
             OpCode::MakeIterArray => {
                 let v = self.pop();
                 let items = self.materialize_iter_array(&v)?;
-                self.push(Value::new_array(items));
+                let arr = self.alloc_array(items);
+                self.push(arr);
             }
             OpCode::ObjectKeysArray => {
                 let v = self.pop();
                 let keys = self.own_keys_array(&v);
-                self.push(Value::new_array(keys));
+                let arr = self.alloc_array(keys);
+                self.push(arr);
             }
             OpCode::ObjectRestExclude(n) => {
                 let mut exclude = Vec::with_capacity(n as usize);
@@ -856,7 +1291,8 @@ impl Vm {
                         }
                     }
                 }
-                self.push(Value::Object(Rc::new(RefCell::new(out))));
+                let val = self.alloc_obj(out);
+                self.push(val);
             }
             OpCode::ArraySliceFrom => {
                 let start = self.pop();
@@ -868,7 +1304,8 @@ impl Vm {
                 } else {
                     Vec::new()
                 };
-                self.push(Value::new_array(sliced));
+                let val = self.alloc_array(sliced);
+                self.push(val);
             }
 
             OpCode::MakeClass(cidx) => {
@@ -890,7 +1327,8 @@ impl Vm {
                         _ => panic!("LoadRegex: 定数が Regex ではありません"),
                     }
                 };
-                self.push(new_regex_value(re));
+                let v = self.alloc_regex_value(re);
+                self.push(v);
             }
             OpCode::Await => {
                 // ネイティブ関数の Rust 再帰呼び出し（`call_value`/`call_function_obj`）
@@ -952,7 +1390,7 @@ impl Vm {
         let mut ups = Vec::with_capacity(tpl.upvalues.len());
         for d in &tpl.upvalues {
             let cell = match d {
-                UpvalueDesc::ParentLocal(slot) => frame.locals[*slot as usize].clone(),
+                UpvalueDesc::ParentLocal(slot) => frame.locals[*slot as usize].as_boxed_cell(),
                 UpvalueDesc::ParentUpvalue(idx) => frame.upvalues[*idx as usize].clone(),
             };
             ups.push(cell);
@@ -974,7 +1412,7 @@ impl Vm {
                 continue;
             }
             let fo = self.build_closure(&m.func);
-            proto.props.set_value(m.name.clone(), wrap_function(fo));
+            proto.props.set_value(m.name.clone(), self.wrap_function(fo));
         }
         for a in &tpl.accessors {
             if a.is_static {
@@ -983,9 +1421,9 @@ impl Vm {
             let fo = self.build_closure(&a.func);
             proto
                 .props
-                .define_accessor(a.name.clone(), a.is_get, wrap_function(fo));
+                .define_accessor(a.name.clone(), a.is_get, self.wrap_function(fo));
         }
-        let proto_rc: ObjRef = Rc::new(RefCell::new(proto));
+        let proto_rc: ObjRef = self.alloc_obj_ref(proto);
 
         let instance_fields: Vec<(Rc<str>, Option<Rc<FunctionObj>>)> = tpl
             .instance_fields
@@ -999,7 +1437,7 @@ impl Vm {
             prototype: proto_rc.clone(),
             instance_fields,
         };
-        let class_rc: ObjRef = Rc::new(RefCell::new(ObjData::new(ObjKind::Class(class_data))));
+        let class_rc: ObjRef = self.alloc_obj_ref(ObjData::new(ObjKind::Class(class_data)));
         proto_rc
             .borrow_mut()
             .props
@@ -1021,7 +1459,7 @@ impl Vm {
             class_rc
                 .borrow_mut()
                 .props
-                .set_value(m.name.clone(), wrap_function(fo));
+                .set_value(m.name.clone(), self.wrap_function(fo));
         }
         for a in &tpl.accessors {
             if !a.is_static {
@@ -1031,7 +1469,7 @@ impl Vm {
             class_rc.borrow_mut().props.define_accessor(
                 a.name.clone(),
                 a.is_get,
-                wrap_function(fo),
+                self.wrap_function(fo),
             );
         }
         for (name, init) in &tpl.static_fields {
@@ -1124,7 +1562,7 @@ impl Vm {
         let raw_args = Rc::new(args);
         let mut frame = Frame::new(f.chunk.clone(), f.upvalues.clone(), raw_args);
         if !f.is_arrow && !frame.locals.is_empty() {
-            frame.locals[0] = Rc::new(RefCell::new(this));
+            frame.locals[0].set(this);
         }
         frame
     }
@@ -1225,6 +1663,7 @@ impl Vm {
                         _ => unreachable!(),
                     };
                     let v = nf(self, this, &args)?;
+                    self.track_value_tree(&v);
                     return Ok(CallOutcome::Immediate(v));
                 }
                 if matches!(o.borrow().kind, ObjKind::Class(_)) {
@@ -1260,7 +1699,7 @@ impl Vm {
                 props: PropMap::new(),
                 proto: Some(proto),
             };
-            let inst_rc: ObjRef = Rc::new(RefCell::new(instance));
+            let inst_rc: ObjRef = self.alloc_obj_ref(instance);
             let inst_val = Value::Object(inst_rc.clone());
             for (name, init) in &fields {
                 let v = match init {
@@ -1283,7 +1722,9 @@ impl Vm {
                 ObjKind::Native(n) => n.f.clone(),
                 _ => unreachable!(),
             };
-            return nf(self, Value::Undefined, &args);
+            let v = nf(self, Value::Undefined, &args)?;
+            self.track_value_tree(&v);
+            return Ok(v);
         }
         let is_fn = matches!(co.borrow().kind, ObjKind::Function(_));
         if is_fn {
@@ -1295,11 +1736,11 @@ impl Vm {
                 Some(PropSlot::Value(Value::Object(p))) => Some(p.clone()),
                 _ => None,
             };
-            let inst_rc: ObjRef = Rc::new(RefCell::new(ObjData {
+            let inst_rc: ObjRef = self.alloc_obj_ref(ObjData {
                 kind: ObjKind::Plain,
                 props: PropMap::new(),
                 proto,
-            }));
+            });
             let inst_val = Value::Object(inst_rc.clone());
             let ret = self.call_function_obj(fo, inst_val.clone(), &args)?;
             if matches!(ret, Value::Object(_)) {
@@ -1542,7 +1983,7 @@ impl Vm {
                     ObjKind::Map(m) => Ok(m
                         .entries
                         .iter()
-                        .map(|(k, val)| Value::new_array(vec![k.clone(), val.clone()]))
+                        .map(|(k, val)| self.alloc_array(vec![k.clone(), val.clone()]))
                         .collect()),
                     ObjKind::Set(s) => Ok(s.values.clone()),
                     _ => Err(self.type_error(
@@ -1603,7 +2044,7 @@ impl Vm {
             .set_value(Rc::from("message"), Value::str(msg.clone()));
         o.props
             .set_value(Rc::from("stack"), Value::str(format!("{name}: {msg}")));
-        Value::Object(Rc::new(RefCell::new(o)))
+        self.alloc_obj(o)
     }
     pub fn type_error(&self, msg: impl Into<String>) -> Value {
         self.make_error("TypeError", msg.into())
@@ -1621,9 +2062,9 @@ impl Vm {
 
     /// pending 状態の新しい Promise を作る。
     pub fn new_pending_promise(&mut self) -> (Value, ObjRef) {
-        let obj: ObjRef = Rc::new(RefCell::new(ObjData::new(ObjKind::Promise(
+        let obj: ObjRef = self.alloc_obj_ref(ObjData::new(ObjKind::Promise(
             PromiseData::pending(),
-        ))));
+        )));
         (Value::Object(obj.clone()), obj)
     }
 
@@ -1822,33 +2263,39 @@ impl Vm {
     /// 呼び出す。resolve/reject はどちらか一方が最初の 1 回しか効かない。
     fn run_resolve_thenable(&mut self, promise: ObjRef, thenable: Value, then_fn: Value) {
         let called: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-        let p1 = promise.clone();
+        let p1 = Rc::downgrade(&promise);
         let called1 = called.clone();
-        let resolve_fn = Value::native_fn(
+        let resolve_fn = self.alloc_native_with_captures(
             "",
             1,
+            vec![promise.clone()],
             Rc::new(move |vm, _this, args| {
                 if *called1.borrow() {
                     return Ok(Value::Undefined);
                 }
                 *called1.borrow_mut() = true;
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
-                vm.resolve_promise(p1.clone(), v);
+                if let Some(p) = p1.upgrade() {
+                    vm.resolve_promise(p, v);
+                }
                 Ok(Value::Undefined)
             }),
         );
-        let p2 = promise.clone();
+        let p2 = Rc::downgrade(&promise);
         let called2 = called.clone();
-        let reject_fn = Value::native_fn(
+        let reject_fn = self.alloc_native_with_captures(
             "",
             1,
+            vec![promise.clone()],
             Rc::new(move |vm, _this, args| {
                 if *called2.borrow() {
                     return Ok(Value::Undefined);
                 }
                 *called2.borrow_mut() = true;
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
-                vm.settle_promise(p2.clone(), Err(v));
+                if let Some(p) = p2.upgrade() {
+                    vm.settle_promise(p, Err(v));
+                }
                 Ok(Value::Undefined)
             }),
         );
@@ -1894,6 +2341,9 @@ impl Vm {
                 }
             }
         }
+        if self.native_call_depth == 0 {
+            self.maybe_collect_garbage();
+        }
         if self.pending_host_count > 0 {
             PumpState::Waiting
         } else {
@@ -1908,13 +2358,313 @@ impl Default for Vm {
     }
 }
 
+// =====================================================================
+// GC トレースヘルパー
+// =====================================================================
+
+fn gc_mark_obj(obj: &ObjRef, marked: &mut HashSet<usize>, worklist: &mut Vec<ObjRef>) {
+    let ptr = Rc::as_ptr(obj) as usize;
+    if marked.insert(ptr) {
+        worklist.push(obj.clone());
+    }
+}
+
+fn gc_mark_value(v: &Value, marked: &mut HashSet<usize>, worklist: &mut Vec<ObjRef>) {
+    if let Value::Object(o) = v {
+        gc_mark_obj(o, marked, worklist);
+    }
+}
+
+fn gc_mark_frame(frame: &Frame, marked: &mut HashSet<usize>, worklist: &mut Vec<ObjRef>) {
+    for slot in &frame.locals {
+        match slot {
+            LocalSlot::Direct(v) => gc_mark_value(v, marked, worklist),
+            LocalSlot::Boxed(cell) => {
+                if let Ok(v) = cell.try_borrow() {
+                    gc_mark_value(&v, marked, worklist);
+                }
+            }
+        }
+    }
+    for cell in frame.upvalues.iter() {
+        if let Ok(v) = cell.try_borrow() {
+            gc_mark_value(&v, marked, worklist);
+        }
+    }
+    for v in &frame.stack {
+        gc_mark_value(v, marked, worklist);
+    }
+    for v in frame.raw_args.iter() {
+        gc_mark_value(v, marked, worklist);
+    }
+}
+
+fn gc_visit_value(v: &Value, f: &mut impl FnMut(&ObjRef)) {
+    if let Value::Object(o) = v {
+        f(o);
+    }
+}
+
+fn gc_visit_frame_raw(frame: &Frame, f: &mut impl FnMut(&ObjRef)) {
+    for slot in &frame.locals {
+        match slot {
+            LocalSlot::Direct(v) => gc_visit_value(v, f),
+            LocalSlot::Boxed(cell) => {
+                if let Ok(v) = cell.try_borrow() {
+                    gc_visit_value(&v, f);
+                }
+            }
+        }
+    }
+    for cell in frame.upvalues.iter() {
+        if let Ok(v) = cell.try_borrow() {
+            gc_visit_value(&v, f);
+        }
+    }
+    for v in &frame.stack {
+        gc_visit_value(v, f);
+    }
+    for v in frame.raw_args.iter() {
+        gc_visit_value(v, f);
+    }
+}
+
+fn gc_visit_obj_outgoing(obj: &ObjRef, f: &mut impl FnMut(&ObjRef)) {
+    let Ok(b) = obj.try_borrow() else {
+        return;
+    };
+    for (_, slot) in b.props.iter() {
+        match slot {
+            PropSlot::Value(v) => gc_visit_value(v, f),
+            PropSlot::Accessor { get, set } => {
+                if let Some(v) = get {
+                    gc_visit_value(v, f);
+                }
+                if let Some(v) = set {
+                    gc_visit_value(v, f);
+                }
+            }
+        }
+    }
+    if let Some(proto) = &b.proto {
+        f(proto);
+    }
+    match &b.kind {
+        ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_) => {}
+        ObjKind::Array(items) => {
+            for v in items {
+                gc_visit_value(v, f);
+            }
+        }
+        ObjKind::Map(m) => {
+            for (k, v) in &m.entries {
+                gc_visit_value(k, f);
+                gc_visit_value(v, f);
+            }
+        }
+        ObjKind::Set(s) => {
+            for v in &s.values {
+                gc_visit_value(v, f);
+            }
+        }
+        ObjKind::Function(fo) => {
+            for cell in fo.upvalues.iter() {
+                if let Ok(v) = cell.try_borrow() {
+                    gc_visit_value(&v, f);
+                }
+            }
+        }
+        ObjKind::Native(n) => {
+            for cap in &n.captures {
+                f(cap);
+            }
+        }
+        ObjKind::Class(cd) => {
+            f(&cd.prototype);
+            if let Some(ctor) = &cd.ctor {
+                for cell in ctor.upvalues.iter() {
+                    if let Ok(v) = cell.try_borrow() {
+                        gc_visit_value(&v, f);
+                    }
+                }
+            }
+            for (_, init) in &cd.instance_fields {
+                if let Some(fo) = init {
+                    for cell in fo.upvalues.iter() {
+                        if let Ok(v) = cell.try_borrow() {
+                            gc_visit_value(&v, f);
+                        }
+                    }
+                }
+            }
+        }
+        ObjKind::Promise(pd) => {
+            match &pd.state {
+                PromiseState::Pending => {}
+                PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => gc_visit_value(v, f),
+            }
+            for r in &pd.reactions {
+                match r {
+                    PromiseReaction::Then {
+                        on_fulfilled,
+                        on_rejected,
+                        result_promise,
+                    } => {
+                        if let Some(v) = on_fulfilled {
+                            gc_visit_value(v, f);
+                        }
+                        if let Some(v) = on_rejected {
+                            gc_visit_value(v, f);
+                        }
+                        f(result_promise);
+                    }
+                    PromiseReaction::Await(cont) => {
+                        for frame in &cont.frames {
+                            gc_visit_frame_raw(frame, f);
+                        }
+                        f(&cont.owner_promise);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 候補集合の内部参照カウント差し引き専用ビジタ。
+/// `ObjData` に直接所有される参照はすべて 1 対 1 で訪問し、複数オブジェクト間で
+/// 共有され得る中間 `Rc`（`FunctionObj`, アップバリューセル `Rc<RefCell<Value>>`,
+/// `Frame::raw_args`）はポインタ単位で重複排除して exact な参照数を保つ。
+fn gc_visit_obj_data_dedup(
+    b: &ObjData,
+    seen_fns: &mut HashSet<usize>,
+    seen_cells: &mut HashSet<usize>,
+    seen_raw_args: &mut HashSet<usize>,
+    f: &mut impl FnMut(&ObjRef),
+) {
+    let visit_cell = |cell: &Rc<RefCell<Value>>,
+                      seen_cells: &mut HashSet<usize>,
+                      f: &mut dyn FnMut(&ObjRef)| {
+        if seen_cells.insert(Rc::as_ptr(cell) as usize) {
+            if let Ok(v) = cell.try_borrow() {
+                if let Value::Object(o) = &*v {
+                    f(o);
+                }
+            }
+        }
+    };
+    let visit_fn = |fo: &Rc<FunctionObj>,
+                    seen_fns: &mut HashSet<usize>,
+                    seen_cells: &mut HashSet<usize>,
+                    f: &mut dyn FnMut(&ObjRef)| {
+        if seen_fns.insert(Rc::as_ptr(fo) as usize) {
+            for cell in fo.upvalues.iter() {
+                visit_cell(cell, seen_cells, f);
+            }
+        }
+    };
+
+    for (_, slot) in b.props.iter() {
+        match slot {
+            PropSlot::Value(v) => gc_visit_value(v, f),
+            PropSlot::Accessor { get, set } => {
+                if let Some(v) = get {
+                    gc_visit_value(v, f);
+                }
+                if let Some(v) = set {
+                    gc_visit_value(v, f);
+                }
+            }
+        }
+    }
+    if let Some(proto) = &b.proto {
+        f(proto);
+    }
+    match &b.kind {
+        ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_) => {}
+        ObjKind::Array(items) => {
+            for v in items {
+                gc_visit_value(v, f);
+            }
+        }
+        ObjKind::Map(m) => {
+            for (k, v) in &m.entries {
+                gc_visit_value(k, f);
+                gc_visit_value(v, f);
+            }
+        }
+        ObjKind::Set(s) => {
+            for v in &s.values {
+                gc_visit_value(v, f);
+            }
+        }
+        ObjKind::Function(fo) => visit_fn(fo, seen_fns, seen_cells, f),
+        ObjKind::Native(n) => {
+            for cap in &n.captures {
+                f(cap);
+            }
+        }
+        ObjKind::Class(cd) => {
+            f(&cd.prototype);
+            if let Some(ctor) = &cd.ctor {
+                visit_fn(ctor, seen_fns, seen_cells, f);
+            }
+            for (_, init) in &cd.instance_fields {
+                if let Some(fo) = init {
+                    visit_fn(fo, seen_fns, seen_cells, f);
+                }
+            }
+        }
+        ObjKind::Promise(pd) => {
+            match &pd.state {
+                PromiseState::Pending => {}
+                PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => gc_visit_value(v, f),
+            }
+            for r in &pd.reactions {
+                match r {
+                    PromiseReaction::Then {
+                        on_fulfilled,
+                        on_rejected,
+                        result_promise,
+                    } => {
+                        if let Some(v) = on_fulfilled {
+                            gc_visit_value(v, f);
+                        }
+                        if let Some(v) = on_rejected {
+                            gc_visit_value(v, f);
+                        }
+                        f(result_promise);
+                    }
+                    PromiseReaction::Await(cont) => {
+                        for frame in &cont.frames {
+                            for slot in &frame.locals {
+                                match slot {
+                                    LocalSlot::Direct(v) => gc_visit_value(v, f),
+                                    LocalSlot::Boxed(cell) => visit_cell(cell, seen_cells, f),
+                                }
+                            }
+                            for cell in frame.upvalues.iter() {
+                                visit_cell(cell, seen_cells, f);
+                            }
+                            for v in &frame.stack {
+                                gc_visit_value(v, f);
+                            }
+                            if seen_raw_args.insert(Rc::as_ptr(&frame.raw_args) as usize) {
+                                for v in frame.raw_args.iter() {
+                                    gc_visit_value(v, f);
+                                }
+                            }
+                        }
+                        f(&cont.owner_promise);
+                    }
+                }
+            }
+        }
+    }
+}
+
 enum CallOutcome {
     Immediate(Value),
     FramePushed,
-}
-
-fn wrap_function(fo: Rc<FunctionObj>) -> Value {
-    Value::Object(Rc::new(RefCell::new(ObjData::new(ObjKind::Function(fo)))))
 }
 
 /// 呼び出し可能（関数・ネイティブ関数）かどうか。クラスは `new` 経由でしか
@@ -2138,5 +2888,461 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
         (Object(_), Number(_) | Str(_)) => loose_eq(&to_primitive(a), b),
         (Number(_) | Str(_), Object(_)) => loose_eq(a, &to_primitive(b)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{compiler, parse_module, Interpreter};
+
+    fn compile(src: &str) -> Rc<Chunk> {
+        let m = parse_module(src, "<test>").unwrap();
+        compiler::compile_module(&m).unwrap()
+    }
+
+    fn run_exports(interp: &mut Interpreter, src: &str) -> Vec<(Rc<str>, Value)> {
+        interp.run_module(src, "<test>").unwrap()
+    }
+
+    fn export_val(exports: &[(Rc<str>, Value)], name: &str) -> Value {
+        exports
+            .iter()
+            .find(|(k, _)| &**k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    }
+
+    // =================================================================
+    // Part 1: 非キャプチャローカル変数の非ボックス化テスト
+    // =================================================================
+
+    #[test]
+    fn uncaptured_locals_stay_direct_and_only_captured_slots_are_boxed() {
+        let src = r#"
+            export function demo(a: number, b: number) {
+                let uncaptured = a + 10;
+                let captured = b + 20;
+                let alsoUncaptured = uncaptured * 2;
+                const fn1 = () => captured;
+                captured += 5;
+                return fn1() + alsoUncaptured;
+            }
+            export const result = demo(3, 7);
+        "#;
+        let chunk = compile(src);
+
+        // `demo` の FunctionTemplate を定数表から取り出して captured_locals を検査する
+        let demo_tpl = chunk
+            .consts
+            .iter()
+            .find_map(|c| match c {
+                Const::FunctionTemplate(t) if &*t.name == "demo" => Some(t.clone()),
+                _ => None,
+            })
+            .expect("demo FunctionTemplate should exist");
+
+        // demo のローカルスロットのうち captured されるのは `captured` 1 個だけ
+        let boxed_count = demo_tpl
+            .chunk
+            .captured_locals
+            .iter()
+            .filter(|&&c| c)
+            .count();
+        let direct_count = demo_tpl
+            .chunk
+            .captured_locals
+            .iter()
+            .filter(|&&c| !c)
+            .count();
+        assert_eq!(boxed_count, 1, "captured_locals: {:?}", demo_tpl.chunk.captured_locals);
+        assert!(direct_count >= 5, "non-captured locals should stay Direct");
+
+        // Frame::new が実際に Direct / Boxed を正しく作り分けることも直接確認
+        let frame = Frame::new(demo_tpl.chunk.clone(), Rc::new(Vec::new()), Rc::new(Vec::new()));
+        assert_eq!(frame.locals.iter().filter(|s| s.is_boxed()).count(), 1);
+        assert_eq!(frame.locals.iter().filter(|s| s.is_direct()).count(), direct_count);
+
+        // 実行結果が正しいことを確認: (7 + 20 + 5) + ((3 + 10) * 2) = 32 + 26 = 58
+        let mut interp = Interpreter::new();
+        let exports = run_exports(&mut interp, src);
+        match export_val(&exports, "result") {
+            Value::Number(n) => assert_eq!(n, 58.0),
+            other => panic!("expected 58, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uncaptured_for_let_loop_is_direct_and_captured_for_let_preserves_per_iter_binding() {
+        let src = r#"
+            function sumLoop(n: number) {
+                let s = 0;
+                for (let i = 0; i < n; i++) {
+                    s += i;
+                }
+                return s;
+            }
+            function captureLoop() {
+                const fns: Array<() => number> = [];
+                for (let i = 0; i < 5; i++) {
+                    fns.push(() => i);
+                }
+                return fns.map(f => f()).join(",");
+            }
+            export const sum = sumLoop(100);
+            export const captured = captureLoop();
+        "#;
+        let chunk = compile(src);
+        let sum_tpl = chunk
+            .consts
+            .iter()
+            .find_map(|c| match c {
+                Const::FunctionTemplate(t) if &*t.name == "sumLoop" => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            sum_tpl.chunk.captured_locals.iter().all(|&c| !c),
+            "sumLoop の全ローカルは非キャプチャ（Direct）であるべき: {:?}",
+            sum_tpl.chunk.captured_locals
+        );
+
+        let cap_tpl = chunk
+            .consts
+            .iter()
+            .find_map(|c| match c {
+                Const::FunctionTemplate(t) if &*t.name == "captureLoop" => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            cap_tpl.chunk.captured_locals.iter().filter(|&&c| c).count(),
+            1,
+            "captureLoop はループ変数 i のみ Boxed であるべき"
+        );
+
+        let mut interp = Interpreter::new();
+        let exports = run_exports(&mut interp, src);
+        match export_val(&exports, "sum") {
+            Value::Number(n) => assert_eq!(n, 4950.0),
+            other => panic!("expected 4950, got {other:?}"),
+        }
+        match export_val(&exports, "captured") {
+            Value::Str(s) => assert_eq!(&*s, "0,1,2,3,4"),
+            other => panic!("expected '0,1,2,3,4', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_upvalues_and_arrow_captured_this_work_with_mixed_slots() {
+        let src = r#"
+            function makeCounter(start: number) {
+                let uncap = 100;
+                let count = start;
+                function mid() {
+                    let midUncap = 1;
+                    return () => {
+                        count += midUncap;
+                        return count;
+                    };
+                }
+                const inc = mid();
+                return [inc(), inc(), uncap];
+            }
+            const obj = {
+                x: 42,
+                getX() {
+                    let localOnly = 8;
+                    const arrow = () => this.x;
+                    return arrow() + localOnly;
+                },
+            };
+            export const res = makeCounter(10).join(",");
+            export const thisRes = obj.getX();
+        "#;
+        let mut interp = Interpreter::new();
+        let exports = run_exports(&mut interp, src);
+        match export_val(&exports, "res") {
+            Value::Str(s) => assert_eq!(&*s, "11,12,100"),
+            other => panic!("unexpected res: {other:?}"),
+        }
+        match export_val(&exports, "thisRes") {
+            Value::Number(n) => assert_eq!(n, 50.0),
+            other => panic!("unexpected thisRes: {other:?}"),
+        }
+    }
+
+    // =================================================================
+    // Part 2: 循環参照回収 (GC) テスト
+    // =================================================================
+
+    #[test]
+    fn gc_reclaims_1000_circular_objects_and_pairs_back_to_baseline() {
+        let mut interp = Interpreter::new();
+        interp.collect_garbage();
+        let baseline = interp.vm().live_tracked_objects();
+
+        let src = r#"
+            for (let i = 0; i < 1000; i++) {
+                const selfRef: any = { id: i };
+                selfRef.self = selfRef;
+
+                const a: any = { name: "a" };
+                const b: any = { name: "b" };
+                a.b = b;
+                b.a = a;
+            }
+            export const done = true;
+        "#;
+        // 閾値を大きくしておき、明示 collect_garbage による回収数を観測する
+        interp.vm().set_gc_threshold(100_000);
+        let _ = run_exports(&mut interp, src);
+
+        let before = interp.vm().live_tracked_objects();
+        assert!(
+            before >= baseline + 3000,
+            "GC 前は 3000 個以上の循環オブジェクトが残存しているはず: before={before}, baseline={baseline}"
+        );
+
+        let collected = interp.collect_garbage();
+        let after = interp.vm().live_tracked_objects();
+        assert!(
+            collected >= 3000,
+            "3000 個以上の循環オブジェクトが回収されるべき: collected={collected}"
+        );
+        assert_eq!(
+            after, baseline,
+            "GC 後はベースラインまで完全に回収されるべき: after={after}, baseline={baseline}"
+        );
+    }
+
+    #[test]
+    fn gc_reclaims_self_referencing_and_mutually_recursive_closures() {
+        let mut interp = Interpreter::new();
+        interp.collect_garbage();
+        let baseline = interp.vm().live_tracked_objects();
+
+        let src = r#"
+            function makeSelf() {
+                function f() {
+                    return f;
+                }
+                return f() === f;
+            }
+            function makeMutual() {
+                function a(n: number): number {
+                    return n <= 0 ? 0 : b(n - 1);
+                }
+                function b(n: number): number {
+                    return n <= 0 ? 1 : a(n - 1);
+                }
+                return a(4) + b(4);
+            }
+            let ok = 0;
+            for (let i = 0; i < 200; i++) {
+                if (makeSelf()) ok += 1;
+                ok += makeMutual();
+            }
+            export const total = ok;
+        "#;
+        interp.vm().set_gc_threshold(100_000);
+        let exports = run_exports(&mut interp, src);
+        match export_val(&exports, "total") {
+            Value::Number(n) => assert_eq!(n, 400.0),
+            other => panic!("expected 400, got {other:?}"),
+        }
+
+        let before = interp.vm().live_tracked_objects();
+        assert!(before >= baseline + 600, "before={before}, baseline={baseline}");
+        let collected = interp.collect_garbage();
+        let after = interp.vm().live_tracked_objects();
+        assert!(collected >= 600, "collected={collected}");
+        assert_eq!(after, baseline, "after={after}, baseline={baseline}");
+    }
+
+    #[test]
+    fn gc_reclaims_circular_arrays_classes_and_promises() {
+        let mut interp = Interpreter::new();
+        interp.collect_garbage();
+        let baseline = interp.vm().live_tracked_objects();
+
+        let src = r#"
+            for (let i = 0; i < 100; i++) {
+                // 循環配列
+                const arr: any = [];
+                arr.push(arr);
+
+                // クラス自身と prototype.constructor の循環
+                class LocalClass {
+                    v = i;
+                    get() { return this.v; }
+                }
+                const inst = new LocalClass();
+                (inst as any).self = inst;
+
+                // Promise + .then クロージャ循環
+                const p1: any = new Promise(() => {});
+                p1.then(() => p1);
+
+                // Promise + resolver ネイティブ捕捉循環
+                let res: any;
+                const p2: any = new Promise((r: any) => { res = r; });
+                p2.res = res;
+
+                // 解決済み Promise とオブジェクトの循環
+                const box: any = {};
+                const p3 = Promise.resolve(box);
+                box.p = p3;
+            }
+            export const done = true;
+        "#;
+        interp.vm().set_gc_threshold(100_000);
+        let _ = run_exports(&mut interp, src);
+
+        let before = interp.vm().live_tracked_objects();
+        assert!(before >= baseline + 500, "before={before}, baseline={baseline}");
+
+        let collected = interp.collect_garbage();
+        let after = interp.vm().live_tracked_objects();
+        assert!(collected >= 500, "collected={collected}");
+        assert_eq!(after, baseline, "after={after}, baseline={baseline}");
+    }
+
+    #[test]
+    fn automatic_gc_threshold_reclaims_cycles_during_execution() {
+        let mut interp = Interpreter::new();
+        interp.collect_garbage();
+        let baseline = interp.vm().live_tracked_objects();
+
+        // 明示的に collect_garbage を呼ばず、自動 GC の閾値超過だけで回収されることを確認
+        let src = r#"
+            for (let i = 0; i < 6000; i++) {
+                const a: any = {};
+                a.self = a;
+            }
+            export const done = true;
+        "#;
+        let _ = run_exports(&mut interp, src);
+
+        let live_after_run = interp.vm().live_tracked_objects();
+        assert!(
+            live_after_run < baseline + 4000,
+            "自動 GC が発火して生存オブジェクト数が抑えられているべき: live={live_after_run}, baseline={baseline}"
+        );
+        interp.collect_garbage();
+        assert_eq!(interp.vm().live_tracked_objects(), baseline);
+    }
+
+    #[test]
+    fn gc_preserves_cyclic_objects_held_by_external_rust_value() {
+        let mut interp = Interpreter::new();
+        interp.collect_garbage();
+        let baseline = interp.vm().live_tracked_objects();
+
+        let src = r#"
+            const a: any = { tag: "keep-a" };
+            const b: any = { tag: "keep-b" };
+            a.b = b;
+            b.a = a;
+
+            // こちらは到達不能な循環ゴミ
+            {
+                const trash: any = { tag: "trash" };
+                trash.self = trash;
+            }
+            export const held = a;
+        "#;
+        let exports = run_exports(&mut interp, src);
+        let held = export_val(&exports, "held");
+        drop(exports);
+
+        // VM ルートには `held` がもう存在しないが、Rust ローカル変数 `held` が強参照を持っている
+        let collected = interp.collect_garbage();
+        assert!(collected >= 1, "trash は回収されるべき");
+
+        // 外部保持された `held` とその先の `b` は破壊されていないこと
+        let tag_a = interp.vm().get_prop(&held, "tag").unwrap();
+        let b_val = interp.vm().get_prop(&held, "b").unwrap();
+        let tag_b = interp.vm().get_prop(&b_val, "tag").unwrap();
+        let back_a = interp.vm().get_prop(&b_val, "a").unwrap();
+        assert!(matches!(tag_a, Value::Str(ref s) if &**s == "keep-a"));
+        assert!(matches!(tag_b, Value::Str(ref s) if &**s == "keep-b"));
+        assert!(strict_eq(&back_a, &held));
+
+        // 外部参照をすべて手放してから GC すると a・b ともに完全に回収される
+        drop(back_a);
+        drop(b_val);
+        drop(held);
+        let collected2 = interp.collect_garbage();
+        assert_eq!(collected2, 2, "外部参照解放後は a と b の 2 個が回収されるべき");
+        assert_eq!(interp.vm().live_tracked_objects(), baseline);
+    }
+
+    #[test]
+    fn gc_preserves_suspended_async_task_waiting_on_external_host_promise() {
+        let mut interp = Interpreter::new();
+        let saved_handle: Rc<RefCell<Option<HostPromise>>> = Rc::new(RefCell::new(None));
+        let h_clone = saved_handle.clone();
+        interp.register_native_async("waitHost", 0, move |_vm, _this, _args, handle| {
+            *h_clone.borrow_mut() = Some(handle);
+        });
+
+        let src = r#"
+            export let observed = 0;
+            async function worker() {
+                const localObj: any = { bonus: 7 };
+                localObj.self = localObj;
+                const v = await waitHost();
+                observed = v + localObj.bonus;
+            }
+            worker();
+            // ゴミ循環も同時に作る
+            for (let i = 0; i < 50; i++) {
+                const g: any = {};
+                g.self = g;
+            }
+        "#;
+        let _ = run_exports(&mut interp, src);
+        assert!(saved_handle.borrow().is_some());
+
+        // 中断中に GC を複数回走らせても、HostPromise と継続フレーム内の localObj は守られる
+        let collected = interp.collect_garbage();
+        assert!(collected >= 50);
+
+        let handle = saved_handle.borrow_mut().take().unwrap();
+        handle.resolve(interp.vm(), Value::Number(35.0));
+        assert_eq!(interp.run_event_loop(), PumpState::Idle);
+
+        // async 関数が正しく再開して observed = 35 + 7 = 42 に到達したこと
+        // (トップレベル export は return 時点の値スナップショットなのでグローバル経由でも検証)
+        let mut interp2 = Interpreter::new();
+        let saved2: Rc<RefCell<Option<HostPromise>>> = Rc::new(RefCell::new(None));
+        let h2 = saved2.clone();
+        interp2.register_native_async("waitHost", 0, move |_vm, _this, _args, handle| {
+            *h2.borrow_mut() = Some(handle);
+        });
+        let box_obj = Value::new_plain_object();
+        interp2.define_global("outBox", box_obj.clone());
+        let _ = run_exports(
+            &mut interp2,
+            r#"
+                async function worker() {
+                    const localObj: any = { bonus: 7 };
+                    localObj.self = localObj;
+                    const v = await waitHost();
+                    outBox.result = v + localObj.bonus;
+                }
+                worker();
+            "#,
+        );
+        interp2.collect_garbage();
+        saved2
+            .borrow_mut()
+            .take()
+            .unwrap()
+            .resolve(interp2.vm(), Value::Number(35.0));
+        assert_eq!(interp2.run_event_loop(), PumpState::Idle);
+        let res = interp2.vm().get_prop(&box_obj, "result").unwrap();
+        assert!(matches!(res, Value::Number(n) if n == 42.0), "got {res:?}");
     }
 }

@@ -241,7 +241,10 @@ fn install_json(vm: &mut Vm) {
     });
     let parse = native("parse", 1, |vm, _this, args| {
         let s = vm.to_display_string(&arg(args, 0));
-        json_parse(&s).map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))
+        let val =
+            json_parse(&s).map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))?;
+        vm.track_value_tree(&val);
+        Ok(val)
     });
     if let Value::Object(o) = &json {
         let mut b = o.borrow_mut();
@@ -874,21 +877,27 @@ fn install_promise(vm: &mut Vm) {
     let ctor = native("Promise", 1, |vm, _this, args| {
         let executor = arg(args, 0);
         let (promise_val, promise_obj) = vm.new_pending_promise();
-        let p_res = promise_obj.clone();
-        let resolve_fn = Value::native_fn(
+        let p_res = Rc::downgrade(&promise_obj);
+        let resolve_fn = vm.alloc_native_with_captures(
             "",
             1,
+            vec![promise_obj.clone()],
             Rc::new(move |vm, _this, args| {
-                vm.resolve_promise(p_res.clone(), arg(args, 0));
+                if let Some(p) = p_res.upgrade() {
+                    vm.resolve_promise(p, arg(args, 0));
+                }
                 Ok(Value::Undefined)
             }),
         );
-        let p_rej = promise_obj.clone();
-        let reject_fn = Value::native_fn(
+        let p_rej = Rc::downgrade(&promise_obj);
+        let reject_fn = vm.alloc_native_with_captures(
             "",
             1,
+            vec![promise_obj.clone()],
             Rc::new(move |vm, _this, args| {
-                vm.settle_promise(p_rej.clone(), Err(arg(args, 0)));
+                if let Some(p) = p_rej.upgrade() {
+                    vm.settle_promise(p, Err(arg(args, 0)));
+                }
                 Ok(Value::Undefined)
             }),
         );
@@ -919,8 +928,8 @@ fn install_promise(vm: &mut Vm) {
         let (_, dummy) = vm.new_pending_promise();
         for item in items {
             let p = vm.coerce_to_promise(item);
-            let on_fulfilled = settle_forward_fn(result_obj.clone(), false);
-            let on_rejected = settle_forward_fn(result_obj.clone(), true);
+            let on_fulfilled = settle_forward_fn(vm, result_obj.clone(), false);
+            let on_rejected = settle_forward_fn(vm, result_obj.clone(), true);
             vm.add_promise_reaction(
                 &p,
                 PromiseReaction::Then {
@@ -985,16 +994,24 @@ fn install_promise(vm: &mut Vm) {
 
 /// `Promise.race` 用: 自分（引数の値/例外）で `target` を確定させ、戻り値は
 /// 捨てる（呼び出し元は使い捨ての `result_promise` にぶら下げる）。
-fn settle_forward_fn(target: ObjRef, is_reject: bool) -> Value {
-    native("", 1, move |vm, _this, args| {
-        let v = arg(args, 0);
-        if is_reject {
-            vm.settle_promise(target.clone(), Err(v));
-        } else {
-            vm.resolve_promise(target.clone(), v);
-        }
-        Ok(Value::Undefined)
-    })
+fn settle_forward_fn(vm: &Vm, target: ObjRef, is_reject: bool) -> Value {
+    let weak = Rc::downgrade(&target);
+    vm.alloc_native_with_captures(
+        "",
+        1,
+        vec![target],
+        Rc::new(move |vm, _this, args| {
+            if let Some(t) = weak.upgrade() {
+                let v = arg(args, 0);
+                if is_reject {
+                    vm.settle_promise(t, Err(v));
+                } else {
+                    vm.resolve_promise(t, v);
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    )
 }
 
 fn promise_method(name: &str) -> Option<Value> {
@@ -1047,20 +1064,51 @@ fn promise_method(name: &str) -> Option<Value> {
             };
             let cb = arg(args, 0);
             let (result_val, result_obj) = vm.new_pending_promise();
-            let cb_f = cb.clone();
             // finally のコールバックは引数無しで呼ばれ、戻り値は無視される
             // （投げた場合のみそれが新しい結果を上書きする）。元の値/例外は
             // そのまま透過する（`then`/`catch` と違い finally は値を変えない）。
-            let on_fulfilled = native("", 1, move |vm, _this, args| {
-                let v = arg(args, 0);
-                vm.call_value(cb_f.clone(), Value::Undefined, &[])?;
-                Ok(v)
-            });
-            let on_rejected = native("", 1, move |vm, _this, args| {
-                let e = arg(args, 0);
-                vm.call_value(cb.clone(), Value::Undefined, &[])?;
-                Err(e)
-            });
+            let (on_fulfilled, on_rejected) = if let Value::Object(cb_obj) = cb {
+                let cb_w1 = Rc::downgrade(&cb_obj);
+                let on_f = vm.alloc_native_with_captures(
+                    "",
+                    1,
+                    vec![cb_obj.clone()],
+                    Rc::new(move |vm, _this, args| {
+                        let v = arg(args, 0);
+                        if let Some(c) = cb_w1.upgrade() {
+                            vm.call_value(Value::Object(c), Value::Undefined, &[])?;
+                        }
+                        Ok(v)
+                    }),
+                );
+                let cb_w2 = Rc::downgrade(&cb_obj);
+                let on_r = vm.alloc_native_with_captures(
+                    "",
+                    1,
+                    vec![cb_obj],
+                    Rc::new(move |vm, _this, args| {
+                        let e = arg(args, 0);
+                        if let Some(c) = cb_w2.upgrade() {
+                            vm.call_value(Value::Object(c), Value::Undefined, &[])?;
+                        }
+                        Err(e)
+                    }),
+                );
+                (on_f, on_r)
+            } else {
+                let cb_f = cb.clone();
+                let on_f = native("", 1, move |vm, _this, args| {
+                    let v = arg(args, 0);
+                    vm.call_value(cb_f.clone(), Value::Undefined, &[])?;
+                    Ok(v)
+                });
+                let on_r = native("", 1, move |vm, _this, args| {
+                    let e = arg(args, 0);
+                    vm.call_value(cb.clone(), Value::Undefined, &[])?;
+                    Err(e)
+                });
+                (on_f, on_r)
+            };
             vm.add_promise_reaction(
                 p,
                 PromiseReaction::Then {
