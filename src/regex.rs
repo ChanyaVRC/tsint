@@ -32,8 +32,8 @@
 //! AST をいったん「Save/Jmp/Split/Match」などからなるフラットな命令列
 //! （`Inst`）へコンパイルし（ジャンプ先はコンパイル時に確定するアドレス
 //! 方式。バックパッチはこのモジュール内で完結する）、その命令列を
-//! `pc`（命令ポインタ）と `sp`（文字列中の位置）を引数に取る再帰関数
-//! `Exec::run` でバックトラッキング実行する。
+//! ヒープ上の明示的なバックトラックスタックとアンドゥログ（trail）を用いる
+//! 反復ループ `Exec::run_from` でバックトラッキング実行する。
 //!
 //! 選択 `|` と量指定子 `* + ? {n,m}` はいずれも `Split`/`Jmp` を使って
 //! **地続きの命令列としてインライン展開**する（量指定子の外側にある残りの
@@ -54,10 +54,10 @@
 //! 無いため、先読みの内側だけを独立に「最初に見つかった成功」で確定して
 //! 良い）。
 //!
-//! バックトラッキングの選択点（`Split`・`LoopBack` 経由のループ・`Look`）
-//! では、そこで試す枝ごとにキャプチャ配列（`saved`）のスナップショットを
-//! 取り、失敗したら破棄・成功したらコミットする方式で「キャプチャの巻き戻し」
-//! を実装する。
+//! バックトラッキングの選択点（`Split`・`Look`）では、`saved` キャプチャ配列
+//! 全体をクローンする代わりに、変更前の値を記録するアンドゥログ（`trail`）
+//! の長さをマークしておき、枝が失敗したらそのマーク位置まで逆順に巻き戻す
+//! ことで、バックトラック時のヒープ再確保をゼロに抑えている。
 //!
 //! 後方参照・先読みは正規言語ではないため、Thompson 構成の NFA
 //! シミュレーションでは実行できない（これが本エンジンがバックトラッキング
@@ -838,23 +838,29 @@ impl Compiler {
     }
 
     /// 「あってもなくても良い」コピーを `remaining` 個、入れ子の `Split` で
-    /// 展開する（`{n,m}` の m-n 分。有限個なので無限ループの心配は無い）。
+    /// 展開する（`{n,m}` の m-n 分。有限個なので無限ループの心配は無い。
+    /// 大きな `remaining` でもコンパイル時にコールスタックを消費しないよう反復で展開する）。
     fn compile_optional_chain(&mut self, inner: &Ast, remaining: u32, greedy: bool) {
         if remaining == 0 {
             return;
         }
-        let split_pc = self.emit(Inst::Split(0, 0));
-        let body_start = self.here();
-        self.compile(inner);
-        self.compile_optional_chain(inner, remaining - 1, greedy);
+        let mut splits = Vec::with_capacity(remaining as usize);
+        for _ in 0..remaining {
+            let split_pc = self.emit(Inst::Split(0, 0));
+            let body_start = self.here();
+            splits.push((split_pc, body_start));
+            self.compile(inner);
+        }
         let after = self.here();
-        if let Inst::Split(ref mut a, ref mut b) = self.prog[split_pc] {
-            if greedy {
-                *a = body_start;
-                *b = after;
-            } else {
-                *a = after;
-                *b = body_start;
+        for (split_pc, body_start) in splits {
+            if let Inst::Split(ref mut a, ref mut b) = self.prog[split_pc] {
+                if greedy {
+                    *a = body_start;
+                    *b = after;
+                } else {
+                    *a = after;
+                    *b = body_start;
+                }
             }
         }
     }
@@ -884,18 +890,35 @@ impl Compiler {
 }
 
 // =====================================================================
-// 実行器（バックトラッキング）
+// 実行器（明示スタック＋アンドゥログによるバックトラッキング）
 // =====================================================================
 
 /// 壊滅的バックトラック対策のデフォルト上限。超過時は `RegexError` を返す
 /// （JS の実際の挙動とは異なるが、無限に固まるよりは明確なエラーの方が
 /// 良いという方針。詳細はモジュール冒頭のドキュメント参照）。
 const DEFAULT_MAX_STEPS: u64 = 2_000_000;
-/// Rust の呼び出しスタックオーバーフローは catch できない（プロセスが
-/// abort する）ため、実際のスタック限界よりだいぶ手前でエラーにする。
-const DEFAULT_MAX_DEPTH: usize = 20_000;
+/// ヒープ上のバックトラックスタック深さの上限（過大なメモリ確保を防ぐ）。
+const DEFAULT_MAX_DEPTH: usize = 50_000;
+/// 先読み `(?=...)` / `(?!...)` のネスト上限（OS コールスタック保護）。
+const MAX_LOOK_DEPTH: usize = 256;
 
 type Saved = Vec<Option<usize>>;
+type Trail = Vec<(usize, Option<usize>)>;
+
+#[derive(Clone, Copy)]
+struct BacktrackFrame {
+    pc: usize,
+    sp: usize,
+    trail_mark: usize,
+}
+
+#[inline]
+fn rewind_trail(saved: &mut [Option<usize>], trail: &mut Trail, mark: usize) {
+    while trail.len() > mark {
+        let (slot, prev) = trail.pop().unwrap();
+        saved[slot] = prev;
+    }
+}
 
 struct Exec<'a> {
     prog: &'a [Inst],
@@ -909,7 +932,8 @@ struct Exec<'a> {
 }
 
 impl<'a> Exec<'a> {
-    fn budget(&mut self, depth: usize) -> Result<(), RegexError> {
+    #[inline]
+    fn step(&mut self) -> Result<(), RegexError> {
         self.steps += 1;
         if self.steps > self.max_steps {
             return Err(RegexError(
@@ -917,143 +941,199 @@ impl<'a> Exec<'a> {
                     .to_string(),
             ));
         }
-        if depth > self.max_depth {
-            return Err(RegexError(
-                "正規表現の再帰の深さ上限を超えました（パターンまたは入力が大きすぎます）"
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 
-    fn run(
+    fn run_from(
         &mut self,
-        pc: usize,
-        sp: usize,
-        saved: &mut Saved,
-        depth: usize,
+        mut pc: usize,
+        mut sp: usize,
+        saved: &mut [Option<usize>],
+        trail: &mut Trail,
+        stack: &mut Vec<BacktrackFrame>,
+        look_depth: usize,
     ) -> Result<Option<usize>, RegexError> {
-        self.budget(depth)?;
-        match &self.prog[pc] {
-            Inst::Char(c) => {
-                if sp < self.chars.len() && char_eq(self.chars[sp], *c, self.ignore_case) {
-                    self.run(pc + 1, sp + 1, saved, depth + 1)
-                } else {
-                    Ok(None)
+        if look_depth > MAX_LOOK_DEPTH {
+            return Err(RegexError(
+                "正規表現の再帰の深さ上限を超えました（先読みのネストが深すぎます）".to_string(),
+            ));
+        }
+        let stack_base = stack.len();
+        let base_trail_mark = trail.len();
+
+        loop {
+            self.step()?;
+            let ok = match &self.prog[pc] {
+                Inst::Char(c) => {
+                    if sp < self.chars.len() && char_eq(self.chars[sp], *c, self.ignore_case) {
+                        pc += 1;
+                        sp += 1;
+                        true
+                    } else {
+                        false
+                    }
                 }
-            }
-            Inst::Any => {
-                if sp < self.chars.len() && (self.dot_all || !is_line_terminator(self.chars[sp])) {
-                    self.run(pc + 1, sp + 1, saved, depth + 1)
-                } else {
-                    Ok(None)
+                Inst::Any => {
+                    if sp < self.chars.len()
+                        && (self.dot_all || !is_line_terminator(self.chars[sp]))
+                    {
+                        pc += 1;
+                        sp += 1;
+                        true
+                    } else {
+                        false
+                    }
                 }
-            }
-            Inst::Class(cc) => {
-                if sp < self.chars.len() && cc.matches(self.chars[sp], self.ignore_case) {
-                    self.run(pc + 1, sp + 1, saved, depth + 1)
-                } else {
-                    Ok(None)
+                Inst::Class(cc) => {
+                    if sp < self.chars.len() && cc.matches(self.chars[sp], self.ignore_case) {
+                        pc += 1;
+                        sp += 1;
+                        true
+                    } else {
+                        false
+                    }
                 }
-            }
-            Inst::Save(slot) => {
-                let slot = *slot;
-                let old = saved[slot];
-                saved[slot] = Some(sp);
-                let r = self.run(pc + 1, sp, saved, depth + 1)?;
-                if r.is_none() {
-                    saved[slot] = old;
+                Inst::Save(slot) => {
+                    let slot = *slot;
+                    let prev = saved[slot];
+                    if prev != Some(sp) {
+                        trail.push((slot, prev));
+                        saved[slot] = Some(sp);
+                    }
+                    pc += 1;
+                    true
                 }
-                Ok(r)
-            }
-            Inst::Jmp(t) => self.run(*t, sp, saved, depth + 1),
-            Inst::Split(a, b) => {
-                let (a, b) = (*a, *b);
-                let snapshot = saved.clone();
-                if let Some(r) = self.run(a, sp, saved, depth + 1)? {
-                    return Ok(Some(r));
+                Inst::Jmp(t) => {
+                    pc = *t;
+                    true
                 }
-                *saved = snapshot;
-                self.run(b, sp, saved, depth + 1)
-            }
-            Inst::Match => Ok(Some(sp)),
-            Inst::Bol => {
-                let ok =
-                    sp == 0 || (self.multiline && sp > 0 && is_line_terminator(self.chars[sp - 1]));
-                if ok {
-                    self.run(pc + 1, sp, saved, depth + 1)
-                } else {
-                    Ok(None)
+                Inst::Split(a, b) => {
+                    let (a, b) = (*a, *b);
+                    if stack.len() >= self.max_depth {
+                        return Err(RegexError(
+                            "正規表現の再帰の深さ上限を超えました（パターンまたは入力が大きすぎます）"
+                                .to_string(),
+                        ));
+                    }
+                    stack.push(BacktrackFrame {
+                        pc: b,
+                        sp,
+                        trail_mark: trail.len(),
+                    });
+                    pc = a;
+                    true
                 }
-            }
-            Inst::Eol => {
-                let ok = sp == self.chars.len()
-                    || (self.multiline && is_line_terminator(self.chars[sp]));
-                if ok {
-                    self.run(pc + 1, sp, saved, depth + 1)
-                } else {
-                    Ok(None)
+                Inst::Match => {
+                    stack.truncate(stack_base);
+                    return Ok(Some(sp));
                 }
-            }
-            Inst::WordB(want) => {
-                let before = sp > 0 && is_word(self.chars[sp - 1]);
-                let after = sp < self.chars.len() && is_word(self.chars[sp]);
-                if (before != after) == *want {
-                    self.run(pc + 1, sp, saved, depth + 1)
-                } else {
-                    Ok(None)
+                Inst::Bol => {
+                    let ok = sp == 0
+                        || (self.multiline && sp > 0 && is_line_terminator(self.chars[sp - 1]));
+                    if ok {
+                        pc += 1;
+                        true
+                    } else {
+                        false
+                    }
                 }
-            }
-            Inst::Backref(n) => {
-                let slot = n * 2;
-                match (
-                    saved.get(slot).copied().flatten(),
-                    saved.get(slot + 1).copied().flatten(),
-                ) {
-                    (Some(s), Some(e)) if e >= s => {
-                        let len = e - s;
-                        let ok = sp + len <= self.chars.len()
-                            && (0..len).all(|i| {
-                                char_eq(self.chars[sp + i], self.chars[s + i], self.ignore_case)
-                            });
-                        if ok {
-                            self.run(pc + 1, sp + len, saved, depth + 1)
-                        } else {
-                            Ok(None)
+                Inst::Eol => {
+                    let ok = sp == self.chars.len()
+                        || (self.multiline && is_line_terminator(self.chars[sp]));
+                    if ok {
+                        pc += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Inst::WordB(want) => {
+                    let before = sp > 0 && is_word(self.chars[sp - 1]);
+                    let after = sp < self.chars.len() && is_word(self.chars[sp]);
+                    if (before != after) == *want {
+                        pc += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Inst::Backref(n) => {
+                    let slot = n * 2;
+                    match (
+                        saved.get(slot).copied().flatten(),
+                        saved.get(slot + 1).copied().flatten(),
+                    ) {
+                        (Some(s), Some(e)) if e >= s => {
+                            let len = e - s;
+                            let matched = sp + len <= self.chars.len()
+                                && (0..len).all(|i| {
+                                    char_eq(
+                                        self.chars[sp + i],
+                                        self.chars[s + i],
+                                        self.ignore_case,
+                                    )
+                                });
+                            if matched {
+                                pc += 1;
+                                sp += len;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        // 未マッチのグループへの後方参照は空文字列として扱う（JS 仕様）。
+                        _ => {
+                            pc += 1;
+                            true
                         }
                     }
-                    // 未マッチのグループへの後方参照は空文字列として扱う（JS 仕様）。
-                    _ => self.run(pc + 1, sp, saved, depth + 1),
                 }
-            }
-            Inst::Look {
-                sub_pc,
-                after_pc,
-                negate,
-            } => {
-                let (sub_pc, after_pc, negate) = (*sub_pc, *after_pc, *negate);
-                let mut snapshot = saved.clone();
-                let matched = self.run(sub_pc, sp, &mut snapshot, depth + 1)?.is_some();
-                if matched != negate {
-                    if !negate {
-                        // 肯定先読み内で行われたキャプチャは反映する（JS 仕様）。
-                        *saved = snapshot;
+                Inst::Look {
+                    sub_pc,
+                    after_pc,
+                    negate,
+                } => {
+                    let (sub_pc, after_pc, negate) = (*sub_pc, *after_pc, *negate);
+                    let look_trail_mark = trail.len();
+                    let matched = self
+                        .run_from(sub_pc, sp, saved, trail, stack, look_depth + 1)?
+                        .is_some();
+                    if matched != negate {
+                        // 肯定先読み成功時は saved への変更と trail のアンドゥ記録をそのまま残す
+                        // （外側が後でバックトラックした場合も自動で巻き戻される）。
+                        // 否定先読み成功時は内部が不成立だったため run_from 内で巻き戻し済み。
+                        pc = after_pc;
+                        true
+                    } else {
+                        // 否定先読み失敗（= 内部がマッチ）時は内部キャプチャを巻き戻す。
+                        rewind_trail(saved, trail, look_trail_mark);
+                        false
                     }
-                    self.run(after_pc, sp, saved, depth + 1)
-                } else {
-                    Ok(None)
                 }
-            }
-            Inst::LoopBack { mark_slot, loop_pc } => {
-                let (mark_slot, loop_pc) = (*mark_slot, *loop_pc);
-                let progressed = saved.get(mark_slot).copied().flatten() != Some(sp);
-                if progressed {
-                    self.run(loop_pc, sp, saved, depth + 1)
+                Inst::LoopBack { mark_slot, loop_pc } => {
+                    let (mark_slot, loop_pc) = (*mark_slot, *loop_pc);
+                    let progressed = saved.get(mark_slot).copied().flatten() != Some(sp);
+                    if progressed {
+                        pc = loop_pc;
+                    } else {
+                        // 前回のこのループ反復開始時と `sp` が変わっていない
+                        // （＝本体が空文字列にしかマッチしなかった）。無限ループを
+                        // 避けるため、ここでループを打ち切って素通りする。
+                        pc += 1;
+                    }
+                    true
+                }
+            };
+
+            if !ok {
+                if stack.len() > stack_base {
+                    let frame = stack.pop().unwrap();
+                    rewind_trail(saved, trail, frame.trail_mark);
+                    pc = frame.pc;
+                    sp = frame.sp;
                 } else {
-                    // 前回のこのループ反復開始時と `sp` が変わっていない
-                    // （＝本体が空文字列にしかマッチしなかった）。無限ループを
-                    // 避けるため、ここでループを打ち切って素通りする。
-                    self.run(pc + 1, sp, saved, depth + 1)
+                    rewind_trail(saved, trail, base_trail_mark);
+                    return Ok(None);
                 }
             }
         }
@@ -1166,13 +1246,18 @@ impl Regex {
             max_steps: DEFAULT_MAX_STEPS,
             max_depth: DEFAULT_MAX_DEPTH,
         };
+        let mut saved: Saved = vec![None; nslots];
+        let mut trail: Trail = Vec::new();
+        let mut stack: Vec<BacktrackFrame> = Vec::new();
         let mut s = from;
         loop {
             if s > chars.len() {
                 return Ok(None);
             }
-            let mut saved: Saved = vec![None; nslots];
-            if exec.run(0, s, &mut saved, 0)?.is_some() {
+            if exec
+                .run_from(0, s, &mut saved, &mut trail, &mut stack, 0)?
+                .is_some()
+            {
                 let get = |i: usize| saved.get(i).copied().flatten();
                 let start = get(0).unwrap();
                 let end = get(1).unwrap();
@@ -1185,6 +1270,9 @@ impl Regex {
                 }
                 return Ok(Some(RegexMatch { start, end, groups }));
             }
+            debug_assert!(trail.is_empty());
+            debug_assert!(stack.is_empty());
+            debug_assert!(saved.iter().all(|v| v.is_none()));
             s += 1;
         }
     }
@@ -1492,7 +1580,7 @@ mod tests {
         assert_eq!(m(r"^\*", "", "start"), None);
     }
 
-    // ---------------- ステップ上限 ----------------
+    // ---------------- ステップ上限・アンドゥログ・スタック保護 ----------------
 
     #[test]
     fn catastrophic_backtracking_hits_step_limit() {
@@ -1503,5 +1591,98 @@ mod tests {
         let chars: Vec<char> = s.chars().collect();
         let err = re.search(&chars, 0).unwrap_err();
         assert!(err.0.contains("ステップ数") || err.0.contains("再帰の深さ"));
+    }
+
+    #[test]
+    fn redos_unanchored_nested_plus_completes_fast_without_hang_or_overflow() {
+        let re = Regex::compile(r"(a+)+b", "").unwrap();
+        let s = "a".repeat(30) + "c";
+        let chars: Vec<char> = s.chars().collect();
+        let start = std::time::Instant::now();
+        let err = re.search(&chars, 0).unwrap_err();
+        assert!(err.0.contains("ステップ数") || err.0.contains("再帰の深さ"));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "ReDoS 検出に時間がかかりすぎています: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn deep_repetition_does_not_stack_overflow() {
+        // 明示スタック＋反復ループにより、深い繰り返しでも OS スタックオーバーフローしない。
+        let s = "a".repeat(5000);
+        assert_eq!(m(r"^a{5000}$", "", &s), Some((0, 5000)));
+        assert_eq!(m(r"^a{0,5000}$", "", &s), Some((0, 5000)));
+        let s10k = "a".repeat(10_000);
+        assert_eq!(m(r"^a+$", "", &s10k), Some((0, 10_000)));
+    }
+
+    #[test]
+    fn backtracking_rolls_back_captures_from_failed_branch() {
+        // 第1枝でグループ 1, 2 をキャプチャしてから失敗 → 第2枝へバックトラックした際、
+        // グループ 1, 2 が確実に None に巻き戻されていること。
+        assert_eq!(
+            groups(r"^(?:(a)(b)c|(a)bd)$", "", "abd"),
+            vec![None, None, Some("a".into())]
+        );
+        // ネストした量指定子＋キャプチャのバックトラック
+        assert_eq!(
+            groups(r"^(a+)(a+)b$", "", "aaaab"),
+            vec![Some("aaa".into()), Some("a".into())]
+        );
+        assert_eq!(
+            groups(r"^(a|ab)+(c)$", "", "ababc"),
+            vec![Some("ab".into()), Some("c".into())]
+        );
+    }
+
+    #[test]
+    fn backreference_with_backtracking_and_trail_rewind() {
+        // `(\w+)` が貪欲に "abab" を取った後 `\1` で失敗し、"ab" まで巻き戻って成功する。
+        assert_eq!(groups(r"^(\w+)\1$", "", "abab"), vec![Some("ab".into())]);
+        assert_eq!(m(r"^(\w+)\1$", "", "abac"), None);
+    }
+
+    #[test]
+    fn positive_lookahead_commits_captures_and_rolls_back_on_outer_backtrack() {
+        // JS 仕様: 肯定先読み内のキャプチャは後続の後方参照や結果に保持される。
+        assert_eq!(
+            groups(r"(?=(a+))\1b", "", "aaab"),
+            vec![Some("aaa".into())]
+        );
+        // 肯定先読みが一度成功してキャプチャを確定しても、後続が失敗して外側の枝へ
+        // バックトラックした場合は、先読み内のキャプチャも巻き戻されること。
+        assert_eq!(
+            groups(r"^(?:(?=(a))x|(?=(ab))ab)$", "", "ab"),
+            vec![None, Some("ab".into())]
+        );
+        // ネストした肯定先読みのキャプチャ保持
+        assert_eq!(
+            groups(r"^(?=(?=(ab))a)ab$", "", "ab"),
+            vec![Some("ab".into())]
+        );
+    }
+
+    #[test]
+    fn negative_lookahead_rolls_back_captures_on_both_success_and_failure() {
+        // 否定先読みが成功（内部が不成立）した場合、内部で途中まで書いたキャプチャは巻き戻される。
+        assert_eq!(
+            groups(r"^(?!(a)x)(a)y$", "", "ay"),
+            vec![None, Some("a".into())]
+        );
+        // 否定先読みが失敗（内部がマッチ）して外側の別枝へバックトラックした場合も、
+        // 否定先読み内でマッチしたキャプチャは確実に巻き戻される。
+        assert_eq!(groups(r"^(?:(?!(a))x|a)$", "", "a"), vec![None]);
+    }
+
+    #[test]
+    fn deeply_nested_lookahead_hits_depth_limit_cleanly() {
+        let depth = MAX_LOOK_DEPTH + 10;
+        let pat = format!("{}{}{}", "(?=".repeat(depth), "a", ")".repeat(depth));
+        let re = Regex::compile(&pat, "").unwrap();
+        let chars: Vec<char> = "a".chars().collect();
+        let err = re.search(&chars, 0).unwrap_err();
+        assert!(err.0.contains("再帰の深さ"));
     }
 }
