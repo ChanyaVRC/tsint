@@ -1,7 +1,15 @@
-//! tsint — 完全自作 TypeScript インタプリタ（Noiria エンジン用）。
+//! tsint — 完全自作・ゼロ依存（`std` のみ）の TypeScript インタプリタ。
 //!
-//! T1: レキサ + パーサ。T2: バイトコードコンパイラ + 明示スタック VM。
-//! 依存クレートはゼロ（std のみ）。
+//! ノベルゲームエンジン [Noiria](https://github.com/ChanyaVRC/noiria) の
+//! デフォルト配布スクリプトエンジンとして設計・実装されている。
+//!
+//! - T1: レキサ + パーサ（[`parse_module`]）
+//! - T2: バイトコードコンパイラ + 明示スタック VM（非キャプチャローカル変数の
+//!   非ボックス化・O(1) `PropMap` 索引化・循環参照 GC）
+//! - T3: Promise / async・await / イベントループ（[`Interpreter::register_native_async`]・
+//!   [`Interpreter::run_event_loop`]）
+//! - T4: 正規表現エンジン本実装（明示バックトラックスタック + アンドゥログ）
+//! - T5: ES モジュールシステム（[`Interpreter::run_module_graph`]）および Noiria 本体統合
 //!
 //! 対応範囲や設計方針は README を参照。
 
@@ -48,8 +56,8 @@ impl std::fmt::Display for InterpError {
     }
 }
 
-/// T2 の公開エントリポイント。`Interpreter::new()` → `register_native` →
-/// `run_module` の順で使う。
+/// `tsint` の公開エントリポイント。`Interpreter::new()` → `register_native` /
+/// `register_native_async` → `run_module` / `run_module_graph` の順で使う。
 pub struct Interpreter {
     vm: vm::Vm,
 }
@@ -88,8 +96,7 @@ impl Interpreter {
     }
 
     /// ホスト側が非同期に解決する `Promise` を返すネイティブ関数を登録する
-    /// （T3: `sys.wait` のようなホスト API のための口。T5 で Noiria の
-    /// `op_wait`/`op_input_next_event` 等をここに載せる想定）。
+    /// （Noiria の `op_wait` / `op_input_next_event` のようなホスト非同期 API 向け）。
     ///
     /// `f` は呼び出しの度に `HostPromise` ハンドルを受け取る。呼び出し自体は
     /// 即座にその Promise を返す（同期）。ハンドルはホスト側で保持しておき、
@@ -116,8 +123,8 @@ impl Interpreter {
     /// マイクロタスクキューを汲み尽くす（`.then` 反応・`await` の再開等）。
     /// 保留中のホスト Promise（`register_native_async` 由来）がまだ残って
     /// いれば `PumpState::Waiting`、無ければ `PumpState::Idle` を返す。
-    /// Noiria 統合（T5）ではゲームループの 1 フレームごとにこれを呼び、
-    /// ホスト Promise を解決してからまた呼ぶ、という形で駆動する想定。
+    /// ゲームループの 1 フレームごとにこれを呼び、ホスト Promise を解決して
+    /// からまた呼ぶ形で駆動する。
     pub fn run_event_loop(&mut self) -> vm::PumpState {
         self.vm.run_event_loop()
     }
@@ -132,7 +139,8 @@ impl Interpreter {
     }
 
     /// ソースをパース・コンパイル・実行し、export された値の一覧を返す。
-    /// import 文を含むモジュールは明確なエラーになる（T5 で対応予定）。
+    /// `import` 文を含むモジュールは明確なエラーになる（複数モジュールには
+    /// [`Interpreter::run_module_graph`] を使用する）。
     pub fn run_module(
         &mut self,
         source: &str,

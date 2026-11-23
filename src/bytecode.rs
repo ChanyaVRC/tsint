@@ -6,10 +6,10 @@
 //!   実行時にクロージャオブジェクトを作る。
 //! - VM（`vm.rs`）はこの命令列を Rust の再帰呼び出しを使わずに実行する。
 //!   関数呼び出しは Rust スタックではなく `Vm.frames: Vec<Frame>`
-//!   （ヒープ上の明示スタック）に積む。これにより将来（T3）
-//!   「任意の命令境界で実行を中断し、後で再開する」ことが可能になる —
-//!   中断は単に `Vm::run` のループを抜けて `Vm` 構造体（frames を含む）を
-//!   保持しておけばよく、Rust のコールスタックには何も残らない。
+//!   （ヒープ上の明示スタック）に積む。これにより `await` 等の命令境界で
+//!   実行を中断し、後で再開することが可能になる —
+//!   中断は単に `Vm::run_until` のループを抜けてフレーム列を保持しておけばよく、
+//!   Rust のコールスタックには何も残らない。
 //! - 例外（try/catch/finally）は「例外テーブル」方式。`finally` は
 //!   コンパイラが各脱出経路（正常フォールスルー・catch 完了後・
 //!   break/continue/return・例外での巻き戻し）ごとにバイトコードを
@@ -70,11 +70,11 @@ pub enum OpCode {
     // --- プロパティ / 添字 ---
     /// 定数表の名前で obj.prop を取得。obj は pop。
     GetProp(ConstIdx),
-    /// obj.prop = value。 stack: [obj, value] -> [value]
+    /// `obj.prop = value`。`stack: [obj, value] -> [value]`
     SetProp(ConstIdx),
-    /// stack: [obj, key] -> [value]
+    /// `stack: [obj, key] -> [value]`
     GetIndex,
-    /// stack: [obj, key, value] -> [value]
+    /// `stack: [obj, key, value] -> [value]`
     SetIndex,
     DeleteProp(ConstIdx),
     DeleteIndex,
@@ -139,42 +139,42 @@ pub enum OpCode {
     Throw,
 
     // --- 関数 / クラス / オブジェクト生成 ---
-    /// functions[idx] を現在フレームの upvalue 記述に従ってクロージャ化。
+    /// `functions[idx]` を現在フレームの upvalue 記述に従ってクロージャ化。
     MakeClosure(ConstIdx),
-    /// stack: [callee(this の下), callee, arg0..argN-1] -> [result]
+    /// `stack: [callee(this の下), callee, arg0..argN-1] -> [result]`
     Call(u16),
     /// 引数を単一の配列値（スプレッド展開込み）として渡す呼び出し。
-    /// stack: [this, callee, argsArray] -> [result]
+    /// `stack: [this, callee, argsArray] -> [result]`
     CallSpread,
     New(u16),
     NewSpread,
     NewObject,
     NewArray,
-    /// stack: [array, value] -> [array]（value を push、array はそのまま残す）
+    /// `stack: [array, value] -> [array]`（value を push、array はそのまま残す）
     ArrayPush,
-    /// stack: [array, holeCount] は使わず、代わりに elision は LoadUndefined で表現する。
-    /// stack: [array, srcIterable] -> [array]（スプレッド展開して array に追加）
+    /// `stack: [array, holeCount]` は使わず、代わりに elision は LoadUndefined で表現する。
+    /// `stack: [array, srcIterable] -> [array]`（スプレッド展開して array に追加）
     SpreadAppendArray,
-    /// stack: [obj, value] -> [obj]（定数名プロパティを設定）
+    /// `stack: [obj, value] -> [obj]`（定数名プロパティを設定）
     ObjectSetProp(ConstIdx),
-    /// stack: [obj, key, value] -> [obj]
+    /// `stack: [obj, key, value] -> [obj]`
     ObjectSetComputed,
-    /// stack: [obj, funcValue] -> [obj]（メソッド定義。ConstIdx は名前）
+    /// `stack: [obj, funcValue] -> [obj]`（メソッド定義。ConstIdx は名前）
     ObjectSetMethod(ConstIdx),
-    /// stack: [obj, funcValue] -> [obj]（getter/setter 定義）
+    /// `stack: [obj, funcValue] -> [obj]`（getter/setter 定義）
     ObjectDefineGetter(ConstIdx),
     ObjectDefineSetter(ConstIdx),
-    /// stack: [obj, src] -> [obj]（オブジェクトスプレッド）
+    /// `stack: [obj, src] -> [obj]`（オブジェクトスプレッド）
     ObjectSpread,
     /// 値を反復可能な配列へ実体化する（Array はそのまま、String は文字配列、
-    /// Map は [k,v] 配列、Set は値配列）。
+    /// Map は `[k, v]` 配列、Set は値配列）。
     MakeIterArray,
     /// for-in 用: オブジェクトの列挙可能な own キー一覧（配列は添字の文字列表現）を配列にして push。
     ObjectKeysArray,
-    /// オブジェクト分割代入の rest 用: stack [obj, key1..keyN] -> [restObj]
+    /// オブジェクト分割代入の rest 用: `stack [obj, key1..keyN] -> [restObj]`
     /// （obj の own プロパティのうち key1..keyN を除いたコピーを作る）。
     ObjectRestExclude(u16),
-    /// 配列分割代入の rest 用: stack [arr, startIndex] -> [restArr]
+    /// 配列分割代入の rest 用: `stack [arr, startIndex] -> [restArr]`
     ArraySliceFrom,
 
     // --- this / 式文脈 ---
