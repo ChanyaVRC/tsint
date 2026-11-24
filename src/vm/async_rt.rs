@@ -303,9 +303,7 @@ impl Vm {
                 }
             }
         }
-        if self.native_call_depth == 0 {
-            self.maybe_collect_garbage();
-        }
+        self.maybe_gc_if_top_level();
         if self.pending_host_count > 0 {
             PumpState::Waiting
         } else {

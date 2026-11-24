@@ -256,7 +256,7 @@ pub fn compile_dynamic_function(param_names: &[String], body_src: &str) -> CResu
     };
 
     let mut c = Compiler { funcs: Vec::new() };
-    let template = c.compile_function(func_expr, "anonymous", false)?;
+    let template = c.compile_function(func_expr, "anonymous")?;
     Ok(template.chunk.clone())
 }
 
@@ -361,24 +361,9 @@ impl Compiler {
 
     pub(super) fn patch_jump(&mut self, idx: usize, target: u32) {
         let op = &mut self.cur().chunk.code[idx];
-        *op = match *op {
-            OpCode::Jump(_) => OpCode::Jump(target),
-            OpCode::JumpIfFalse(_) => OpCode::JumpIfFalse(target),
-            OpCode::JumpIfTrue(_) => OpCode::JumpIfTrue(target),
-            OpCode::LtJumpIfFalse(_) => OpCode::LtJumpIfFalse(target),
-            OpCode::LtEqJumpIfFalse(_) => OpCode::LtEqJumpIfFalse(target),
-            OpCode::GtJumpIfFalse(_) => OpCode::GtJumpIfFalse(target),
-            OpCode::GtEqJumpIfFalse(_) => OpCode::GtEqJumpIfFalse(target),
-            OpCode::StrictEqJumpIfFalse(_) => OpCode::StrictEqJumpIfFalse(target),
-            OpCode::StrictNotEqJumpIfFalse(_) => OpCode::StrictNotEqJumpIfFalse(target),
-            OpCode::JumpIfNullish(_) => OpCode::JumpIfNullish(target),
-            OpCode::JumpIfNullishCall(_) => OpCode::JumpIfNullishCall(target),
-            OpCode::JumpIfFalsyKeep(_) => OpCode::JumpIfFalsyKeep(target),
-            OpCode::JumpIfTruthyKeep(_) => OpCode::JumpIfTruthyKeep(target),
-            OpCode::JumpIfNotNullishKeep(_) => OpCode::JumpIfNotNullishKeep(target),
-            OpCode::JumpIfNotUndefinedKeep(_) => OpCode::JumpIfNotUndefinedKeep(target),
-            other => panic!("patch_jump: ジャンプ命令ではありません: {other:?}"),
-        };
+        *op = op
+            .with_jump_target(target)
+            .unwrap_or_else(|| panic!("patch_jump: ジャンプ命令ではありません: {op:?}"));
     }
 
     pub(super) fn declare_local(&mut self, name: &str) -> LocalIdx {

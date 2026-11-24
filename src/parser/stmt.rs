@@ -208,32 +208,14 @@ impl Parser {
                 self.skip_type()?;
             }
             if self.is_word("of") || self.is_word("in") {
-                let is_of = self.is_word("of");
-                self.bump();
-                let right = if is_of {
-                    self.parse_assign_expr()?
-                } else {
-                    self.parse_expr()?
-                };
-                self.expect_punct(Punct::RParen)?;
-                let body = Box::new(self.parse_stmt()?);
-                let left = Box::new(ForInit::VarDecl(
+                let left = ForInit::VarDecl(
                     kind,
                     vec![VarDeclarator {
                         name: first_pattern,
                         init: None,
                     }],
-                ));
-                return Ok(self.mk_stmt(
-                    start,
-                    StmtKind::ForIn {
-                        left,
-                        right: Box::new(right),
-                        body,
-                        is_of,
-                        is_await,
-                    },
-                ));
+                );
+                return self.parse_for_in_of_tail(start, left, is_await);
             }
             let first_init = if self.eat_punct(Punct::Eq) {
                 Some(Box::new(self.parse_assign_expr()?))
@@ -256,80 +238,49 @@ impl Parser {
                 };
                 decls.push(VarDeclarator { name: pat, init });
             }
-            self.expect_punct(Punct::Semi)?;
-            let test = if !self.is_punct(Punct::Semi) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::Semi)?;
-            let update = if !self.is_punct(Punct::RParen) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::RParen)?;
-            let body = Box::new(self.parse_stmt()?);
-            return Ok(self.mk_stmt(
-                start,
-                StmtKind::For {
-                    init: Some(Box::new(ForInit::VarDecl(kind, decls))),
-                    test,
-                    update,
-                    body,
-                },
-            ));
+            return self.parse_for_c_style_tail(start, Some(ForInit::VarDecl(kind, decls)));
         }
 
         if self.is_punct(Punct::Semi) {
-            self.bump();
-            let test = if !self.is_punct(Punct::Semi) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::Semi)?;
-            let update = if !self.is_punct(Punct::RParen) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::RParen)?;
-            let body = Box::new(self.parse_stmt()?);
-            return Ok(self.mk_stmt(
-                start,
-                StmtKind::For {
-                    init: None,
-                    test,
-                    update,
-                    body,
-                },
-            ));
+            return self.parse_for_c_style_tail(start, None);
         }
 
         // 式から始まる init（`for (a of b)` / 通常の for-loop 両対応）。
         let first_expr = self.parse_expr()?;
         if self.is_word("of") || self.is_word("in") {
-            let is_of = self.is_word("of");
-            self.bump();
-            let right = if is_of {
-                self.parse_assign_expr()?
-            } else {
-                self.parse_expr()?
-            };
-            self.expect_punct(Punct::RParen)?;
-            let body = Box::new(self.parse_stmt()?);
-            return Ok(self.mk_stmt(
-                start,
-                StmtKind::ForIn {
-                    left: Box::new(ForInit::Expr(Box::new(first_expr))),
-                    right: Box::new(right),
-                    body,
-                    is_of,
-                    is_await,
-                },
-            ));
+            return self.parse_for_in_of_tail(start, ForInit::Expr(Box::new(first_expr)), is_await);
         }
+        self.parse_for_c_style_tail(start, Some(ForInit::Expr(Box::new(first_expr))))
+    }
+
+    fn parse_for_in_of_tail(
+        &mut self,
+        start: Span,
+        left: ForInit,
+        is_await: bool,
+    ) -> PResult<Stmt> {
+        let is_of = self.is_word("of");
+        self.bump();
+        let right = if is_of {
+            self.parse_assign_expr()?
+        } else {
+            self.parse_expr()?
+        };
+        self.expect_punct(Punct::RParen)?;
+        let body = Box::new(self.parse_stmt()?);
+        Ok(self.mk_stmt(
+            start,
+            StmtKind::ForIn {
+                left: Box::new(left),
+                right: Box::new(right),
+                body,
+                is_of,
+                is_await,
+            },
+        ))
+    }
+
+    fn parse_for_c_style_tail(&mut self, start: Span, init: Option<ForInit>) -> PResult<Stmt> {
         self.expect_punct(Punct::Semi)?;
         let test = if !self.is_punct(Punct::Semi) {
             Some(Box::new(self.parse_expr()?))
@@ -347,7 +298,7 @@ impl Parser {
         Ok(self.mk_stmt(
             start,
             StmtKind::For {
-                init: Some(Box::new(ForInit::Expr(Box::new(first_expr)))),
+                init: init.map(Box::new),
                 test,
                 update,
                 body,

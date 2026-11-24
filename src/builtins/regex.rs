@@ -386,6 +386,46 @@ pub(super) fn string_replace(
     string_replace_literal(vm, s, pattern, replacement, force_all)
 }
 
+/// ゼロ幅一致時に無限ループを避けつつ次の検索開始位置を返す。
+#[inline]
+pub(super) fn next_search_pos(mat: &RegexMatch) -> usize {
+    if mat.end == mat.start {
+        mat.end + 1
+    } else {
+        mat.end
+    }
+}
+
+fn run_regex_replace_loop(
+    vm: &mut Vm,
+    re: &crate::regex::Regex,
+    chars: &[char],
+    scratch: &mut RegexScratch,
+    global: bool,
+    out: &mut String,
+    mut on_match: impl FnMut(&mut Vm, &RegexMatch, &mut String) -> Result<(), Value>,
+) -> Result<(), Value> {
+    let mut pos = 0usize;
+    let mut search_from = 0usize;
+    while search_from <= chars.len() {
+        let Some(mat) = re
+            .search_with_scratch(chars, search_from, scratch)
+            .map_err(|e| regex_err(vm, e))?
+        else {
+            break;
+        };
+        out.extend(&chars[pos..mat.start]);
+        on_match(vm, &mat, out)?;
+        pos = mat.end;
+        search_from = next_search_pos(&mat);
+        if !global {
+            break;
+        }
+    }
+    out.extend(&chars[pos..]);
+    Ok(())
+}
+
 fn string_replace_regex(
     vm: &mut Vm,
     s: &str,
@@ -398,35 +438,16 @@ fn string_replace_regex(
         let has_dollar = template.contains('$');
         return with_chars_buf(s, |chars| {
             let mut out = String::with_capacity(s.len());
-            let mut pos = 0usize;
-            let mut search_from = 0usize;
-            with_regex_scratch(|scratch| -> Result<(), Value> {
-                while search_from <= chars.len() {
-                    let Some(mat) = re
-                        .search_with_scratch(chars, search_from, scratch)
-                        .map_err(|e| regex_err(vm, e))?
-                    else {
-                        break;
-                    };
-                    out.extend(&chars[pos..mat.start]);
+            with_regex_scratch(|scratch| {
+                run_regex_replace_loop(vm, re, chars, scratch, global, &mut out, |_, mat, dst| {
                     if has_dollar {
-                        expand_regex_template_into(&template, chars, &mat, &mut out);
+                        expand_regex_template_into(&template, chars, mat, dst);
                     } else {
-                        out.push_str(&template);
+                        dst.push_str(&template);
                     }
-                    pos = mat.end;
-                    search_from = if mat.end == mat.start {
-                        mat.end + 1
-                    } else {
-                        mat.end
-                    };
-                    if !global {
-                        break;
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })
             })?;
-            out.extend(&chars[pos..]);
             Ok(Value::str(out))
         });
     }
@@ -434,28 +455,15 @@ fn string_replace_regex(
     let chars: Vec<char> = s.chars().collect();
     let mut scratch = RegexScratch::default();
     let mut out = String::with_capacity(s.len());
-    let mut pos = 0usize;
-    let mut search_from = 0usize;
-    while search_from <= chars.len() {
-        let Some(mat) = re
-            .search_with_scratch(&chars, search_from, &mut scratch)
-            .map_err(|e| regex_err(vm, e))?
-        else {
-            break;
-        };
-        out.extend(&chars[pos..mat.start]);
-        call_regex_replace_cb_into(vm, replacement, &chars, &mat, s, &mut out)?;
-        pos = mat.end;
-        search_from = if mat.end == mat.start {
-            mat.end + 1
-        } else {
-            mat.end
-        };
-        if !global {
-            break;
-        }
-    }
-    out.extend(&chars[pos..]);
+    run_regex_replace_loop(
+        vm,
+        re,
+        &chars,
+        &mut scratch,
+        global,
+        &mut out,
+        |vm, mat, dst| call_regex_replace_cb_into(vm, replacement, &chars, mat, s, dst),
+    )?;
     Ok(Value::str(out))
 }
 
@@ -595,11 +603,7 @@ pub(super) fn regex_split(
                     });
                 }
                 p = mat.end;
-                search_from = if mat.end == mat.start {
-                    mat.end + 1
-                } else {
-                    mat.end
-                };
+                search_from = next_search_pos(&mat);
             }
             Ok(())
         })?;

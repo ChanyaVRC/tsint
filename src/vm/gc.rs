@@ -31,57 +31,33 @@ impl Vm {
 
     fn track_value_tree_slow(&self, root: &ObjRef) {
         let mut stack = vec![root.clone()];
-        let push_untracked = |stack: &mut Vec<ObjRef>, child: &ObjRef| {
-            if Rc::weak_count(child) == 0 {
-                stack.push(child.clone());
-            }
-        };
         while let Some(obj) = stack.pop() {
             if Rc::weak_count(&obj) > 0 {
                 continue;
             }
             self.track_object(&obj);
             if let Ok(b) = obj.try_borrow() {
-                for (_, slot) in b.props.iter() {
-                    match slot {
-                        PropSlot::Value(Value::Object(child)) => push_untracked(&mut stack, child),
-                        PropSlot::Accessor { get, set } => {
-                            if let Some(Value::Object(child)) = get {
-                                push_untracked(&mut stack, child);
-                            }
-                            if let Some(Value::Object(child)) = set {
-                                push_untracked(&mut stack, child);
-                            }
-                        }
-                        _ => {}
+                let mut push_untracked = |child: &ObjRef| {
+                    if Rc::weak_count(child) == 0 {
+                        stack.push(child.clone());
                     }
-                }
-                if let Some(proto) = &b.proto {
-                    push_untracked(&mut stack, proto);
-                }
+                };
+                gc_visit_props_and_proto(&b, &mut push_untracked);
                 match &b.kind {
                     ObjKind::Array(items) => {
                         for it in items {
-                            if let Value::Object(child) = it {
-                                push_untracked(&mut stack, child);
-                            }
+                            gc_visit_value(it, &mut push_untracked);
                         }
                     }
                     ObjKind::Map(m) => {
                         for (k, val) in &m.entries {
-                            if let Value::Object(child) = k {
-                                push_untracked(&mut stack, child);
-                            }
-                            if let Value::Object(child) = val {
-                                push_untracked(&mut stack, child);
-                            }
+                            gc_visit_value(k, &mut push_untracked);
+                            gc_visit_value(val, &mut push_untracked);
                         }
                     }
                     ObjKind::Set(s) => {
                         for val in &s.values {
-                            if let Value::Object(child) = val {
-                                push_untracked(&mut stack, child);
-                            }
+                            gc_visit_value(val, &mut push_untracked);
                         }
                     }
                     _ => {}
@@ -109,6 +85,13 @@ impl Vm {
     pub(super) fn maybe_collect_garbage(&mut self) {
         if self.gc_allocs_since_last.get() >= self.gc_threshold {
             self.collect_garbage();
+        }
+    }
+
+    #[inline]
+    pub(super) fn maybe_gc_if_top_level(&mut self) {
+        if self.native_call_depth == 0 {
+            self.maybe_collect_garbage();
         }
     }
 
@@ -224,28 +207,20 @@ impl Vm {
             .map(|(_, rc)| Rc::strong_count(rc).saturating_sub(1))
             .collect();
 
-        let mut seen_fns: FastHashSet<usize> = FastHashSet::default();
-        let mut seen_cells: FastHashSet<usize> = FastHashSet::default();
-        let mut seen_raw_args: FastHashSet<usize> = FastHashSet::default();
+        let mut dedup = GcDedupState::default();
 
         for (i, (_, rc)) in candidates.iter().enumerate() {
             let Ok(b) = rc.try_borrow() else {
                 external_refs[i] = external_refs[i].saturating_add(1);
                 continue;
             };
-            gc_visit_obj_data_dedup(
-                &b,
-                &mut seen_fns,
-                &mut seen_cells,
-                &mut seen_raw_args,
-                &mut |target| {
-                    let tptr = Rc::as_ptr(target) as usize;
-                    if let Some(&tidx) = candidate_idx.get(&tptr) {
-                        debug_assert!(external_refs[tidx] > 0);
-                        external_refs[tidx] = external_refs[tidx].saturating_sub(1);
-                    }
-                },
-            );
+            gc_visit_obj_data(&b, Some(&mut dedup), &mut |target| {
+                let tptr = Rc::as_ptr(target) as usize;
+                if let Some(&tidx) = candidate_idx.get(&tptr) {
+                    debug_assert!(external_refs[tidx] > 0);
+                    external_refs[tidx] = external_refs[tidx].saturating_sub(1);
+                }
+            });
         }
 
         // ---- Phase 4: 外部参照が残る候補から到達可能なものをすべて生存保護 ----
@@ -311,28 +286,73 @@ fn gc_visit_value(v: &Value, f: &mut impl FnMut(&ObjRef)) {
     }
 }
 
-fn gc_visit_frame_raw(frame: &Frame, f: &mut impl FnMut(&ObjRef)) {
+#[derive(Default)]
+struct GcDedupState {
+    seen_fns: FastHashSet<usize>,
+    seen_cells: FastHashSet<usize>,
+    seen_raw_args: FastHashSet<usize>,
+}
+
+fn gc_visit_cell(
+    cell: &Rc<RefCell<Value>>,
+    dedup: Option<&mut GcDedupState>,
+    f: &mut impl FnMut(&ObjRef),
+) {
+    if let Some(d) = dedup {
+        if !d.seen_cells.insert(Rc::as_ptr(cell) as usize) {
+            return;
+        }
+    }
+    if let Ok(v) = cell.try_borrow() {
+        gc_visit_value(&v, f);
+    }
+}
+
+fn gc_visit_fn_upvalues(
+    fo: &Rc<FunctionObj>,
+    mut dedup: Option<&mut GcDedupState>,
+    f: &mut impl FnMut(&ObjRef),
+) {
+    if let Some(d) = dedup.as_deref_mut() {
+        if !d.seen_fns.insert(Rc::as_ptr(fo) as usize) {
+            return;
+        }
+    }
+    for cell in fo.upvalues.iter() {
+        gc_visit_cell(cell, dedup.as_deref_mut(), f);
+    }
+}
+
+fn gc_visit_frame(
+    frame: &Frame,
+    mut dedup: Option<&mut GcDedupState>,
+    f: &mut impl FnMut(&ObjRef),
+) {
     for slot in &frame.locals {
         match slot {
             LocalSlot::Direct(v) => gc_visit_value(v, f),
-            LocalSlot::Boxed(cell) => {
-                if let Ok(v) = cell.try_borrow() {
-                    gc_visit_value(&v, f);
-                }
-            }
+            LocalSlot::Boxed(cell) => gc_visit_cell(cell, dedup.as_deref_mut(), f),
         }
     }
     for cell in frame.upvalues.iter() {
-        if let Ok(v) = cell.try_borrow() {
-            gc_visit_value(&v, f);
-        }
+        gc_visit_cell(cell, dedup.as_deref_mut(), f);
     }
     for v in &frame.stack {
         gc_visit_value(v, f);
     }
-    for v in frame.raw_args.iter() {
-        gc_visit_value(v, f);
+    let visit_raw_args = match dedup {
+        Some(d) => d.seen_raw_args.insert(Rc::as_ptr(&frame.raw_args) as usize),
+        None => true,
+    };
+    if visit_raw_args {
+        for v in frame.raw_args.iter() {
+            gc_visit_value(v, f);
+        }
     }
+}
+
+fn gc_visit_frame_raw(frame: &Frame, f: &mut impl FnMut(&ObjRef)) {
+    gc_visit_frame(frame, None, f);
 }
 
 fn gc_visit_props_and_proto(b: &ObjData, f: &mut impl FnMut(&ObjRef)) {
@@ -358,117 +378,17 @@ fn gc_visit_obj_outgoing(obj: &ObjRef, f: &mut impl FnMut(&ObjRef)) {
     let Ok(b) = obj.try_borrow() else {
         return;
     };
-    gc_visit_props_and_proto(&b, f);
-    match &b.kind {
-        ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_) => {}
-        ObjKind::Array(items) => {
-            for v in items {
-                gc_visit_value(v, f);
-            }
-        }
-        ObjKind::Map(m) => {
-            for (k, v) in &m.entries {
-                gc_visit_value(k, f);
-                gc_visit_value(v, f);
-            }
-        }
-        ObjKind::Set(s) => {
-            for v in &s.values {
-                gc_visit_value(v, f);
-            }
-        }
-        ObjKind::Function(fo) => {
-            for cell in fo.upvalues.iter() {
-                if let Ok(v) = cell.try_borrow() {
-                    gc_visit_value(&v, f);
-                }
-            }
-        }
-        ObjKind::Native(n) => {
-            for cap in &n.captures {
-                f(cap);
-            }
-        }
-        ObjKind::Class(cd) => {
-            f(&cd.prototype);
-            if let Some(ctor) = &cd.ctor {
-                for cell in ctor.upvalues.iter() {
-                    if let Ok(v) = cell.try_borrow() {
-                        gc_visit_value(&v, f);
-                    }
-                }
-            }
-            for (_, init) in &cd.instance_fields {
-                if let Some(fo) = init {
-                    for cell in fo.upvalues.iter() {
-                        if let Ok(v) = cell.try_borrow() {
-                            gc_visit_value(&v, f);
-                        }
-                    }
-                }
-            }
-        }
-        ObjKind::Promise(pd) => {
-            match &pd.state {
-                PromiseState::Pending => {}
-                PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => gc_visit_value(v, f),
-            }
-            for r in &pd.reactions {
-                match r {
-                    PromiseReaction::Then {
-                        on_fulfilled,
-                        on_rejected,
-                        result_promise,
-                    } => {
-                        if let Some(v) = on_fulfilled {
-                            gc_visit_value(v, f);
-                        }
-                        if let Some(v) = on_rejected {
-                            gc_visit_value(v, f);
-                        }
-                        f(result_promise);
-                    }
-                    PromiseReaction::Await(cont) => {
-                        for frame in &cont.frames {
-                            gc_visit_frame_raw(frame, f);
-                        }
-                        f(&cont.owner_promise);
-                    }
-                }
-            }
-        }
-    }
+    gc_visit_obj_data(&b, None, f);
 }
 
-fn gc_visit_obj_data_dedup(
+/// `ObjData` の出エッジをすべて訪問する。`dedup` が `Some` の場合は共有される
+/// `FunctionObj` / セル / `raw_args` をポインタ単位で重複排除して trial-deletion の
+/// 二重減算を防ぐ。
+fn gc_visit_obj_data(
     b: &ObjData,
-    seen_fns: &mut FastHashSet<usize>,
-    seen_cells: &mut FastHashSet<usize>,
-    seen_raw_args: &mut FastHashSet<usize>,
+    mut dedup: Option<&mut GcDedupState>,
     f: &mut impl FnMut(&ObjRef),
 ) {
-    let visit_cell = |cell: &Rc<RefCell<Value>>,
-                      seen_cells: &mut FastHashSet<usize>,
-                      f: &mut dyn FnMut(&ObjRef)| {
-        if seen_cells.insert(Rc::as_ptr(cell) as usize) {
-            if let Ok(v) = cell.try_borrow() {
-                if let Value::Object(o) = &*v {
-                    f(o);
-                }
-            }
-        }
-    };
-    let visit_fn = |fo: &Rc<FunctionObj>,
-                    seen_fns: &mut FastHashSet<usize>,
-                    seen_cells: &mut FastHashSet<usize>,
-                    f: &mut dyn FnMut(&ObjRef)| {
-        if seen_fns.insert(Rc::as_ptr(fo) as usize) {
-            for cell in fo.upvalues.iter() {
-                visit_cell(cell, seen_cells, f);
-            }
-        }
-    };
-
     gc_visit_props_and_proto(b, f);
     match &b.kind {
         ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_) => {}
@@ -488,7 +408,7 @@ fn gc_visit_obj_data_dedup(
                 gc_visit_value(v, f);
             }
         }
-        ObjKind::Function(fo) => visit_fn(fo, seen_fns, seen_cells, f),
+        ObjKind::Function(fo) => gc_visit_fn_upvalues(fo, dedup, f),
         ObjKind::Native(n) => {
             for cap in &n.captures {
                 f(cap);
@@ -497,11 +417,11 @@ fn gc_visit_obj_data_dedup(
         ObjKind::Class(cd) => {
             f(&cd.prototype);
             if let Some(ctor) = &cd.ctor {
-                visit_fn(ctor, seen_fns, seen_cells, f);
+                gc_visit_fn_upvalues(ctor, dedup.as_deref_mut(), f);
             }
             for (_, init) in &cd.instance_fields {
                 if let Some(fo) = init {
-                    visit_fn(fo, seen_fns, seen_cells, f);
+                    gc_visit_fn_upvalues(fo, dedup.as_deref_mut(), f);
                 }
             }
         }
@@ -527,23 +447,7 @@ fn gc_visit_obj_data_dedup(
                     }
                     PromiseReaction::Await(cont) => {
                         for frame in &cont.frames {
-                            for slot in &frame.locals {
-                                match slot {
-                                    LocalSlot::Direct(v) => gc_visit_value(v, f),
-                                    LocalSlot::Boxed(cell) => visit_cell(cell, seen_cells, f),
-                                }
-                            }
-                            for cell in frame.upvalues.iter() {
-                                visit_cell(cell, seen_cells, f);
-                            }
-                            for v in &frame.stack {
-                                gc_visit_value(v, f);
-                            }
-                            if seen_raw_args.insert(Rc::as_ptr(&frame.raw_args) as usize) {
-                                for v in frame.raw_args.iter() {
-                                    gc_visit_value(v, f);
-                                }
-                            }
+                            gc_visit_frame(frame, dedup.as_deref_mut(), f);
                         }
                         f(&cont.owner_promise);
                     }

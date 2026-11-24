@@ -813,9 +813,7 @@ impl Vm {
                 } else {
                     *last_value = v;
                 }
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 Ok(None)
             }
             OpCode::Call(argc) => self.exec_call(argc as usize).map(|()| None),
@@ -973,19 +971,16 @@ impl Vm {
                 Err(v)
             }
             OpCode::MakeClosure(cidx) => {
-                let tpl = {
-                    let f = self.frames.last().unwrap();
-                    match &f.chunk.consts[cidx as usize] {
-                        Const::FunctionTemplate(t) => t.clone(),
-                        _ => panic!("MakeClosure: 定数がFunctionTemplateではありません"),
-                    }
-                };
+                let tpl = self
+                    .frames
+                    .last()
+                    .unwrap()
+                    .chunk
+                    .const_function_template(cidx);
                 let fo = self.build_closure(&tpl);
                 let v = self.wrap_function(fo);
                 self.push(v);
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 Ok(None)
             }
             OpCode::CallSpread => {
@@ -999,9 +994,7 @@ impl Vm {
                 })
             }
             OpCode::New(argc) => self.exec_new(argc as usize).map(|()| {
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 None
             }),
             OpCode::NewSpread => {
@@ -1016,17 +1009,13 @@ impl Vm {
             OpCode::NewObject => {
                 let o = self.alloc_plain_object();
                 self.push(o);
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 Ok(None)
             }
             OpCode::NewArray => {
                 let a = self.alloc_array(Vec::new());
                 self.push(a);
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 Ok(None)
             }
             OpCode::SpreadAppendArray => {
@@ -1077,7 +1066,7 @@ impl Vm {
             }
             OpCode::ObjectKeysArray => {
                 let v = self.pop();
-                let keys = self.own_keys_array(&v);
+                let keys = super::props::own_enumerable_keys(&v);
                 let arr = self.alloc_array(keys);
                 self.push(arr);
                 Ok(None)
@@ -1118,31 +1107,17 @@ impl Vm {
                 Ok(None)
             }
             OpCode::MakeClass(cidx) => {
-                let tpl = {
-                    let f = self.frames.last().unwrap();
-                    match &f.chunk.consts[cidx as usize] {
-                        Const::ClassTemplate(t) => t.clone(),
-                        _ => panic!("MakeClass: 定数が ClassTemplate ではありません"),
-                    }
-                };
+                let tpl = self.frames.last().unwrap().chunk.const_class_template(cidx);
                 self.build_class(&tpl).map(|v| {
                     self.push(v);
                     None
                 })
             }
             OpCode::LoadRegex(cidx) => {
-                let re = {
-                    let f = self.frames.last().unwrap();
-                    match &f.chunk.consts[cidx as usize] {
-                        Const::Regex(r) => r.clone(),
-                        _ => panic!("LoadRegex: 定数が Regex ではありません"),
-                    }
-                };
+                let re = self.frames.last().unwrap().chunk.const_regex(cidx);
                 let v = self.alloc_regex_value(re);
                 self.push(v);
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 Ok(None)
             }
             OpCode::Await => {

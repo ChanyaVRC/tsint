@@ -159,13 +159,13 @@ impl Compiler {
             }
             ExprKind::ObjectLit(props) => self.compile_object_lit(props, line)?,
             ExprKind::Function(f) => {
-                let name = f.name.clone().unwrap_or_default();
-                let tpl = self.compile_function(f, &name, false)?;
+                let name = f.name.as_deref().unwrap_or("");
+                let tpl = self.compile_function(f, name)?;
                 let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                 self.emit(OpCode::MakeClosure(c), line);
             }
             ExprKind::Arrow(f) => {
-                let tpl = self.compile_function(f, "", false)?;
+                let tpl = self.compile_function(f, "")?;
                 let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                 self.emit(OpCode::MakeClosure(c), line);
             }
@@ -277,7 +277,7 @@ impl Compiler {
                     kind,
                 } => {
                     let name = property_key_static_name(key);
-                    let tpl = self.compile_function(function, &name, true)?;
+                    let tpl = self.compile_function(function, &name)?;
                     let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                     self.emit(OpCode::MakeClosure(c), line);
                     let nc = self.add_const_str(&name);

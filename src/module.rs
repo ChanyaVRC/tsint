@@ -198,6 +198,57 @@ impl<'i, 'h> Loader<'i, 'h> {
             })
     }
 
+    /// 解決済みモジュールを読み込み・書き換え・コンパイルしてチャンクを返す。
+    fn compile_resolved(
+        &mut self,
+        resolved: &str,
+    ) -> Result<Rc<crate::bytecode::Chunk>, ModuleError> {
+        let source = self
+            .host
+            .load(resolved)
+            .map_err(|message| ModuleError::Load {
+                resolved: resolved.to_string(),
+                message,
+            })?;
+        let parsed = parse_module(&source, resolved).map_err(|source| ModuleError::Parse {
+            resolved: resolved.to_string(),
+            source,
+        })?;
+        let rewritten = self.rewrite_module(parsed, resolved)?;
+        compiler::compile_module(&rewritten).map_err(|source| ModuleError::Compile {
+            resolved: resolved.to_string(),
+            source,
+        })
+    }
+
+    fn push_reexport(
+        &mut self,
+        out: &mut Vec<Stmt>,
+        ns_name: &str,
+        source_name: &str,
+        exported: String,
+        line: u32,
+    ) {
+        let tmp = self.fresh_name("reexp");
+        out.push(const_decl(
+            &tmp,
+            member_expr(ident_expr(ns_name, line), source_name, line),
+            line,
+        ));
+        out.push(Stmt {
+            id: 0,
+            span: line_span(line),
+            kind: StmtKind::ExportNamed {
+                specifiers: vec![ast::ExportSpecifier::Named {
+                    local: tmp,
+                    exported,
+                }],
+                source: None,
+                type_only: false,
+            },
+        });
+    }
+
     /// 依存モジュールを読み込み・評価し（キャッシュ済みなら再利用）、
     /// その名前空間オブジェクトを保持するグローバル変数名を返す。
     fn load_dependency(&mut self, resolved: &str) -> Result<Rc<str>, ModuleError> {
@@ -212,23 +263,7 @@ impl<'i, 'h> Loader<'i, 'h> {
         self.cache.insert(resolved.to_string(), ns_name.clone());
         self.interp.define_global(&ns_name, ns_obj.clone());
 
-        let source = self
-            .host
-            .load(resolved)
-            .map_err(|message| ModuleError::Load {
-                resolved: resolved.to_string(),
-                message,
-            })?;
-        let parsed = parse_module(&source, resolved).map_err(|source| ModuleError::Parse {
-            resolved: resolved.to_string(),
-            source,
-        })?;
-        let rewritten = self.rewrite_module(parsed, resolved)?;
-        let chunk =
-            compiler::compile_module(&rewritten).map_err(|source| ModuleError::Compile {
-                resolved: resolved.to_string(),
-                source,
-            })?;
+        let chunk = self.compile_resolved(resolved)?;
         let exports =
             self.interp
                 .vm()
@@ -309,24 +344,7 @@ impl<'i, 'h> Loader<'i, 'h> {
                 let ns_name = self.load_dependency(&resolved)?;
                 for spec in specifiers {
                     let ast::ExportSpecifier::Named { local, exported } = spec;
-                    let tmp = self.fresh_name("reexp");
-                    out.push(const_decl(
-                        &tmp,
-                        member_expr(ident_expr(&ns_name, line), &local, line),
-                        line,
-                    ));
-                    out.push(Stmt {
-                        id: 0,
-                        span: line_span(line),
-                        kind: StmtKind::ExportNamed {
-                            specifiers: vec![ast::ExportSpecifier::Named {
-                                local: tmp,
-                                exported,
-                            }],
-                            source: None,
-                            type_only: false,
-                        },
-                    });
+                    self.push_reexport(out, &ns_name, &local, exported, line);
                 }
             }
             StmtKind::ExportAll {
@@ -353,24 +371,7 @@ impl<'i, 'h> Loader<'i, 'h> {
                     if &*name == "default" {
                         continue;
                     }
-                    let tmp = self.fresh_name("reexp");
-                    out.push(const_decl(
-                        &tmp,
-                        member_expr(ident_expr(&ns_name, line), &name, line),
-                        line,
-                    ));
-                    out.push(Stmt {
-                        id: 0,
-                        span: line_span(line),
-                        kind: StmtKind::ExportNamed {
-                            specifiers: vec![ast::ExportSpecifier::Named {
-                                local: tmp,
-                                exported: name.to_string(),
-                            }],
-                            source: None,
-                            type_only: false,
-                        },
-                    });
+                    self.push_reexport(out, &ns_name, &name, name.to_string(), line);
                 }
             }
             other => out.push(Stmt {
@@ -404,23 +405,7 @@ impl Interpreter {
             next_id: 0,
         };
         let resolved = loader.resolve(entry_specifier, "<entry>")?;
-        let source = loader
-            .host
-            .load(&resolved)
-            .map_err(|message| ModuleError::Load {
-                resolved: resolved.clone(),
-                message,
-            })?;
-        let parsed = parse_module(&source, &resolved).map_err(|source| ModuleError::Parse {
-            resolved: resolved.clone(),
-            source,
-        })?;
-        let rewritten = loader.rewrite_module(parsed, &resolved)?;
-        let chunk =
-            compiler::compile_module(&rewritten).map_err(|source| ModuleError::Compile {
-                resolved: resolved.clone(),
-                source,
-            })?;
+        let chunk = loader.compile_resolved(&resolved)?;
         let outcome = loader
             .interp
             .vm()

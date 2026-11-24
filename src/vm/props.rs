@@ -7,6 +7,27 @@ use crate::value::*;
 use super::ops::{to_number, to_property_key_string};
 use super::{KindTag, Vm};
 
+/// オブジェクトまたは配列の列挙可能な own キー一覧を返す（`for...in` / `Object.keys` 共通）。
+pub(crate) fn own_enumerable_keys(v: &Value) -> Vec<Value> {
+    match v {
+        Value::Object(o) => {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Array(items) => (0..items.len())
+                    .map(|i| Value::str(i.to_string()))
+                    .collect(),
+                _ => b
+                    .props
+                    .iter()
+                    .filter(|(_, s)| matches!(s, PropSlot::Value(_)))
+                    .map(|(k, _)| Value::Str(k.clone()))
+                    .collect(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[inline]
 pub(super) fn kind_tag_of(kind: &ObjKind) -> Option<KindTag> {
     match kind {
@@ -316,26 +337,6 @@ impl Vm {
             return self.has_prop(p, name);
         }
         false
-    }
-
-    pub(super) fn own_keys_array(&self, v: &Value) -> Vec<Value> {
-        match v {
-            Value::Object(o) => {
-                let b = o.borrow();
-                match &b.kind {
-                    ObjKind::Array(items) => (0..items.len())
-                        .map(|i| Value::str(i.to_string()))
-                        .collect(),
-                    _ => b
-                        .props
-                        .iter()
-                        .filter(|(_, s)| matches!(s, PropSlot::Value(_)))
-                        .map(|(k, _)| Value::Str(k.clone()))
-                        .collect(),
-                }
-            }
-            _ => Vec::new(),
-        }
     }
 
     pub fn materialize_iter_array(&mut self, v: &Value) -> Result<Vec<Value>, Value> {

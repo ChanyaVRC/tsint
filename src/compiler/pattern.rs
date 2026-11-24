@@ -188,7 +188,6 @@ impl Compiler {
         &mut self,
         f: &Function,
         name: &str,
-        is_method: bool,
     ) -> CResult<FunctionTemplate> {
         self.funcs.push(FuncCtx::new(name));
         if !f.is_arrow {
@@ -198,7 +197,6 @@ impl Compiler {
                 slot: this_slot,
             });
         }
-        let _ = is_method;
 
         let mut has_rest = false;
         let mut simple_prefix = 0usize;
@@ -294,12 +292,12 @@ impl Compiler {
             match m.kind {
                 ClassMemberKind::Constructor => {
                     let f = m.function.as_ref().unwrap();
-                    let tpl = self.compile_function(f, "constructor", true)?;
+                    let tpl = self.compile_function(f, "constructor")?;
                     ctor_tpl = Some(Rc::new(tpl));
                 }
                 ClassMemberKind::Method => {
                     let f = m.function.as_ref().unwrap();
-                    let tpl = self.compile_function(f, &mname, true)?;
+                    let tpl = self.compile_function(f, &mname)?;
                     methods.push(ClassMethodTemplate {
                         name: Rc::from(mname.as_ref()),
                         is_static: m.is_static,
@@ -308,7 +306,7 @@ impl Compiler {
                 }
                 ClassMemberKind::Getter | ClassMemberKind::Setter => {
                     let f = m.function.as_ref().unwrap();
-                    let tpl = self.compile_function(f, &mname, true)?;
+                    let tpl = self.compile_function(f, &mname)?;
                     accessors.push(ClassAccessorTemplate {
                         name: Rc::from(mname.as_ref()),
                         is_static: m.is_static,

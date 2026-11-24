@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::{arg, native};
 use crate::value::*;
-use crate::vm::{to_number, Vm};
+use crate::vm::{own_enumerable_keys, to_number, Vm};
 
 // =====================================================================
 // console
@@ -41,16 +41,10 @@ pub(super) fn install_object(vm: &mut Vm) {
     let values = native("values", 1, |_vm, _this, args| {
         Ok(Value::new_array(own_enumerable_values(&arg(args, 0))))
     });
-    let entries = native("entries", 1, |_vm, _this, args| {
+    let entries = native("entries", 1, |vm, _this, args| {
         let obj = arg(args, 0);
-        let keys = own_enumerable_keys(&obj);
-        let values = own_enumerable_values(&obj);
-        let pairs = keys
-            .into_iter()
-            .zip(values)
-            .map(|(k, v)| Value::new_array(vec![k, v]))
-            .collect();
-        Ok(Value::new_array(pairs))
+        let pairs = own_enumerable_entries(vm, &obj);
+        Ok(vm.alloc_array(pairs))
     });
     let assign = native("assign", 2, |_vm, _this, args| {
         let target = arg(args, 0);
@@ -85,19 +79,25 @@ pub(super) fn install_object(vm: &mut Vm) {
     vm.define_global("Object", object_global);
 }
 
-fn own_enumerable_keys(v: &Value) -> Vec<Value> {
+fn own_enumerable_entries(vm: &Vm, v: &Value) -> Vec<Value> {
     match v {
         Value::Object(o) => {
             let b = o.borrow();
             match &b.kind {
-                ObjKind::Array(items) => (0..items.len())
-                    .map(|i| Value::str(i.to_string()))
+                ObjKind::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, val)| vm.alloc_array(vec![Value::str(i.to_string()), val.clone()]))
                     .collect(),
                 _ => b
                     .props
                     .iter()
-                    .filter(|(_, s)| matches!(s, PropSlot::Value(_)))
-                    .map(|(k, _)| Value::Str(k.clone()))
+                    .filter_map(|(k, s)| match s {
+                        PropSlot::Value(val) => {
+                            Some(vm.alloc_array(vec![Value::Str(k.clone()), val.clone()]))
+                        }
+                        PropSlot::Accessor { .. } => None,
+                    })
                     .collect(),
             }
         }
