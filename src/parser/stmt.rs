@@ -16,11 +16,10 @@ impl Parser {
             let body = self.parse_block_stmts()?;
             return Ok(self.mk_stmt(start, StmtKind::Block(body)));
         }
-        let word = match self.ident_name() {
-            Some(w) => w,
-            None => return self.parse_expr_stmt(),
+        let Some(word) = self.cur_ident() else {
+            return self.parse_expr_stmt();
         };
-        match word.as_str() {
+        match word {
             "var" | "let" | "const" => self.parse_var_decl_stmt(),
             "function" => {
                 self.bump();
@@ -64,11 +63,12 @@ impl Parser {
                 Ok(self.mk_stmt(start, StmtKind::Debugger))
             }
             _ => {
-                if self.peek_is_punct(1, Punct::Colon) && !is_keyword_like(&word) {
+                if self.peek_is_punct(1, Punct::Colon) && !is_keyword_like(word) {
+                    let label = word.to_owned();
                     self.bump(); // ラベル名
                     self.bump(); // ':'
                     let body = Box::new(self.parse_stmt()?);
-                    return Ok(self.mk_stmt(start, StmtKind::Labeled { label: word, body }));
+                    return Ok(self.mk_stmt(start, StmtKind::Labeled { label, body }));
                 }
                 self.parse_expr_stmt()
             }
@@ -104,8 +104,8 @@ impl Parser {
 
     fn parse_var_decl_stmt(&mut self) -> PResult<Stmt> {
         let start = self.cur_span();
-        let word = self.parse_binding_ident()?;
-        let kind = Self::var_kind_from_word(&word);
+        let kind = Self::var_kind_from_word(self.cur_ident().unwrap_or("var"));
+        self.bump();
         let decls = self.parse_var_declarators()?;
         self.consume_semi()?;
         Ok(self.mk_stmt(start, StmtKind::VarDecl { kind, decls }))
@@ -201,8 +201,8 @@ impl Parser {
         self.expect_punct(Punct::LParen)?;
 
         if self.is_word("var") || self.is_word("let") || self.is_word("const") {
-            let word = self.parse_binding_ident()?;
-            let kind = Self::var_kind_from_word(&word);
+            let kind = Self::var_kind_from_word(self.cur_ident().unwrap_or("var"));
+            self.bump();
             let first_pattern = self.parse_binding_pattern()?;
             if self.eat_punct(Punct::Colon) {
                 self.skip_type()?;
@@ -465,10 +465,11 @@ impl Parser {
         let start = self.cur_span();
         self.bump(); // break/continue
         let label = if !self.cur().newline_before {
-            match self.ident_name() {
-                Some(name) if !is_keyword_like(&name) => {
+            match self.cur_ident() {
+                Some(name) if !is_keyword_like(name) => {
+                    let s = name.to_owned();
                     self.bump();
-                    Some(name)
+                    Some(s)
                 }
                 _ => None,
             }
@@ -552,9 +553,9 @@ impl Parser {
 
     fn parse_class_member(&mut self) -> PResult<ClassMember> {
         let mut is_static = false;
-        while let Some(word) = self.ident_name() {
+        while let Some(word) = self.cur_ident() {
             let is_modifier = matches!(
-                word.as_str(),
+                word,
                 "public"
                     | "private"
                     | "protected"

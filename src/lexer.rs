@@ -131,10 +131,10 @@ enum BraceCtx {
 
 /// 正規表現リテラルが許されるかどうかを、直前の意味のあるトークンから判定する。
 /// 「識別子・数値・文字列・`)` `]` `++` `--` の直後」は除算、それ以外は正規表現。
-fn regex_allowed_after(prev: Option<&TokenKind>) -> bool {
-    match prev {
-        None => true,
-        Some(TokenKind::Ident(name)) => {
+#[inline]
+fn regex_allowed_after(kind: &TokenKind) -> bool {
+    match kind {
+        TokenKind::Ident(name) => {
             // ほとんどの識別子の後ろは除算だが、キーワードの後ろは正規表現。
             matches!(
                 name.as_str(),
@@ -156,10 +156,12 @@ fn regex_allowed_after(prev: Option<&TokenKind>) -> bool {
                     | "default"
             )
         }
-        Some(TokenKind::Number(_)) | Some(TokenKind::Str(_)) => false,
-        Some(TokenKind::NoSubTemplate(_)) | Some(TokenKind::TemplateTail(_)) => false,
-        Some(TokenKind::Regex { .. }) => false,
-        Some(TokenKind::Punct(p)) => !matches!(
+        TokenKind::Number(_)
+        | TokenKind::Str(_)
+        | TokenKind::NoSubTemplate(_)
+        | TokenKind::TemplateTail(_)
+        | TokenKind::Regex { .. } => false,
+        TokenKind::Punct(p) => !matches!(
             p,
             Punct::RParen | Punct::RBracket | Punct::PlusPlus | Punct::MinusMinus
         ),
@@ -167,73 +169,105 @@ fn regex_allowed_after(prev: Option<&TokenKind>) -> bool {
     }
 }
 
+#[inline]
+fn is_ascii_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+#[inline]
+fn is_ascii_ident_part(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
 pub struct Lexer<'a> {
-    src: &'a [u8],
-    chars: Vec<char>,
-    byte_offsets: Vec<u32>,
-    pos: usize, // chars 上のインデックス
+    src: &'a str,
+    bytes: &'a [u8],
+    pos: usize, // UTF-8 バイトオフセット（常に文字境界）
     line: u32,
-    col: u32,
+    col: u32, // 1 始まりの文字（Unicode スカラ値）列番号
     brace_stack: Vec<BraceCtx>,
-    last_kind: Option<TokenKind>,
+    regex_allowed: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        let chars: Vec<char> = src.chars().collect();
-        let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
-        let mut b = 0u32;
-        for c in &chars {
-            byte_offsets.push(b);
-            b += c.len_utf8() as u32;
-        }
-        byte_offsets.push(b);
         Lexer {
-            src: src.as_bytes(),
-            chars,
-            byte_offsets,
+            src,
+            bytes: src.as_bytes(),
             pos: 0,
             line: 1,
             col: 1,
             brace_stack: Vec::new(),
-            last_kind: None,
+            regex_allowed: true,
         }
     }
 
+    #[inline]
     fn cur_pos(&self) -> Pos {
         Pos {
             line: self.line,
             col: self.col,
-            byte: *self
-                .byte_offsets
-                .get(self.pos)
-                .unwrap_or(&(self.src.len() as u32)),
+            byte: self.pos as u32,
         }
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    #[inline]
+    fn peek_byte(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
 
-    fn peek_at(&self, offset: usize) -> Option<char> {
-        self.chars.get(self.pos + offset).copied()
+    #[inline]
+    fn peek_byte_at(&self, offset: usize) -> Option<u8> {
+        self.bytes.get(self.pos + offset).copied()
     }
 
-    fn advance(&mut self) -> Option<char> {
-        let c = self.peek()?;
+    #[inline]
+    fn peek_char(&self) -> Option<char> {
+        let b = *self.bytes.get(self.pos)?;
+        if b < 0x80 {
+            Some(b as char)
+        } else {
+            self.src[self.pos..].chars().next()
+        }
+    }
+
+    #[inline]
+    fn advance_ascii(&mut self) -> u8 {
+        let b = self.bytes[self.pos];
         self.pos += 1;
-        if c == '\n' {
+        if b == b'\n' {
             self.line += 1;
             self.col = 1;
         } else {
             self.col += 1;
         }
-        Some(c)
+        b
     }
 
-    fn eat(&mut self, c: char) -> bool {
-        if self.peek() == Some(c) {
-            self.advance();
+    #[inline]
+    fn advance_char(&mut self) -> Option<char> {
+        let b = *self.bytes.get(self.pos)?;
+        if b < 0x80 {
+            self.pos += 1;
+            if b == b'\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+            Some(b as char)
+        } else {
+            let c = self.src[self.pos..].chars().next()?;
+            self.pos += c.len_utf8();
+            self.col += 1;
+            Some(c)
+        }
+    }
+
+    #[inline]
+    fn eat_byte(&mut self, expected: u8) -> bool {
+        if self.peek_byte() == Some(expected) {
+            self.advance_ascii();
             true
         } else {
             false
@@ -250,11 +284,11 @@ impl<'a> Lexer<'a> {
     /// トークン列全体を生成する。
     pub fn tokenize(src: &'a str) -> Result<Vec<Token>, LexError> {
         let mut lexer = Lexer::new(src);
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((src.len() / 5).max(16));
         loop {
             let tok = lexer.next_token()?;
             let is_eof = matches!(tok.kind, TokenKind::Eof);
-            lexer.last_kind = Some(tok.kind.clone());
+            lexer.regex_allowed = regex_allowed_after(&tok.kind);
             out.push(tok);
             if is_eof {
                 break;
@@ -266,41 +300,70 @@ impl<'a> Lexer<'a> {
     /// 空白・改行・コメントを読み飛ばし、改行が含まれていたかを返す。
     fn skip_trivia(&mut self) -> bool {
         let mut saw_newline = false;
-        loop {
-            match self.peek() {
-                Some('\n') => {
+        let bytes = self.bytes;
+        while let Some(&b) = bytes.get(self.pos) {
+            match b {
+                b'\n' => {
                     saw_newline = true;
-                    self.advance();
+                    self.pos += 1;
+                    self.line += 1;
+                    self.col = 1;
                 }
-                Some(c) if c.is_whitespace() => {
-                    self.advance();
+                b' ' | b'\t' | b'\r' | 0x0b | 0x0c => {
+                    self.pos += 1;
+                    self.col += 1;
                 }
-                Some('/') if self.peek_at(1) == Some('/') => {
-                    while let Some(c) = self.peek() {
-                        if c == '\n' {
-                            break;
-                        }
-                        self.advance();
-                    }
-                }
-                Some('/') if self.peek_at(1) == Some('*') => {
-                    self.advance();
-                    self.advance();
-                    loop {
-                        match self.peek() {
-                            None => break,
-                            Some('*') if self.peek_at(1) == Some('/') => {
-                                self.advance();
-                                self.advance();
+                b'/' => match bytes.get(self.pos + 1).copied() {
+                    Some(b'/') => {
+                        self.pos += 2;
+                        self.col += 2;
+                        while let Some(&c) = bytes.get(self.pos) {
+                            if c == b'\n' {
                                 break;
                             }
-                            Some(c) => {
-                                if c == '\n' {
-                                    saw_newline = true;
-                                }
-                                self.advance();
+                            if c < 0x80 {
+                                self.pos += 1;
+                                self.col += 1;
+                            } else {
+                                let ch = self.src[self.pos..].chars().next().unwrap();
+                                self.pos += ch.len_utf8();
+                                self.col += 1;
                             }
                         }
+                    }
+                    Some(b'*') => {
+                        self.pos += 2;
+                        self.col += 2;
+                        while let Some(&c) = bytes.get(self.pos) {
+                            if c == b'*' && bytes.get(self.pos + 1) == Some(&b'/') {
+                                self.pos += 2;
+                                self.col += 2;
+                                break;
+                            }
+                            if c == b'\n' {
+                                saw_newline = true;
+                                self.pos += 1;
+                                self.line += 1;
+                                self.col = 1;
+                            } else if c < 0x80 {
+                                self.pos += 1;
+                                self.col += 1;
+                            } else {
+                                let ch = self.src[self.pos..].chars().next().unwrap();
+                                self.pos += ch.len_utf8();
+                                self.col += 1;
+                            }
+                        }
+                    }
+                    _ => break,
+                },
+                0x80..=0xff => {
+                    let ch = self.src[self.pos..].chars().next().unwrap();
+                    if ch.is_whitespace() {
+                        self.pos += ch.len_utf8();
+                        self.col += 1;
+                    } else {
+                        break;
                     }
                 }
                 _ => break,
@@ -313,7 +376,7 @@ impl<'a> Lexer<'a> {
         let newline_before = self.skip_trivia();
         let start = self.cur_pos();
 
-        let Some(c) = self.peek() else {
+        let Some(b) = self.peek_byte() else {
             return Ok(Token {
                 kind: TokenKind::Eof,
                 span: Span::new(start, start),
@@ -321,25 +384,34 @@ impl<'a> Lexer<'a> {
             });
         };
 
-        let kind = if c == '`' {
-            self.advance();
-            self.read_template_part(true)?
-        } else if c == '}' && self.brace_stack.last() == Some(&BraceCtx::Template) {
-            self.brace_stack.pop();
-            self.advance();
-            self.read_template_part(false)?
-        } else if c.is_ascii_digit()
-            || (c == '.' && self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false))
-        {
-            self.read_number()?
-        } else if c == '"' || c == '\'' {
-            self.read_string(c)?
-        } else if c == '/' && regex_allowed_after(self.last_kind.as_ref()) {
-            self.read_regex()?
-        } else if is_ident_start(c) {
-            self.read_ident()
+        let kind = if b < 0x80 {
+            if b == b'`' {
+                self.advance_ascii();
+                self.read_template_part(true)?
+            } else if b == b'}' && self.brace_stack.last() == Some(&BraceCtx::Template) {
+                self.brace_stack.pop();
+                self.advance_ascii();
+                self.read_template_part(false)?
+            } else if b.is_ascii_digit()
+                || (b == b'.' && self.peek_byte_at(1).is_some_and(|d| d.is_ascii_digit()))
+            {
+                self.read_number()?
+            } else if b == b'"' || b == b'\'' {
+                self.read_string(b)?
+            } else if b == b'/' && self.regex_allowed {
+                self.read_regex()?
+            } else if is_ascii_ident_start(b) {
+                self.read_ident()
+            } else {
+                self.read_punct()?
+            }
         } else {
-            self.read_punct()?
+            let c = self.src[self.pos..].chars().next().unwrap();
+            if is_ident_start(c) {
+                self.read_ident()
+            } else {
+                return Err(self.err(format!("不正な文字です: {c:?}")));
+            }
         };
 
         let end = self.cur_pos();
@@ -351,115 +423,202 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_ident(&mut self) -> TokenKind {
-        let mut s = String::new();
-        while let Some(c) = self.peek() {
-            if is_ident_part(c) {
-                s.push(c);
-                self.advance();
+        let start = self.pos;
+        let bytes = self.bytes;
+        while let Some(&b) = bytes.get(self.pos) {
+            if b < 0x80 {
+                if is_ascii_ident_part(b) {
+                    self.pos += 1;
+                    self.col += 1;
+                } else {
+                    break;
+                }
             } else {
-                break;
+                let c = self.src[self.pos..].chars().next().unwrap();
+                if is_ident_part(c) {
+                    self.pos += c.len_utf8();
+                    self.col += 1;
+                } else {
+                    break;
+                }
             }
         }
-        TokenKind::Ident(s)
+        TokenKind::Ident(self.src[start..self.pos].to_owned())
     }
 
     fn read_number(&mut self) -> Result<TokenKind, LexError> {
-        let mut s = String::new();
-        if self.peek() == Some('0')
+        if self.peek_byte() == Some(b'0')
             && matches!(
-                self.peek_at(1),
-                Some('x') | Some('X') | Some('o') | Some('O') | Some('b') | Some('B')
+                self.peek_byte_at(1),
+                Some(b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
             )
         {
-            s.push(self.advance().unwrap()); // '0'
-            let radix_char = self.advance().unwrap(); // x/o/b
-            s.push(radix_char);
-            let radix = match radix_char.to_ascii_lowercase() {
-                'x' => 16,
-                'o' => 8,
-                'b' => 2,
+            self.advance_ascii(); // '0'
+            let radix_byte = self.advance_ascii();
+            let radix = match radix_byte.to_ascii_lowercase() {
+                b'x' => 16u32,
+                b'o' => 8u32,
+                b'b' => 2u32,
                 _ => unreachable!(),
             };
-            let mut digits = String::new();
-            while let Some(c) = self.peek() {
-                if c.is_digit(radix) || c == '_' {
-                    if c != '_' {
-                        digits.push(c);
-                    }
-                    self.advance();
+            let dig_start = self.pos;
+            let mut has_sep = false;
+            while let Some(b) = self.peek_byte() {
+                if b == b'_' {
+                    has_sep = true;
+                    self.advance_ascii();
+                } else if (b as char).is_digit(radix) {
+                    self.advance_ascii();
                 } else {
                     break;
                 }
             }
+            let dig_end = self.pos;
             // BigInt サフィックス 'n' は読み飛ばす（値としては通常数値扱い）。
-            self.eat('n');
-            let v = i64::from_str_radix(&digits, radix).unwrap_or(0) as f64;
+            self.eat_byte(b'n');
+            let v = if !has_sep {
+                i64::from_str_radix(&self.src[dig_start..dig_end], radix).unwrap_or(0) as f64
+            } else {
+                let digits: String = self.src[dig_start..dig_end]
+                    .chars()
+                    .filter(|&c| c != '_')
+                    .collect();
+                i64::from_str_radix(&digits, radix).unwrap_or(0) as f64
+            };
             return Ok(TokenKind::Number(v));
         }
 
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == '_' {
-                if c != '_' {
-                    s.push(c);
+        let start = self.pos;
+        let mut has_sep = false;
+        let mut is_float = false;
+        let mut int_acc: i64 = 0;
+        let mut int_digits = 0usize;
+
+        while let Some(b) = self.peek_byte() {
+            if b.is_ascii_digit() {
+                if int_digits < 15 {
+                    int_acc = int_acc * 10 + (b - b'0') as i64;
                 }
-                self.advance();
+                int_digits += 1;
+                self.advance_ascii();
+            } else if b == b'_' {
+                has_sep = true;
+                self.advance_ascii();
             } else {
                 break;
             }
         }
-        if self.peek() == Some('.') {
-            s.push('.');
-            self.advance();
-            while let Some(c) = self.peek() {
-                if c.is_ascii_digit() || c == '_' {
-                    if c != '_' {
-                        s.push(c);
-                    }
-                    self.advance();
+        if self.peek_byte() == Some(b'.') {
+            is_float = true;
+            self.advance_ascii();
+            while let Some(b) = self.peek_byte() {
+                if b.is_ascii_digit() {
+                    self.advance_ascii();
+                } else if b == b'_' {
+                    has_sep = true;
+                    self.advance_ascii();
                 } else {
                     break;
                 }
             }
         }
-        if matches!(self.peek(), Some('e') | Some('E')) {
-            s.push('e');
-            self.advance();
-            if matches!(self.peek(), Some('+') | Some('-')) {
-                s.push(self.advance().unwrap());
+        if matches!(self.peek_byte(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.advance_ascii();
+            if matches!(self.peek_byte(), Some(b'+' | b'-')) {
+                self.advance_ascii();
             }
-            while let Some(c) = self.peek() {
-                if c.is_ascii_digit() {
-                    s.push(c);
-                    self.advance();
+            while let Some(b) = self.peek_byte() {
+                if b.is_ascii_digit() {
+                    self.advance_ascii();
                 } else {
                     break;
                 }
             }
         }
-        self.eat('n'); // BigInt サフィックス
-        let v: f64 = s
-            .parse()
-            .map_err(|_| self.err(format!("不正な数値リテラル: {s}")))?;
+        let end = self.pos;
+        self.eat_byte(b'n'); // BigInt サフィックス
+
+        if !is_float && int_digits > 0 && int_digits <= 15 {
+            return Ok(TokenKind::Number(int_acc as f64));
+        }
+        let v: f64 = if !has_sep {
+            self.src[start..end]
+                .parse()
+                .map_err(|_| self.err(format!("不正な数値リテラル: {}", &self.src[start..end])))?
+        } else {
+            let cleaned: String = self.src[start..end].chars().filter(|&c| c != '_').collect();
+            cleaned
+                .parse()
+                .map_err(|_| self.err(format!("不正な数値リテラル: {cleaned}")))?
+        };
         Ok(TokenKind::Number(v))
     }
 
-    fn read_string(&mut self, quote: char) -> Result<TokenKind, LexError> {
-        self.advance(); // 開き quote
-        let mut s = String::new();
+    fn read_string(&mut self, quote: u8) -> Result<TokenKind, LexError> {
+        self.advance_ascii(); // 開き quote
+        let start = self.pos;
+        let bytes = self.bytes;
+        // エスケープ無し文字列のゼロコピー高速パス
+        while let Some(&b) = bytes.get(self.pos) {
+            if b == quote {
+                let s = self.src[start..self.pos].to_owned();
+                self.pos += 1;
+                self.col += 1;
+                return Ok(TokenKind::Str(s));
+            }
+            if b == b'\\' {
+                break;
+            }
+            if b == b'\n' {
+                self.pos += 1;
+                self.line += 1;
+                self.col = 1;
+            } else if b < 0x80 {
+                self.pos += 1;
+                self.col += 1;
+            } else {
+                let c = self.src[self.pos..].chars().next().unwrap();
+                self.pos += c.len_utf8();
+                self.col += 1;
+            }
+        }
+        if self.pos >= bytes.len() {
+            return Err(self.err("文字列リテラルが閉じられていません"));
+        }
+        let mut s = String::with_capacity(self.pos - start + 16);
+        s.push_str(&self.src[start..self.pos]);
         loop {
-            match self.peek() {
+            match self.peek_byte() {
                 None => return Err(self.err("文字列リテラルが閉じられていません")),
-                Some(c) if c == quote => {
-                    self.advance();
+                Some(b) if b == quote => {
+                    self.advance_ascii();
                     break;
                 }
-                Some('\\') => {
-                    self.advance();
+                Some(b'\\') => {
+                    self.advance_ascii();
                     self.read_escape(&mut s)?;
                 }
-                Some(c) => {
-                    s.push(c);
-                    self.advance();
+                Some(_) => {
+                    let chunk_start = self.pos;
+                    while let Some(&b) = bytes.get(self.pos) {
+                        if b == quote || b == b'\\' {
+                            break;
+                        }
+                        if b == b'\n' {
+                            self.pos += 1;
+                            self.line += 1;
+                            self.col = 1;
+                        } else if b < 0x80 {
+                            self.pos += 1;
+                            self.col += 1;
+                        } else {
+                            let c = self.src[self.pos..].chars().next().unwrap();
+                            self.pos += c.len_utf8();
+                            self.col += 1;
+                        }
+                    }
+                    s.push_str(&self.src[chunk_start..self.pos]);
                 }
             }
         }
@@ -467,7 +626,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_escape(&mut self, out: &mut String) -> Result<(), LexError> {
-        let Some(c) = self.advance() else {
+        let Some(c) = self.advance_char() else {
             return Err(self.err("不正なエスケープシーケンス"));
         };
         match c {
@@ -480,14 +639,14 @@ impl<'a> Lexer<'a> {
             '0' => out.push('\0'),
             '\n' => {} // 行継続
             '\r' => {
-                self.eat('\n');
+                self.eat_byte(b'\n');
             }
             'x' => {
                 let mut hex = String::new();
                 for _ in 0..2 {
-                    if let Some(h) = self.peek() {
+                    if let Some(h) = self.peek_char() {
                         hex.push(h);
-                        self.advance();
+                        self.advance_char();
                     }
                 }
                 if let Ok(code) = u32::from_str_radix(&hex, 16) {
@@ -497,17 +656,17 @@ impl<'a> Lexer<'a> {
                 }
             }
             'u' => {
-                if self.peek() == Some('{') {
-                    self.advance();
+                if self.peek_byte() == Some(b'{') {
+                    self.advance_ascii();
                     let mut hex = String::new();
-                    while let Some(h) = self.peek() {
+                    while let Some(h) = self.peek_char() {
                         if h == '}' {
                             break;
                         }
                         hex.push(h);
-                        self.advance();
+                        self.advance_char();
                     }
-                    self.eat('}');
+                    self.eat_byte(b'}');
                     if let Ok(code) = u32::from_str_radix(&hex, 16) {
                         if let Some(ch) = char::from_u32(code) {
                             out.push(ch);
@@ -516,9 +675,9 @@ impl<'a> Lexer<'a> {
                 } else {
                     let mut hex = String::new();
                     for _ in 0..4 {
-                        if let Some(h) = self.peek() {
+                        if let Some(h) = self.peek_char() {
                             hex.push(h);
-                            self.advance();
+                            self.advance_char();
                         }
                     }
                     if let Ok(code) = u32::from_str_radix(&hex, 16) {
@@ -537,131 +696,158 @@ impl<'a> Lexer<'a> {
     /// `is_head` が true ならバッククォート直後（Head/NoSub）、false なら
     /// `}` 直後（Middle/Tail）の読み取り。
     fn read_template_part(&mut self, is_head: bool) -> Result<TokenKind, LexError> {
-        let mut s = String::new();
+        let start = self.pos;
+        let bytes = self.bytes;
+        let mut s: Option<String> = None;
+        let mut chunk_start = start;
         loop {
-            match self.peek() {
+            match bytes.get(self.pos).copied() {
                 None => return Err(self.err("テンプレートリテラルが閉じられていません")),
-                Some('`') => {
-                    self.advance();
+                Some(b'`') => {
+                    let result = match s {
+                        Some(mut buf) => {
+                            buf.push_str(&self.src[chunk_start..self.pos]);
+                            buf
+                        }
+                        None => self.src[chunk_start..self.pos].to_owned(),
+                    };
+                    self.advance_ascii();
                     return Ok(if is_head {
-                        TokenKind::NoSubTemplate(s)
+                        TokenKind::NoSubTemplate(result)
                     } else {
-                        TokenKind::TemplateTail(s)
+                        TokenKind::TemplateTail(result)
                     });
                 }
-                Some('$') if self.peek_at(1) == Some('{') => {
-                    self.advance();
-                    self.advance();
+                Some(b'$') if bytes.get(self.pos + 1) == Some(&b'{') => {
+                    let result = match s {
+                        Some(mut buf) => {
+                            buf.push_str(&self.src[chunk_start..self.pos]);
+                            buf
+                        }
+                        None => self.src[chunk_start..self.pos].to_owned(),
+                    };
+                    self.pos += 2;
+                    self.col += 2;
                     self.brace_stack.push(BraceCtx::Template);
                     return Ok(if is_head {
-                        TokenKind::TemplateHead(s)
+                        TokenKind::TemplateHead(result)
                     } else {
-                        TokenKind::TemplateMiddle(s)
+                        TokenKind::TemplateMiddle(result)
                     });
                 }
-                Some('\\') => {
-                    self.advance();
-                    self.read_escape(&mut s)?;
+                Some(b'\\') => {
+                    let buf = s.get_or_insert_with(|| String::with_capacity(self.pos - start + 16));
+                    buf.push_str(&self.src[chunk_start..self.pos]);
+                    self.advance_ascii();
+                    self.read_escape(buf)?;
+                    chunk_start = self.pos;
                 }
-                Some(c) => {
-                    s.push(c);
-                    self.advance();
+                Some(b'\n') => {
+                    self.pos += 1;
+                    self.line += 1;
+                    self.col = 1;
+                }
+                Some(b) if b < 0x80 => {
+                    self.pos += 1;
+                    self.col += 1;
+                }
+                Some(_) => {
+                    let c = self.src[self.pos..].chars().next().unwrap();
+                    self.pos += c.len_utf8();
+                    self.col += 1;
                 }
             }
         }
     }
 
     fn read_regex(&mut self) -> Result<TokenKind, LexError> {
-        self.advance(); // 先頭の '/'
-        let mut pattern = String::new();
+        self.advance_ascii(); // 先頭の '/'
+        let pat_start = self.pos;
         let mut in_class = false;
         loop {
-            match self.peek() {
+            match self.peek_byte() {
                 None => return Err(self.err("正規表現リテラルが閉じられていません")),
-                Some('\n') => return Err(self.err("正規表現リテラル中に改行があります")),
-                Some('\\') => {
-                    pattern.push('\\');
-                    self.advance();
-                    if let Some(c) = self.peek() {
-                        pattern.push(c);
-                        self.advance();
+                Some(b'\n') => return Err(self.err("正規表現リテラル中に改行があります")),
+                Some(b'\\') => {
+                    self.advance_ascii();
+                    if self.peek_byte().is_some() {
+                        self.advance_char();
                     }
                 }
-                Some('[') => {
+                Some(b'[') => {
                     in_class = true;
-                    pattern.push('[');
-                    self.advance();
+                    self.advance_ascii();
                 }
-                Some(']') if in_class => {
+                Some(b']') if in_class => {
                     in_class = false;
-                    pattern.push(']');
-                    self.advance();
+                    self.advance_ascii();
                 }
-                Some('/') if !in_class => {
-                    self.advance();
-                    break;
+                Some(b'/') if !in_class => {
+                    let pat_end = self.pos;
+                    self.advance_ascii();
+                    let flags_start = self.pos;
+                    while let Some(c) = self.peek_char() {
+                        if c.is_alphabetic() {
+                            self.advance_char();
+                        } else {
+                            break;
+                        }
+                    }
+                    return Ok(TokenKind::Regex {
+                        pattern: self.src[pat_start..pat_end].to_owned(),
+                        flags: self.src[flags_start..self.pos].to_owned(),
+                    });
                 }
-                Some(c) => {
-                    pattern.push(c);
-                    self.advance();
+                Some(_) => {
+                    self.advance_char();
                 }
             }
         }
-        let mut flags = String::new();
-        while let Some(c) = self.peek() {
-            if c.is_alphabetic() {
-                flags.push(c);
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        Ok(TokenKind::Regex { pattern, flags })
     }
 
     fn read_punct(&mut self) -> Result<TokenKind, LexError> {
-        let c = self.advance().unwrap();
+        let b = self.advance_ascii();
         use Punct::*;
-        let p = match c {
-            '(' => LParen,
-            ')' => RParen,
-            '{' => {
+        let p = match b {
+            b'(' => LParen,
+            b')' => RParen,
+            b'{' => {
                 self.brace_stack.push(BraceCtx::Block);
                 LBrace
             }
-            '}' => {
+            b'}' => {
                 // Template 文脈でないただの '}'。ネストが崩れていても best-effort で pop。
                 if self.brace_stack.last() == Some(&BraceCtx::Block) {
                     self.brace_stack.pop();
                 }
                 RBrace
             }
-            '[' => LBracket,
-            ']' => RBracket,
-            ';' => Semi,
-            ',' => Comma,
-            '~' => Tilde,
-            '@' => At,
-            '#' => Hash,
-            '.' => {
-                if self.peek() == Some('.') && self.peek_at(1) == Some('.') {
-                    self.advance();
-                    self.advance();
+            b'[' => LBracket,
+            b']' => RBracket,
+            b';' => Semi,
+            b',' => Comma,
+            b'~' => Tilde,
+            b'@' => At,
+            b'#' => Hash,
+            b'.' => {
+                if self.peek_byte() == Some(b'.') && self.peek_byte_at(1) == Some(b'.') {
+                    self.advance_ascii();
+                    self.advance_ascii();
                     DotDotDot
                 } else {
                     Dot
                 }
             }
-            ':' => Colon,
-            '?' => {
-                if self.peek() == Some('.')
-                    && !self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false)
+            b':' => Colon,
+            b'?' => {
+                if self.peek_byte() == Some(b'.')
+                    && !self.peek_byte_at(1).is_some_and(|d| d.is_ascii_digit())
                 {
-                    self.advance();
+                    self.advance_ascii();
                     QuestionDot
-                } else if self.peek() == Some('?') {
-                    self.advance();
-                    if self.eat('=') {
+                } else if self.peek_byte() == Some(b'?') {
+                    self.advance_ascii();
+                    if self.eat_byte(b'=') {
                         QuestionQuestionEq
                     } else {
                         QuestionQuestion
@@ -670,147 +856,147 @@ impl<'a> Lexer<'a> {
                     Question
                 }
             }
-            '+' => {
-                if self.eat('+') {
+            b'+' => {
+                if self.eat_byte(b'+') {
                     PlusPlus
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     PlusEq
                 } else {
                     Plus
                 }
             }
-            '-' => {
-                if self.eat('-') {
+            b'-' => {
+                if self.eat_byte(b'-') {
                     MinusMinus
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     MinusEq
                 } else {
                     Minus
                 }
             }
-            '*' => {
-                if self.eat('*') {
-                    if self.eat('=') {
+            b'*' => {
+                if self.eat_byte(b'*') {
+                    if self.eat_byte(b'=') {
                         StarStarEq
                     } else {
                         StarStar
                     }
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     StarEq
                 } else {
                     Star
                 }
             }
-            '/' => {
-                if self.eat('=') {
+            b'/' => {
+                if self.eat_byte(b'=') {
                     SlashEq
                 } else {
                     Slash
                 }
             }
-            '%' => {
-                if self.eat('=') {
+            b'%' => {
+                if self.eat_byte(b'=') {
                     PercentEq
                 } else {
                     Percent
                 }
             }
-            '=' => {
-                if self.peek() == Some('=') && self.peek_at(1) == Some('=') {
-                    self.advance();
-                    self.advance();
+            b'=' => {
+                if self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'=') {
+                    self.advance_ascii();
+                    self.advance_ascii();
                     EqEqEq
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     EqEq
-                } else if self.eat('>') {
+                } else if self.eat_byte(b'>') {
                     Arrow
                 } else {
                     Eq
                 }
             }
-            '!' => {
-                if self.peek() == Some('=') && self.peek_at(1) == Some('=') {
-                    self.advance();
-                    self.advance();
+            b'!' => {
+                if self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'=') {
+                    self.advance_ascii();
+                    self.advance_ascii();
                     NotEqEq
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     NotEq
                 } else {
                     Bang
                 }
             }
-            '<' => {
-                if self.peek() == Some('<') {
-                    self.advance();
-                    if self.eat('=') {
+            b'<' => {
+                if self.peek_byte() == Some(b'<') {
+                    self.advance_ascii();
+                    if self.eat_byte(b'=') {
                         LtLtEq
                     } else {
                         LtLt
                     }
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     LtEq
                 } else {
                     Lt
                 }
             }
-            '>' => {
-                if self.peek() == Some('>') && self.peek_at(1) == Some('>') {
-                    self.advance();
-                    self.advance();
-                    if self.eat('=') {
+            b'>' => {
+                if self.peek_byte() == Some(b'>') && self.peek_byte_at(1) == Some(b'>') {
+                    self.advance_ascii();
+                    self.advance_ascii();
+                    if self.eat_byte(b'=') {
                         GtGtGtEq
                     } else {
                         GtGtGt
                     }
-                } else if self.peek() == Some('>') {
-                    self.advance();
-                    if self.eat('=') {
+                } else if self.peek_byte() == Some(b'>') {
+                    self.advance_ascii();
+                    if self.eat_byte(b'=') {
                         GtGtEq
                     } else {
                         GtGt
                     }
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     GtEq
                 } else {
                     Gt
                 }
             }
-            '&' => {
-                if self.peek() == Some('&') {
-                    self.advance();
-                    if self.eat('=') {
+            b'&' => {
+                if self.peek_byte() == Some(b'&') {
+                    self.advance_ascii();
+                    if self.eat_byte(b'=') {
                         AmpAmpEq
                     } else {
                         AmpAmp
                     }
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     AmpEq
                 } else {
                     Amp
                 }
             }
-            '|' => {
-                if self.peek() == Some('|') {
-                    self.advance();
-                    if self.eat('=') {
+            b'|' => {
+                if self.peek_byte() == Some(b'|') {
+                    self.advance_ascii();
+                    if self.eat_byte(b'=') {
                         PipePipeEq
                     } else {
                         PipePipe
                     }
-                } else if self.eat('=') {
+                } else if self.eat_byte(b'=') {
                     PipeEq
                 } else {
                     Pipe
                 }
             }
-            '^' => {
-                if self.eat('=') {
+            b'^' => {
+                if self.eat_byte(b'=') {
                     CaretEq
                 } else {
                     Caret
                 }
             }
-            other => return Err(self.err(format!("不正な文字です: {other:?}"))),
+            other => return Err(self.err(format!("不正な文字です: {:?}", other as char))),
         };
         Ok(TokenKind::Punct(p))
     }

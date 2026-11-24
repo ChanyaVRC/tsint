@@ -79,9 +79,11 @@ struct FuncCtx {
     control: Vec<Ctrl>,
     /// 例外の再送出に使う一時ローカルスロット（finally を含む関数のみ確保）。
     exc_slot: Option<LocalIdx>,
-    /// 定数表の重複排除キャッシュ（文字列・数値）。
-    str_consts: FastHashMap<Rc<str>, ConstIdx>,
-    num_consts: FastHashMap<u64, ConstIdx>,
+    /// 定数表の重複排除キャッシュ（定数が多い関数でのみ遅延確保）。
+    #[allow(clippy::box_collection)]
+    str_consts: Option<Box<FastHashMap<Rc<str>, ConstIdx>>>,
+    #[allow(clippy::box_collection)]
+    num_consts: Option<Box<FastHashMap<u64, ConstIdx>>>,
 }
 
 impl FuncCtx {
@@ -94,8 +96,8 @@ impl FuncCtx {
             upvalue_names: Vec::new(),
             control: vec![Ctrl::FuncBoundary],
             exc_slot: None,
-            str_consts: FastHashMap::default(),
-            num_consts: FastHashMap::default(),
+            str_consts: None,
+            num_consts: None,
         }
     }
 
@@ -289,13 +291,36 @@ impl Compiler {
 
     fn add_const_str(&mut self, s: &str) -> ConstIdx {
         let f = self.cur();
-        if let Some(&idx) = f.str_consts.get(s) {
+        if let Some(ref mut map) = f.str_consts {
+            if let Some(&idx) = map.get(s) {
+                return idx;
+            }
+            let rc: Rc<str> = Rc::from(s);
+            let idx = f.chunk.consts.len() as ConstIdx;
+            f.chunk.consts.push(Const::Str(rc.clone()));
+            map.insert(rc, idx);
             return idx;
+        }
+        for (i, c) in f.chunk.consts.iter().enumerate() {
+            if let Const::Str(existing) = c {
+                if &**existing == s {
+                    return i as ConstIdx;
+                }
+            }
         }
         let rc: Rc<str> = Rc::from(s);
         let idx = f.chunk.consts.len() as ConstIdx;
-        f.chunk.consts.push(Const::Str(rc.clone()));
-        f.str_consts.insert(rc, idx);
+        f.chunk.consts.push(Const::Str(rc));
+        if f.chunk.consts.len() > 16 {
+            let mut map =
+                FastHashMap::with_capacity_and_hasher(f.chunk.consts.len() * 2, Default::default());
+            for (i, c) in f.chunk.consts.iter().enumerate() {
+                if let Const::Str(existing) = c {
+                    map.insert(existing.clone(), i as ConstIdx);
+                }
+            }
+            f.str_consts = Some(Box::new(map));
+        }
         idx
     }
 
@@ -869,12 +894,34 @@ impl Compiler {
     fn const_num(&mut self, n: f64) -> ConstIdx {
         let bits = n.to_bits();
         let f = self.cur();
-        if let Some(&idx) = f.num_consts.get(&bits) {
+        if let Some(ref mut map) = f.num_consts {
+            if let Some(&idx) = map.get(&bits) {
+                return idx;
+            }
+            let idx = f.chunk.consts.len() as ConstIdx;
+            f.chunk.consts.push(Const::Number(n));
+            map.insert(bits, idx);
             return idx;
+        }
+        for (i, c) in f.chunk.consts.iter().enumerate() {
+            if let Const::Number(existing) = c {
+                if existing.to_bits() == bits {
+                    return i as ConstIdx;
+                }
+            }
         }
         let idx = f.chunk.consts.len() as ConstIdx;
         f.chunk.consts.push(Const::Number(n));
-        f.num_consts.insert(bits, idx);
+        if f.chunk.consts.len() > 16 {
+            let mut map =
+                FastHashMap::with_capacity_and_hasher(f.chunk.consts.len() * 2, Default::default());
+            for (i, c) in f.chunk.consts.iter().enumerate() {
+                if let Const::Number(existing) = c {
+                    map.insert(existing.to_bits(), i as ConstIdx);
+                }
+            }
+            f.num_consts = Some(Box::new(map));
+        }
         idx
     }
 

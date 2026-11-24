@@ -185,23 +185,101 @@ impl CharClass {
     }
 
     fn compile_bitmap(&mut self, ignore_case: bool) {
+        const DIGIT_LO: u64 = 0x03ff_0000_0000_0000; // '0'..='9' (48..=57)
+        const WORD_LO: u64 = DIGIT_LO;
+        const WORD_HI: u64 = 0x07ff_fffe_87ff_fffe; // 'A'..='Z' (65..=90), '_' (95), 'a'..='z' (97..=122)
+        const SPACE_LO: u64 =
+            (1u64 << 9) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12) | (1u64 << 13) | (1u64 << 32);
+
+        #[inline]
+        fn set_bit(bits: &mut [u64; 2], b: u8) {
+            bits[(b >> 6) as usize] |= 1u64 << (b & 63);
+        }
+
         let mut bits = [0u64; 2];
-        for b in 0u8..128 {
-            let c = b as char;
-            let hit = self.atoms.iter().any(|a| atom_matches(a, c, ignore_case));
-            if hit != self.negate {
-                bits[(b >> 6) as usize] |= 1u64 << (b & 63);
+        let mut has_non_ascii = false;
+        for a in &self.atoms {
+            match a {
+                ClassAtom::Char(x) => {
+                    let code = *x as u32;
+                    if code < 128 {
+                        let b = code as u8;
+                        set_bit(&mut bits, b);
+                        if ignore_case {
+                            if b.is_ascii_lowercase() {
+                                set_bit(&mut bits, b - 32);
+                            } else if b.is_ascii_uppercase() {
+                                set_bit(&mut bits, b + 32);
+                            }
+                        }
+                    } else {
+                        has_non_ascii = true;
+                        if ignore_case {
+                            // 例: K (U+212A Kelvin sign) が ASCII 'k' と一致するケースへの保険
+                            if let Some(lo) = x.to_lowercase().next() {
+                                if (lo as u32) < 128 {
+                                    let b = lo as u8;
+                                    set_bit(&mut bits, b);
+                                    if b.is_ascii_lowercase() {
+                                        set_bit(&mut bits, b - 32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ClassAtom::Range(lo, hi) => {
+                    let lo_u = *lo as u32;
+                    let hi_u = *hi as u32;
+                    if hi_u >= 128 {
+                        has_non_ascii = true;
+                    }
+                    if lo_u < 128 {
+                        let end = hi_u.min(127) as u8;
+                        for b in (lo_u as u8)..=end {
+                            set_bit(&mut bits, b);
+                            if ignore_case {
+                                if b.is_ascii_lowercase() {
+                                    set_bit(&mut bits, b - 32);
+                                } else if b.is_ascii_uppercase() {
+                                    set_bit(&mut bits, b + 32);
+                                }
+                            }
+                        }
+                    }
+                }
+                ClassAtom::Digit => bits[0] |= DIGIT_LO,
+                ClassAtom::NotDigit => {
+                    bits[0] |= !DIGIT_LO;
+                    bits[1] |= !0u64;
+                    has_non_ascii = true;
+                }
+                ClassAtom::Word => {
+                    bits[0] |= WORD_LO;
+                    bits[1] |= WORD_HI;
+                }
+                ClassAtom::NotWord => {
+                    bits[0] |= !WORD_LO;
+                    bits[1] |= !WORD_HI;
+                    has_non_ascii = true;
+                }
+                ClassAtom::Space => {
+                    bits[0] |= SPACE_LO;
+                    has_non_ascii = true;
+                }
+                ClassAtom::NotSpace => {
+                    bits[0] |= !SPACE_LO;
+                    bits[1] |= !0u64;
+                    has_non_ascii = true;
+                }
             }
         }
+        if self.negate {
+            bits[0] = !bits[0];
+            bits[1] = !bits[1];
+        }
         self.ascii_bits = bits;
-        self.has_non_ascii_atoms = self.atoms.iter().any(|a| match a {
-            ClassAtom::Char(x) => (*x as u32) >= 128,
-            ClassAtom::Range(_, hi) => (*hi as u32) >= 128,
-            ClassAtom::Digit | ClassAtom::Word => false,
-            ClassAtom::NotDigit | ClassAtom::NotWord | ClassAtom::Space | ClassAtom::NotSpace => {
-                true
-            }
-        });
+        self.has_non_ascii_atoms = has_non_ascii;
     }
 
     #[inline]
