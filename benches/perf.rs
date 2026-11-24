@@ -4,7 +4,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tsint::compiler;
@@ -21,6 +21,16 @@ struct CountingAlloc;
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+static PEAK_LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+
+#[inline]
+fn record_live_delta(delta: i64) {
+    let cur = LIVE_BYTES.fetch_add(delta, Ordering::Relaxed) + delta;
+    if delta > 0 {
+        PEAK_LIVE_BYTES.fetch_max(cur, Ordering::Relaxed);
+    }
+}
 
 // SAFETY: `CountingAlloc` delegates every allocation operation directly to `std::alloc::System`,
 // which satisfies all `GlobalAlloc` layout, alignment, and thread-safety guarantees. The atomic
@@ -29,11 +39,13 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        record_live_delta(layout.size() as i64);
         // SAFETY: Caller upholds `GlobalAlloc::alloc` preconditions (non-zero size layout).
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        record_live_delta(-(layout.size() as i64));
         // SAFETY: `ptr` was allocated by `System.alloc`/`System.realloc` via this allocator
         // with the same `layout`.
         unsafe { System.dealloc(ptr, layout) }
@@ -42,6 +54,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        record_live_delta(new_size as i64 - layout.size() as i64);
         // SAFETY: Caller upholds `GlobalAlloc::realloc` preconditions (`ptr` was allocated by
         // `System` with `layout`, and `new_size` is non-zero and valid for `layout.align()`).
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -54,12 +67,15 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 fn reset_alloc_counters() {
     ALLOC_COUNT.store(0, Ordering::Relaxed);
     ALLOC_BYTES.store(0, Ordering::Relaxed);
+    LIVE_BYTES.store(0, Ordering::Relaxed);
+    PEAK_LIVE_BYTES.store(0, Ordering::Relaxed);
 }
 
-fn read_alloc_counters() -> (u64, u64) {
+fn read_alloc_counters() -> (u64, u64, u64) {
     (
         ALLOC_COUNT.load(Ordering::Relaxed),
         ALLOC_BYTES.load(Ordering::Relaxed),
+        PEAK_LIVE_BYTES.load(Ordering::Relaxed).max(0) as u64,
     )
 }
 
@@ -73,6 +89,7 @@ struct BenchResult {
     min_us: f64,
     allocs: u64,
     bytes: u64,
+    peak_live: u64,
 }
 
 fn run_bench<F: FnMut()>(name: &'static str, warmup: usize, iters: usize, mut f: F) -> BenchResult {
@@ -82,14 +99,16 @@ fn run_bench<F: FnMut()>(name: &'static str, warmup: usize, iters: usize, mut f:
     let mut times = Vec::with_capacity(iters);
     let mut last_allocs = 0u64;
     let mut last_bytes = 0u64;
+    let mut last_peak = 0u64;
     for _ in 0..iters {
         reset_alloc_counters();
         let t0 = Instant::now();
         f();
         let dt = t0.elapsed();
-        let (a, b) = read_alloc_counters();
+        let (a, b, p) = read_alloc_counters();
         last_allocs = a;
         last_bytes = b;
+        last_peak = p;
         times.push(dt);
     }
     times.sort();
@@ -102,6 +121,7 @@ fn run_bench<F: FnMut()>(name: &'static str, warmup: usize, iters: usize, mut f:
         min_us: to_us(min),
         allocs: last_allocs,
         bytes: last_bytes,
+        peak_live: last_peak,
     }
 }
 
@@ -639,20 +659,76 @@ fn main() {
     }));
 
     println!(
-        "{:<24} {:>12} {:>12} {:>12} {:>14}",
-        "benchmark", "median (ms)", "min (ms)", "allocs", "alloc bytes"
+        "{:<24} {:>12} {:>12} {:>12} {:>14} {:>14}",
+        "benchmark", "median (ms)", "min (ms)", "allocs", "alloc bytes", "peak live"
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(93));
     let mut total_ms = 0.0;
+    let mut total_allocs = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_peak = 0u64;
     for r in &results {
         let med_ms = r.median_us / 1000.0;
         let min_ms = r.min_us / 1000.0;
         total_ms += med_ms;
+        total_allocs += r.allocs;
+        total_bytes += r.bytes;
+        total_peak += r.peak_live;
         println!(
-            "{:<24} {:>12.3} {:>12.3} {:>12} {:>14}",
-            r.name, med_ms, min_ms, r.allocs, r.bytes
+            "{:<24} {:>12.3} {:>12.3} {:>12} {:>14} {:>14}",
+            r.name, med_ms, min_ms, r.allocs, r.bytes, r.peak_live
         );
     }
-    println!("{}", "-".repeat(78));
-    println!("{:<24} {:>12.3}", "TOTAL (sum of medians)", total_ms);
+    println!("{}", "-".repeat(93));
+    println!(
+        "{:<24} {:>12.3} {:>12} {:>12} {:>14} {:>14}",
+        "TOTAL (sum)", total_ms, "", total_allocs, total_bytes, total_peak
+    );
+
+    print_type_sizes();
+}
+
+fn print_type_sizes() {
+    use std::mem::size_of;
+    let sizes: &[(&str, usize)] = &[
+        ("Value", size_of::<Value>()),
+        ("PropSlot", size_of::<tsint::value::PropSlot>()),
+        ("PropMap", size_of::<tsint::value::PropMap>()),
+        ("ObjData", size_of::<tsint::value::ObjData>()),
+        ("ObjKind", size_of::<tsint::value::ObjKind>()),
+        ("FunctionObj", size_of::<tsint::value::FunctionObj>()),
+        ("NativeObj", size_of::<tsint::value::NativeObj>()),
+        ("MapData", size_of::<tsint::value::MapData>()),
+        ("SetData", size_of::<tsint::value::SetData>()),
+        ("PromiseData", size_of::<tsint::value::PromiseData>()),
+        ("ClassData", size_of::<tsint::value::ClassData>()),
+        ("Stmt", size_of::<tsint::ast::Stmt>()),
+        ("StmtKind", size_of::<tsint::ast::StmtKind>()),
+        ("Expr", size_of::<tsint::ast::Expr>()),
+        ("ExprKind", size_of::<tsint::ast::ExprKind>()),
+        ("Pattern", size_of::<tsint::ast::Pattern>()),
+        ("Function", size_of::<tsint::ast::Function>()),
+        ("Class", size_of::<tsint::ast::Class>()),
+        ("ClassMember", size_of::<tsint::ast::ClassMember>()),
+        ("PropertyKey", size_of::<tsint::ast::PropertyKey>()),
+        ("OpCode", size_of::<tsint::bytecode::OpCode>()),
+        ("Const", size_of::<tsint::bytecode::Const>()),
+        ("Chunk", size_of::<tsint::bytecode::Chunk>()),
+        (
+            "FunctionTemplate",
+            size_of::<tsint::bytecode::FunctionTemplate>(),
+        ),
+        ("ClassTemplate", size_of::<tsint::bytecode::ClassTemplate>()),
+        ("Frame", size_of::<tsint::vm::Frame>()),
+        ("LocalSlot", size_of::<tsint::vm::LocalSlot>()),
+        ("MicrotaskJob", size_of::<tsint::vm::MicrotaskJob>()),
+        ("Vm", size_of::<tsint::vm::Vm>()),
+        ("Token", size_of::<tsint::lexer::Token>()),
+        ("TokenKind", size_of::<tsint::lexer::TokenKind>()),
+        ("Regex", size_of::<tsint::regex::Regex>()),
+    ];
+    println!("\n=== Type Sizes (bytes) ===");
+    for (name, sz) in sizes {
+        println!("{name:<24} {sz:>6}");
+    }
 }
