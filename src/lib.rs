@@ -13,6 +13,8 @@
 //!
 //! 対応範囲や設計方針は README を参照。
 
+#![forbid(unsafe_code)]
+
 pub mod ast;
 pub mod builtins;
 pub mod bytecode;

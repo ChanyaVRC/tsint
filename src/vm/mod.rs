@@ -42,7 +42,7 @@ thread_local! {
     /// ASCII 単一文字の `Rc<str>` キャッシュ（`str[i]` のゼロ確保高速パス用）。
     static ASCII_CHARS: [Rc<str>; 128] = std::array::from_fn(|b| {
         let ch = [b as u8];
-        Rc::from(std::str::from_utf8(&ch).unwrap())
+        Rc::from(std::str::from_utf8(&ch).expect("0..128 は常に有効な ASCII UTF-8"))
     });
 }
 
@@ -618,5 +618,32 @@ impl Vm {
 impl Default for Vm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // VM が保持する全ルートを先に解放する。循環参照を持たないオブジェクトは
+        // この時点で通常の Rc::drop により即座に解放される。
+        self.frames.clear();
+        self.globals.clear();
+        self.pending_module_exports = None;
+        self.microtasks.clear();
+        self.maybe_unhandled.clear();
+        self.current_owner_promise = None;
+        self.frame_pool.clear();
+        self.args_pool.clear();
+
+        // ルート解放後も生存している追跡オブジェクト（循環参照または外部 Rust 保持）が
+        // 存在する場合のみ trial-deletion GC を走らせ、到達不能な循環参照を確実に回収する。
+        // 外部 Rust コードが保持している Value は strong_count 検査によりそのまま保護される。
+        let has_remaining = self
+            .gc_objects
+            .borrow()
+            .iter()
+            .any(|w| w.strong_count() > 0);
+        if has_remaining {
+            self.collect_garbage();
+        }
     }
 }
