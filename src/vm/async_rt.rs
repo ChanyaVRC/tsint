@@ -1,12 +1,18 @@
 //! T3: Promise・マイクロタスクキュー・`await` タスク中断/再開・イベントループ。
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::value::*;
 
 use super::ops::is_callable;
 use super::{HostPromise, MicrotaskJob, PumpState, RunOutcome, Vm};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettleMode {
+    Resolve,
+    Reject,
+}
 
 impl Vm {
     pub(super) fn spawn_async_task_from_function(
@@ -242,8 +248,8 @@ impl Vm {
     fn make_thenable_guard_fn(
         &self,
         promise: &ObjRef,
-        called: &Rc<RefCell<bool>>,
-        is_reject: bool,
+        called: &Rc<Cell<bool>>,
+        mode: SettleMode,
     ) -> Value {
         let weak = Rc::downgrade(promise);
         let called_c = called.clone();
@@ -252,16 +258,14 @@ impl Vm {
             1,
             vec![promise.clone()],
             Rc::new(move |vm, _this, args| {
-                if *called_c.borrow() {
+                if called_c.replace(true) {
                     return Ok(Value::Undefined);
                 }
-                *called_c.borrow_mut() = true;
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
                 if let Some(p) = weak.upgrade() {
-                    if is_reject {
-                        vm.settle_promise(p, Err(v));
-                    } else {
-                        vm.resolve_promise(p, v);
+                    match mode {
+                        SettleMode::Resolve => vm.resolve_promise(p, v),
+                        SettleMode::Reject => vm.settle_promise(p, Err(v)),
                     }
                 }
                 Ok(Value::Undefined)
@@ -270,12 +274,11 @@ impl Vm {
     }
 
     fn run_resolve_thenable(&mut self, promise: ObjRef, thenable: Value, then_fn: Value) {
-        let called: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-        let resolve_fn = self.make_thenable_guard_fn(&promise, &called, false);
-        let reject_fn = self.make_thenable_guard_fn(&promise, &called, true);
+        let called = Rc::new(Cell::new(false));
+        let resolve_fn = self.make_thenable_guard_fn(&promise, &called, SettleMode::Resolve);
+        let reject_fn = self.make_thenable_guard_fn(&promise, &called, SettleMode::Reject);
         if let Err(e) = self.call_value(then_fn, thenable, &[resolve_fn, reject_fn]) {
-            if !*called.borrow() {
-                *called.borrow_mut() = true;
+            if !called.replace(true) {
                 self.settle_promise(promise, Err(e));
             }
         }
@@ -303,9 +306,7 @@ impl Vm {
                 }
             }
         }
-        if self.native_call_depth == 0 {
-            self.maybe_collect_garbage();
-        }
+        self.maybe_gc_if_top_level();
         if self.pending_host_count > 0 {
             PumpState::Waiting
         } else {

@@ -56,11 +56,10 @@ impl Compiler {
                             self.emit(OpCode::BindLocal(slot), line);
                             return Ok(());
                         }
-                        let (is_logical, plain_op) = assign_op_kind(*op);
-                        if !is_logical {
+                        if let CompoundAssignOp::Binary(plain_op) = classify_compound_assign(*op) {
                             self.emit(OpCode::GetLocal(slot), line);
                             self.compile_expr(value)?;
-                            self.emit(plain_op.unwrap(), line);
+                            self.emit(plain_op, line);
                             self.emit(OpCode::BindLocal(slot), line);
                             return Ok(());
                         }
@@ -129,10 +128,7 @@ impl Compiler {
             }
             ExprKind::RegexLit { pattern, flags } => {
                 let re = crate::regex::Regex::compile(pattern, flags).map_err(|e2| {
-                    err(
-                        line,
-                        format!("正規表現 /{pattern}/ を解釈できません: {}", e2.0),
-                    )
+                    err(line, format!("正規表現 /{pattern}/ を解釈できません: {e2}"))
                 })?;
                 let c = self.add_const(Const::Regex(Rc::new(re)));
                 self.emit(OpCode::LoadRegex(c), line);
@@ -159,13 +155,13 @@ impl Compiler {
             }
             ExprKind::ObjectLit(props) => self.compile_object_lit(props, line)?,
             ExprKind::Function(f) => {
-                let name = f.name.clone().unwrap_or_default();
-                let tpl = self.compile_function(f, &name, false)?;
+                let name = f.name.as_deref().unwrap_or("");
+                let tpl = self.compile_function(f, name)?;
                 let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                 self.emit(OpCode::MakeClosure(c), line);
             }
             ExprKind::Arrow(f) => {
-                let tpl = self.compile_function(f, "", false)?;
+                let tpl = self.compile_function(f, "")?;
                 let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                 self.emit(OpCode::MakeClosure(c), line);
             }
@@ -277,7 +273,7 @@ impl Compiler {
                     kind,
                 } => {
                     let name = property_key_static_name(key);
-                    let tpl = self.compile_function(function, &name, true)?;
+                    let tpl = self.compile_function(function, &name)?;
                     let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                     self.emit(OpCode::MakeClosure(c), line);
                     let nc = self.add_const_str(&name);
@@ -370,32 +366,35 @@ impl Compiler {
                 }
             }
             ExprKind::Member { obj, prop, .. } => {
+                enum MemberKey {
+                    Static(ConstIdx),
+                    Computed(LocalIdx),
+                }
                 let tmp_obj = self.temp_slot();
                 self.compile_expr(obj)?;
                 self.emit(OpCode::BindLocal(tmp_obj), line);
-                let tmp_key = match prop {
+                let member_key = match prop {
                     PropertyKey::Computed(ke) => {
                         let t = self.temp_slot();
                         self.compile_expr(ke)?;
                         self.emit(OpCode::BindLocal(t), line);
-                        Some(t)
+                        MemberKey::Computed(t)
                     }
-                    _ => None,
-                };
-                let name = match prop {
-                    PropertyKey::Computed(_) => None,
-                    _ => Some(property_key_static_name(prop)),
+                    _ => {
+                        let name = property_key_static_name(prop);
+                        MemberKey::Static(self.add_const_str(&name))
+                    }
                 };
                 self.emit(OpCode::GetLocal(tmp_obj), line);
-                let prop_c = if let Some(name) = &name {
-                    let c = self.add_const_str(name);
-                    self.emit(OpCode::GetProp(c), line);
-                    Some(c)
-                } else {
-                    self.emit(OpCode::GetLocal(tmp_key.unwrap()), line);
-                    self.emit(OpCode::GetIndex, line);
-                    None
-                };
+                match member_key {
+                    MemberKey::Static(c) => {
+                        self.emit(OpCode::GetProp(c), line);
+                    }
+                    MemberKey::Computed(t) => {
+                        self.emit(OpCode::GetLocal(t), line);
+                        self.emit(OpCode::GetIndex, line);
+                    }
+                }
                 self.emit(OpCode::Pos, line);
                 let tmp_old = if !prefix {
                     let t = self.temp_slot();
@@ -410,13 +409,16 @@ impl Compiler {
                 let tmp_new = self.temp_slot();
                 self.emit(OpCode::BindLocal(tmp_new), line);
                 self.emit(OpCode::GetLocal(tmp_obj), line);
-                if let Some(c) = prop_c {
-                    self.emit(OpCode::GetLocal(tmp_new), line);
-                    self.emit(OpCode::SetProp(c), line);
-                } else {
-                    self.emit(OpCode::GetLocal(tmp_key.unwrap()), line);
-                    self.emit(OpCode::GetLocal(tmp_new), line);
-                    self.emit(OpCode::SetIndex, line);
+                match member_key {
+                    MemberKey::Static(c) => {
+                        self.emit(OpCode::GetLocal(tmp_new), line);
+                        self.emit(OpCode::SetProp(c), line);
+                    }
+                    MemberKey::Computed(t) => {
+                        self.emit(OpCode::GetLocal(t), line);
+                        self.emit(OpCode::GetLocal(tmp_new), line);
+                        self.emit(OpCode::SetIndex, line);
+                    }
                 }
                 if let Some(t) = tmp_old {
                     self.emit(OpCode::Pop, line);
@@ -488,24 +490,25 @@ impl Compiler {
             return Ok(());
         }
 
-        let (is_logical, plain_op) = assign_op_kind(op);
+        let compound = classify_compound_assign(op);
         match &target.kind {
-            ExprKind::Ident(name) => {
-                if is_logical {
+            ExprKind::Ident(name) => match compound {
+                CompoundAssignOp::Logical(jump_op) => {
                     self.emit_get_var(name, line);
-                    let j = self.emit_jump(logical_assign_jump(op), line);
+                    let j = self.emit_jump(jump_op, line);
                     self.emit(OpCode::Pop, line);
                     self.compile_expr(value)?;
                     self.emit_set_var(name, line);
                     let end = self.cur_addr();
                     self.patch_jump(j, end);
-                } else {
+                }
+                CompoundAssignOp::Binary(plain_op) => {
                     self.emit_get_var(name, line);
                     self.compile_expr(value)?;
-                    self.emit(plain_op.unwrap(), line);
+                    self.emit(plain_op, line);
                     self.emit_set_var(name, line);
                 }
-            }
+            },
             ExprKind::Member { obj, prop, .. } => {
                 if let PropertyKey::Computed(ke) = prop {
                     let tmp_obj = self.temp_slot();
@@ -514,33 +517,33 @@ impl Compiler {
                     let tmp_key = self.temp_slot();
                     self.compile_expr(ke)?;
                     self.emit(OpCode::BindLocal(tmp_key), line);
-                    if is_logical {
-                        self.emit(OpCode::GetLocal(tmp_obj), line);
-                        self.emit(OpCode::GetLocal(tmp_key), line);
-                        self.emit(OpCode::GetIndex, line);
-                        let j = self.emit_jump(logical_assign_jump(op), line);
-                        self.emit(OpCode::Pop, line);
-                        self.compile_expr(value)?;
-                        let tmp_new = self.temp_slot();
-                        self.emit(OpCode::BindLocal(tmp_new), line);
-                        self.emit(OpCode::GetLocal(tmp_obj), line);
-                        self.emit(OpCode::GetLocal(tmp_key), line);
-                        self.emit(OpCode::GetLocal(tmp_new), line);
-                        self.emit(OpCode::SetIndex, line);
-                        let end = self.cur_addr();
-                        self.patch_jump(j, end);
-                    } else {
-                        self.emit(OpCode::GetLocal(tmp_obj), line);
-                        self.emit(OpCode::GetLocal(tmp_key), line);
-                        self.emit(OpCode::GetIndex, line);
-                        self.compile_expr(value)?;
-                        self.emit(plain_op.unwrap(), line);
-                        let tmp_new = self.temp_slot();
-                        self.emit(OpCode::BindLocal(tmp_new), line);
-                        self.emit(OpCode::GetLocal(tmp_obj), line);
-                        self.emit(OpCode::GetLocal(tmp_key), line);
-                        self.emit(OpCode::GetLocal(tmp_new), line);
-                        self.emit(OpCode::SetIndex, line);
+                    self.emit(OpCode::GetLocal(tmp_obj), line);
+                    self.emit(OpCode::GetLocal(tmp_key), line);
+                    self.emit(OpCode::GetIndex, line);
+                    match compound {
+                        CompoundAssignOp::Logical(jump_op) => {
+                            let j = self.emit_jump(jump_op, line);
+                            self.emit(OpCode::Pop, line);
+                            self.compile_expr(value)?;
+                            let tmp_new = self.temp_slot();
+                            self.emit(OpCode::BindLocal(tmp_new), line);
+                            self.emit(OpCode::GetLocal(tmp_obj), line);
+                            self.emit(OpCode::GetLocal(tmp_key), line);
+                            self.emit(OpCode::GetLocal(tmp_new), line);
+                            self.emit(OpCode::SetIndex, line);
+                            let end = self.cur_addr();
+                            self.patch_jump(j, end);
+                        }
+                        CompoundAssignOp::Binary(plain_op) => {
+                            self.compile_expr(value)?;
+                            self.emit(plain_op, line);
+                            let tmp_new = self.temp_slot();
+                            self.emit(OpCode::BindLocal(tmp_new), line);
+                            self.emit(OpCode::GetLocal(tmp_obj), line);
+                            self.emit(OpCode::GetLocal(tmp_key), line);
+                            self.emit(OpCode::GetLocal(tmp_new), line);
+                            self.emit(OpCode::SetIndex, line);
+                        }
                     }
                     return Ok(());
                 }
@@ -549,24 +552,25 @@ impl Compiler {
                 let tmp_obj = self.temp_slot();
                 self.compile_expr(obj)?;
                 self.emit(OpCode::BindLocal(tmp_obj), line);
-                if is_logical {
-                    self.emit(OpCode::GetLocal(tmp_obj), line);
-                    self.emit(OpCode::GetProp(c), line);
-                    let j = self.emit_jump(logical_assign_jump(op), line);
-                    self.emit(OpCode::Pop, line);
-                    self.emit(OpCode::GetLocal(tmp_obj), line);
-                    self.compile_expr(value)?;
-                    self.emit(OpCode::SetProp(c), line);
-                    let end = self.cur_addr();
-                    self.patch_jump(j, end);
-                } else {
-                    self.emit(OpCode::GetLocal(tmp_obj), line);
-                    self.emit(OpCode::GetProp(c), line);
-                    self.compile_expr(value)?;
-                    self.emit(plain_op.unwrap(), line);
-                    self.emit(OpCode::GetLocal(tmp_obj), line);
-                    self.emit(OpCode::Swap, line);
-                    self.emit(OpCode::SetProp(c), line);
+                self.emit(OpCode::GetLocal(tmp_obj), line);
+                self.emit(OpCode::GetProp(c), line);
+                match compound {
+                    CompoundAssignOp::Logical(jump_op) => {
+                        let j = self.emit_jump(jump_op, line);
+                        self.emit(OpCode::Pop, line);
+                        self.emit(OpCode::GetLocal(tmp_obj), line);
+                        self.compile_expr(value)?;
+                        self.emit(OpCode::SetProp(c), line);
+                        let end = self.cur_addr();
+                        self.patch_jump(j, end);
+                    }
+                    CompoundAssignOp::Binary(plain_op) => {
+                        self.compile_expr(value)?;
+                        self.emit(plain_op, line);
+                        self.emit(OpCode::GetLocal(tmp_obj), line);
+                        self.emit(OpCode::Swap, line);
+                        self.emit(OpCode::SetProp(c), line);
+                    }
                 }
             }
             _ => return Err(err(line, "代入の左辺として使えない式です")),
@@ -713,31 +717,30 @@ impl Compiler {
     }
 }
 
-fn logical_assign_jump(op: AssignOp) -> fn(JumpAddr) -> OpCode {
-    match op {
-        AssignOp::AndAssign => OpCode::JumpIfFalsyKeep,
-        AssignOp::OrAssign => OpCode::JumpIfTruthyKeep,
-        AssignOp::NullishAssign => OpCode::JumpIfNotNullishKeep,
-        _ => unreachable!(),
-    }
+/// 複合代入演算子の分類（論理短絡ジャンプか、二項演算命令か）。
+enum CompoundAssignOp {
+    Logical(fn(JumpAddr) -> OpCode),
+    Binary(OpCode),
 }
 
-fn assign_op_kind(op: AssignOp) -> (bool, Option<OpCode>) {
+fn classify_compound_assign(op: AssignOp) -> CompoundAssignOp {
     match op {
-        AssignOp::AddAssign => (false, Some(OpCode::Add)),
-        AssignOp::SubAssign => (false, Some(OpCode::Sub)),
-        AssignOp::MulAssign => (false, Some(OpCode::Mul)),
-        AssignOp::DivAssign => (false, Some(OpCode::Div)),
-        AssignOp::ModAssign => (false, Some(OpCode::Mod)),
-        AssignOp::PowAssign => (false, Some(OpCode::Pow)),
-        AssignOp::ShlAssign => (false, Some(OpCode::Shl)),
-        AssignOp::ShrAssign => (false, Some(OpCode::Shr)),
-        AssignOp::UShrAssign => (false, Some(OpCode::UShr)),
-        AssignOp::BitAndAssign => (false, Some(OpCode::BitAnd)),
-        AssignOp::BitOrAssign => (false, Some(OpCode::BitOr)),
-        AssignOp::BitXorAssign => (false, Some(OpCode::BitXor)),
-        AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => (true, None),
-        AssignOp::Assign => unreachable!(),
+        AssignOp::AddAssign => CompoundAssignOp::Binary(OpCode::Add),
+        AssignOp::SubAssign => CompoundAssignOp::Binary(OpCode::Sub),
+        AssignOp::MulAssign => CompoundAssignOp::Binary(OpCode::Mul),
+        AssignOp::DivAssign => CompoundAssignOp::Binary(OpCode::Div),
+        AssignOp::ModAssign => CompoundAssignOp::Binary(OpCode::Mod),
+        AssignOp::PowAssign => CompoundAssignOp::Binary(OpCode::Pow),
+        AssignOp::ShlAssign => CompoundAssignOp::Binary(OpCode::Shl),
+        AssignOp::ShrAssign => CompoundAssignOp::Binary(OpCode::Shr),
+        AssignOp::UShrAssign => CompoundAssignOp::Binary(OpCode::UShr),
+        AssignOp::BitAndAssign => CompoundAssignOp::Binary(OpCode::BitAnd),
+        AssignOp::BitOrAssign => CompoundAssignOp::Binary(OpCode::BitOr),
+        AssignOp::BitXorAssign => CompoundAssignOp::Binary(OpCode::BitXor),
+        AssignOp::AndAssign => CompoundAssignOp::Logical(OpCode::JumpIfFalsyKeep),
+        AssignOp::OrAssign => CompoundAssignOp::Logical(OpCode::JumpIfTruthyKeep),
+        AssignOp::NullishAssign => CompoundAssignOp::Logical(OpCode::JumpIfNotNullishKeep),
+        AssignOp::Assign => unreachable!("単純代入は呼び出し側で処理済み"),
     }
 }
 

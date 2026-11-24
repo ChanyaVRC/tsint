@@ -3,7 +3,10 @@
 use std::borrow::Cow;
 use std::rc::Rc;
 
-use super::regex::{build_match_array, coerce_to_regex, regex_err, regex_split, string_replace};
+use super::regex::{
+    as_regex, build_match_array, coerce_to_regex, next_search_pos, regex_err, regex_split,
+    string_replace,
+};
 use super::{
     chars_slice_to_val, native, norm_index, value_as_cow_str, with_chars_buf, with_regex_scratch,
 };
@@ -128,15 +131,11 @@ pub(super) fn call_string_method(
                     out.truncate(limit);
                     Ok(vm.alloc_array(out))
                 }
-                Some(Value::Object(o)) if matches!(o.borrow().kind, ObjKind::Regex(_)) => {
-                    let re = match &o.borrow().kind {
-                        ObjKind::Regex(r) => r.clone(),
-                        _ => unreachable!(),
-                    };
-                    let items = regex_split(vm, &re, &s, limit)?;
-                    Ok(vm.alloc_array(items))
-                }
                 Some(sep) => {
+                    if let Some(re) = as_regex(sep) {
+                        let items = regex_split(vm, &re, &s, limit)?;
+                        return Ok(vm.alloc_array(items));
+                    }
                     let sep_s = value_as_cow_str(sep);
                     let out: Vec<Value> = if sep_s.is_empty() {
                         if s.is_ascii() {
@@ -244,11 +243,7 @@ pub(super) fn call_string_method(
                             {
                                 Some(mat) => {
                                     out.push(chars_slice_to_val(&chars[mat.start..mat.end]));
-                                    from = if mat.end == mat.start {
-                                        mat.end + 1
-                                    } else {
-                                        mat.end
-                                    };
+                                    from = next_search_pos(&mat);
                                 }
                                 None => break,
                             }

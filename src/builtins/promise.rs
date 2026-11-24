@@ -1,18 +1,24 @@
 //! Promise コンストラクタ・静的メソッドおよび `Promise.prototype` メソッド（T3）。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use super::{arg, native};
+use super::{arg, arg_ref, native};
 use crate::value::*;
 use crate::vm::{is_callable, Vm};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettleMode {
+    Resolve,
+    Reject,
+}
 
 pub(super) fn install_promise(vm: &mut Vm) {
     let ctor = native("Promise", 1, |vm, _this, args| {
         let executor = arg(args, 0);
         let (promise_val, promise_obj) = vm.new_pending_promise();
-        let resolve_fn = settle_forward_fn(vm, promise_obj.clone(), false);
-        let reject_fn = settle_forward_fn(vm, promise_obj.clone(), true);
+        let resolve_fn = settle_forward_fn(vm, promise_obj.clone(), SettleMode::Resolve);
+        let reject_fn = settle_forward_fn(vm, promise_obj.clone(), SettleMode::Reject);
         if let Err(e) = vm.call_value(executor, Value::Undefined, &[resolve_fn, reject_fn]) {
             vm.settle_promise(promise_obj, Err(e));
         }
@@ -35,13 +41,13 @@ pub(super) fn install_promise(vm: &mut Vm) {
         Ok(v)
     });
     let race = native("race", 1, |vm, _this, args| {
-        let items = vm.materialize_iter_array(&arg(args, 0))?;
+        let items = vm.materialize_iter_array(arg_ref(args, 0))?;
         let (result_val, result_obj) = vm.new_pending_promise();
         let (_, dummy) = vm.new_pending_promise();
         for item in items {
             let p = vm.coerce_to_promise(item);
-            let on_fulfilled = settle_forward_fn(vm, result_obj.clone(), false);
-            let on_rejected = settle_forward_fn(vm, result_obj.clone(), true);
+            let on_fulfilled = settle_forward_fn(vm, result_obj.clone(), SettleMode::Resolve);
+            let on_rejected = settle_forward_fn(vm, result_obj.clone(), SettleMode::Reject);
             vm.add_promise_reaction(
                 &p,
                 PromiseReaction::Then {
@@ -54,35 +60,40 @@ pub(super) fn install_promise(vm: &mut Vm) {
         Ok(result_val)
     });
     let all = native("all", 1, |vm, _this, args| {
-        let items = vm.materialize_iter_array(&arg(args, 0))?;
+        let items = vm.materialize_iter_array(arg_ref(args, 0))?;
         let (result_val, result_obj) = vm.new_pending_promise();
         if items.is_empty() {
-            vm.resolve_promise(result_obj, Value::new_array(Vec::new()));
+            let empty = vm.alloc_array(Vec::new());
+            vm.resolve_promise(result_obj, empty);
             return Ok(result_val);
         }
         let total = items.len();
         let results: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(vec![Value::Undefined; total]));
-        let remaining: Rc<RefCell<usize>> = Rc::new(RefCell::new(total));
+        let remaining = Rc::new(Cell::new(total));
         let (_, dummy) = vm.new_pending_promise();
         for (i, item) in items.into_iter().enumerate() {
             let p = vm.coerce_to_promise(item);
             let results_c = results.clone();
             let remaining_c = remaining.clone();
-            let result_obj_c = result_obj.clone();
-            let on_fulfilled = native("", 1, move |vm, _this, args| {
-                results_c.borrow_mut()[i] = arg(args, 0);
-                *remaining_c.borrow_mut() -= 1;
-                if *remaining_c.borrow() == 0 {
-                    let arr = Value::new_array(results_c.borrow().clone());
-                    vm.resolve_promise(result_obj_c.clone(), arr);
-                }
-                Ok(Value::Undefined)
-            });
-            let result_obj_r = result_obj.clone();
-            let on_rejected = native("", 1, move |vm, _this, args| {
-                vm.settle_promise(result_obj_r.clone(), Err(arg(args, 0)));
-                Ok(Value::Undefined)
-            });
+            let result_weak = Rc::downgrade(&result_obj);
+            let on_fulfilled = vm.alloc_native_with_captures(
+                "",
+                1,
+                vec![result_obj.clone()],
+                Rc::new(move |vm, _this, args| {
+                    results_c.borrow_mut()[i] = arg(args, 0);
+                    let rem = remaining_c.get().saturating_sub(1);
+                    remaining_c.set(rem);
+                    if rem == 0 {
+                        if let Some(target) = result_weak.upgrade() {
+                            let arr = vm.alloc_array(std::mem::take(&mut *results_c.borrow_mut()));
+                            vm.resolve_promise(target, arr);
+                        }
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            let on_rejected = settle_forward_fn(vm, result_obj.clone(), SettleMode::Reject);
             vm.add_promise_reaction(
                 &p,
                 PromiseReaction::Then {
@@ -105,8 +116,8 @@ pub(super) fn install_promise(vm: &mut Vm) {
 }
 
 /// 引数の値/例外で `target` を確定させ、戻り値は捨てるネイティブ関数を生成する
-/// （`new Promise` の resolve/reject および `Promise.race` で共通利用）。
-fn settle_forward_fn(vm: &Vm, target: ObjRef, is_reject: bool) -> Value {
+/// （`new Promise` の resolve/reject および `Promise.race` / `Promise.all` で共通利用）。
+fn settle_forward_fn(vm: &Vm, target: ObjRef, mode: SettleMode) -> Value {
     let weak = Rc::downgrade(&target);
     vm.alloc_native_with_captures(
         "",
@@ -115,10 +126,9 @@ fn settle_forward_fn(vm: &Vm, target: ObjRef, is_reject: bool) -> Value {
         Rc::new(move |vm, _this, args| {
             if let Some(t) = weak.upgrade() {
                 let v = arg(args, 0);
-                if is_reject {
-                    vm.settle_promise(t, Err(v));
-                } else {
-                    vm.resolve_promise(t, v);
+                match mode {
+                    SettleMode::Resolve => vm.resolve_promise(t, v),
+                    SettleMode::Reject => vm.settle_promise(t, Err(v)),
                 }
             }
             Ok(Value::Undefined)

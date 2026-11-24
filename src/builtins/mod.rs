@@ -65,6 +65,11 @@ pub(super) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
 }
 
+#[inline]
+pub(super) fn arg_ref(args: &[Value], i: usize) -> &Value {
+    args.get(i).unwrap_or(&Value::Undefined)
+}
+
 pub(super) fn native(
     name: &str,
     arity: usize,

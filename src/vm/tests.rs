@@ -451,3 +451,47 @@ fn gc_preserves_suspended_async_task_waiting_on_external_host_promise() {
     let res = interp2.vm().get_prop(&box_obj, "result").unwrap();
     assert!(matches!(res, Value::Number(n) if n == 42.0), "got {res:?}");
 }
+
+#[test]
+fn vm_drop_reclaims_cycles_and_preserves_external_values() {
+    let weak_cycle: Weak<RefCell<ObjData>>;
+    let held_external: Value;
+    {
+        let mut interp = Interpreter::new();
+        interp.vm().set_gc_threshold(100_000);
+        let exports = run_exports(
+            &mut interp,
+            r#"
+                const cycleA: any = { tag: "leaked" };
+                const cycleB: any = { peer: cycleA };
+                cycleA.peer = cycleB;
+
+                const keep: any = { tag: "alive" };
+                keep.self = keep;
+
+                export const leaked = cycleA;
+                export const kept = keep;
+            "#,
+        );
+        let leaked = export_val(&exports, "leaked");
+        weak_cycle = Rc::downgrade(leaked.as_object().expect("leaked is object"));
+        held_external = export_val(&exports, "kept");
+        drop(leaked);
+        drop(exports);
+        // ここではまだ GC が走っていないため cycleA は生存中。
+        assert!(weak_cycle.upgrade().is_some());
+    }
+    // Interpreter/Vm の Drop 時に到達不能な循環ゴミが自動回収される。
+    assert!(
+        weak_cycle.upgrade().is_none(),
+        "Vm::drop 後は到達不能な循環オブジェクトが解放されているべき"
+    );
+    // 外部 Rust コードが保持し続けている Value は破壊されず読み取れる。
+    let obj = held_external.as_object().expect("kept is still an object");
+    assert!(matches!(
+        obj.borrow().props.get("tag"),
+        Some(PropSlot::Value(Value::Str(ref s))) if &**s == "alive"
+    ));
+    // テスト終了時に循環参照を明示的に切断してリークを残さない。
+    obj.borrow_mut().props.clear();
+}

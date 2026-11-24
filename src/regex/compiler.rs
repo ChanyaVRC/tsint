@@ -1,7 +1,7 @@
 //! AST → フラットな命令列 (`Inst`) コンパイラ。
 
 use super::charclass::CharClass;
-use super::parser::Ast;
+use super::parser::{Ast, LookaheadKind, QuantifierMode, WordBoundary};
 
 #[derive(Debug, Clone)]
 pub(super) enum Inst {
@@ -14,16 +14,16 @@ pub(super) enum Inst {
     Match,
     Bol,
     Eol,
-    WordB(bool),
+    WordB(WordBoundary),
     Backref(usize),
     /// 先読み。`sub_pc` から始まるサブプログラム（`Inst::Match` で終わる）を
-    /// 現在位置 `sp` から試し、成否（`negate` で反転）を判定してから
+    /// 現在位置 `sp` から試し、成否（`kind`）を判定してから
     /// `after_pc`（サブプログラムの直後ではなく、先読みブロック全体の直後）
     /// へ進む。
     Look {
         sub_pc: usize,
         after_pc: usize,
-        negate: bool,
+        kind: LookaheadKind,
     },
     /// 無制限（`*`/`+`/`{n,}`）ループの「もう1周するか、抜けるか」の判定。
     LoopBack {
@@ -66,14 +66,23 @@ impl Compiler {
         s
     }
 
-    fn patch_split(&mut self, split_pc: usize, body_start: usize, after: usize, greedy: bool) {
+    fn patch_split(
+        &mut self,
+        split_pc: usize,
+        body_start: usize,
+        after: usize,
+        mode: QuantifierMode,
+    ) {
         if let Inst::Split(ref mut a, ref mut b) = self.prog[split_pc] {
-            if greedy {
-                *a = body_start;
-                *b = after;
-            } else {
-                *a = after;
-                *b = body_start;
+            match mode {
+                QuantifierMode::Greedy => {
+                    *a = body_start;
+                    *b = after;
+                }
+                QuantifierMode::Lazy => {
+                    *a = after;
+                    *b = body_start;
+                }
             }
         }
     }
@@ -126,24 +135,24 @@ impl Compiler {
                 self.emit(Inst::Save(idx * 2 + 1));
             }
             Ast::NonCap(inner) => self.compile(inner),
-            Ast::Repeat(inner, min, max, greedy) => self.compile_repeat(inner, *min, *max, *greedy),
+            Ast::Repeat(inner, min, max, mode) => self.compile_repeat(inner, *min, *max, *mode),
             Ast::Start => {
                 self.emit(Inst::Bol);
             }
             Ast::End => {
                 self.emit(Inst::Eol);
             }
-            Ast::WordB(b) => {
-                self.emit(Inst::WordB(*b));
+            Ast::WordB(wb) => {
+                self.emit(Inst::WordB(*wb));
             }
             Ast::Backref(n) => {
                 self.emit(Inst::Backref(*n));
             }
-            Ast::Look(inner, negate) => {
+            Ast::Look(inner, kind) => {
                 let look_pc = self.emit(Inst::Look {
                     sub_pc: 0,
                     after_pc: 0,
-                    negate: *negate,
+                    kind: *kind,
                 });
                 let sub_start = self.here();
                 self.compile(inner);
@@ -163,21 +172,21 @@ impl Compiler {
     }
 
     /// 量指定子本体を地続きの命令列としてインライン展開する。
-    fn compile_repeat(&mut self, inner: &Ast, min: u32, max: Option<u32>, greedy: bool) {
+    fn compile_repeat(&mut self, inner: &Ast, min: u32, max: Option<u32>, mode: QuantifierMode) {
         for _ in 0..min {
             self.compile(inner);
         }
         match max {
             Some(m) => {
                 let extra = m.saturating_sub(min);
-                self.compile_optional_chain(inner, extra, greedy);
+                self.compile_optional_chain(inner, extra, mode);
             }
-            None => self.compile_unbounded_loop(inner, greedy),
+            None => self.compile_unbounded_loop(inner, mode),
         }
     }
 
     /// 「あってもなくても良い」コピーを `remaining` 個、入れ子の `Split` で展開する。
-    fn compile_optional_chain(&mut self, inner: &Ast, remaining: u32, greedy: bool) {
+    fn compile_optional_chain(&mut self, inner: &Ast, remaining: u32, mode: QuantifierMode) {
         if remaining == 0 {
             return;
         }
@@ -190,12 +199,12 @@ impl Compiler {
         }
         let after = self.here();
         for (split_pc, body_start) in splits {
-            self.patch_split(split_pc, body_start, after, greedy);
+            self.patch_split(split_pc, body_start, after, mode);
         }
     }
 
     /// `*`/`+`/`{n,}` の無制限部分（Kleene 的ループ）。
-    fn compile_unbounded_loop(&mut self, inner: &Ast, greedy: bool) {
+    fn compile_unbounded_loop(&mut self, inner: &Ast, mode: QuantifierMode) {
         let mark_slot = self.alloc_scratch();
         let split_pc = self.emit(Inst::Split(0, 0));
         let body_start = self.here();
@@ -206,6 +215,6 @@ impl Compiler {
             loop_pc: split_pc,
         });
         let after = self.here();
-        self.patch_split(split_pc, body_start, after, greedy);
+        self.patch_split(split_pc, body_start, after, mode);
     }
 }

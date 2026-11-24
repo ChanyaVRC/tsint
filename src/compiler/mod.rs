@@ -32,6 +32,8 @@ impl std::fmt::Display for CompileError {
     }
 }
 
+impl std::error::Error for CompileError {}
+
 pub(super) type CResult<T> = Result<T, CompileError>;
 
 pub(super) fn err(line: u32, msg: impl Into<String>) -> CompileError {
@@ -121,7 +123,7 @@ impl FuncCtx {
             .map(|l| l.slot)
     }
 
-    pub(super) fn get_or_make_exc_slot(&mut self) -> LocalIdx {
+    pub(super) fn exc_slot(&mut self) -> LocalIdx {
         if let Some(s) = self.exc_slot {
             return s;
         }
@@ -195,20 +197,28 @@ pub fn compile_module(module: &Module) -> CResult<Rc<Chunk>> {
 }
 
 fn collect_exports(c: &mut Compiler, s: &Stmt) -> CResult<()> {
+    let line = s.span.start.line;
     match &s.kind {
-        StmtKind::ExportDecl(inner) => {
-            let names: Vec<String> = match &inner.kind {
-                StmtKind::VarDecl { decls, .. } => {
-                    decls.iter().flat_map(|d| pattern_names(&d.name)).collect()
+        StmtKind::ExportDecl(inner) => match &inner.kind {
+            StmtKind::VarDecl { decls, .. } => {
+                for d in decls {
+                    for n in pattern_names(&d.name) {
+                        register_export(c, n, n, line)?;
+                    }
                 }
-                StmtKind::FunctionDecl(f) => f.name.clone().into_iter().collect(),
-                StmtKind::ClassDecl(cl) => cl.name.clone().into_iter().collect(),
-                _ => Vec::new(),
-            };
-            for n in names {
-                register_export(c, &n, &n, s.span.start.line)?;
             }
-        }
+            StmtKind::FunctionDecl(f) => {
+                if let Some(n) = f.name.as_deref() {
+                    register_export(c, n, n, line)?;
+                }
+            }
+            StmtKind::ClassDecl(cl) => {
+                if let Some(n) = cl.name.as_deref() {
+                    register_export(c, n, n, line)?;
+                }
+            }
+            _ => {}
+        },
         StmtKind::ExportNamed {
             specifiers,
             source: None,
@@ -216,10 +226,10 @@ fn collect_exports(c: &mut Compiler, s: &Stmt) -> CResult<()> {
         } => {
             for spec in specifiers {
                 let ExportSpecifier::Named { local, exported } = spec;
-                register_export(c, local, exported, s.span.start.line)?;
+                register_export(c, local, exported, line)?;
             }
         }
-        StmtKind::ExportDefault(_) => register_export(c, "default", "default", s.span.start.line)?,
+        StmtKind::ExportDefault(_) => register_export(c, "default", "default", line)?,
         _ => {}
     }
     Ok(())
@@ -256,7 +266,7 @@ pub fn compile_dynamic_function(param_names: &[String], body_src: &str) -> CResu
     };
 
     let mut c = Compiler { funcs: Vec::new() };
-    let template = c.compile_function(func_expr, "anonymous", false)?;
+    let template = c.compile_function(func_expr, "anonymous")?;
     Ok(template.chunk.clone())
 }
 
@@ -361,24 +371,9 @@ impl Compiler {
 
     pub(super) fn patch_jump(&mut self, idx: usize, target: u32) {
         let op = &mut self.cur().chunk.code[idx];
-        *op = match *op {
-            OpCode::Jump(_) => OpCode::Jump(target),
-            OpCode::JumpIfFalse(_) => OpCode::JumpIfFalse(target),
-            OpCode::JumpIfTrue(_) => OpCode::JumpIfTrue(target),
-            OpCode::LtJumpIfFalse(_) => OpCode::LtJumpIfFalse(target),
-            OpCode::LtEqJumpIfFalse(_) => OpCode::LtEqJumpIfFalse(target),
-            OpCode::GtJumpIfFalse(_) => OpCode::GtJumpIfFalse(target),
-            OpCode::GtEqJumpIfFalse(_) => OpCode::GtEqJumpIfFalse(target),
-            OpCode::StrictEqJumpIfFalse(_) => OpCode::StrictEqJumpIfFalse(target),
-            OpCode::StrictNotEqJumpIfFalse(_) => OpCode::StrictNotEqJumpIfFalse(target),
-            OpCode::JumpIfNullish(_) => OpCode::JumpIfNullish(target),
-            OpCode::JumpIfNullishCall(_) => OpCode::JumpIfNullishCall(target),
-            OpCode::JumpIfFalsyKeep(_) => OpCode::JumpIfFalsyKeep(target),
-            OpCode::JumpIfTruthyKeep(_) => OpCode::JumpIfTruthyKeep(target),
-            OpCode::JumpIfNotNullishKeep(_) => OpCode::JumpIfNotNullishKeep(target),
-            OpCode::JumpIfNotUndefinedKeep(_) => OpCode::JumpIfNotUndefinedKeep(target),
-            other => panic!("patch_jump: ジャンプ命令ではありません: {other:?}"),
-        };
+        *op = op
+            .with_jump_target(target)
+            .unwrap_or_else(|| panic!("patch_jump: ジャンプ命令ではありません: {op:?}"));
     }
 
     pub(super) fn declare_local(&mut self, name: &str) -> LocalIdx {

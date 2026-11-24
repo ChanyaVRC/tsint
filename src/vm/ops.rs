@@ -96,6 +96,9 @@ pub fn to_primitive(v: &Value) -> Value {
     }
 }
 
+/// 整数フォーマット高速パスを使う `f64` の絶対値上限（`i64` キャストで精度欠落しない範囲）。
+const FAST_INT_FORMAT_LIMIT: f64 = 1e15;
+
 pub(crate) fn number_to_js_string_into(n: f64, out: &mut String) {
     use std::fmt::Write;
     if n.is_nan() {
@@ -114,7 +117,7 @@ pub(crate) fn number_to_js_string_into(n: f64, out: &mut String) {
         out.push('0');
         return;
     }
-    if n.fract() == 0.0 && n.abs() < 1e15 {
+    if n.fract() == 0.0 && n.abs() < FAST_INT_FORMAT_LIMIT {
         let _ = write!(out, "{}", n as i64);
         return;
     }
@@ -196,15 +199,15 @@ pub fn to_string_basic(v: &Value) -> String {
                 ObjKind::Class(c) => format!("class {} {{ }}", c.name),
                 ObjKind::Error => {
                     let name = match b.props.get("name") {
-                        Some(PropSlot::Value(Value::Str(s))) => s.to_string(),
-                        _ => "Error".to_string(),
+                        Some(PropSlot::Value(Value::Str(s))) => &**s,
+                        _ => "Error",
                     };
                     let msg = match b.props.get("message") {
-                        Some(PropSlot::Value(Value::Str(s))) => s.to_string(),
-                        _ => String::new(),
+                        Some(PropSlot::Value(Value::Str(s))) => &**s,
+                        _ => "",
                     };
                     if msg.is_empty() {
-                        name
+                        name.to_string()
                     } else {
                         format!("{name}: {msg}")
                     }

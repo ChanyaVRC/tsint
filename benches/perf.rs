@@ -22,20 +22,28 @@ struct CountingAlloc;
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// SAFETY: `CountingAlloc` delegates every allocation operation directly to `std::alloc::System`,
+// which satisfies all `GlobalAlloc` layout, alignment, and thread-safety guarantees. The atomic
+// counter updates (`Ordering::Relaxed`) are lock-free and never allocate, so re-entrancy cannot occur.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: Caller upholds `GlobalAlloc::alloc` preconditions (non-zero size layout).
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` was allocated by `System.alloc`/`System.realloc` via this allocator
+        // with the same `layout`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        // SAFETY: Caller upholds `GlobalAlloc::realloc` preconditions (`ptr` was allocated by
+        // `System` with `layout`, and `new_size` is non-zero and valid for `layout.align()`).
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }

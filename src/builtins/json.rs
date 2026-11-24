@@ -28,7 +28,7 @@ pub(super) fn install_json(vm: &mut Vm) {
     });
     let parse = native("parse", 1, |vm, _this, args| {
         let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-        json_parse(vm, &s).map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))
+        json_parse(vm, &s).map_err(|e| vm.syntax_error(format!("JSON.parse: {e}")))
     });
     if let Value::Object(o) = &json {
         let mut b = o.borrow_mut();
@@ -179,13 +179,24 @@ fn json_stringify_into(v: &Value, indent: usize, depth: usize, out: &mut String)
     }
 }
 
+#[derive(Debug)]
+struct JsonError(String);
+
+impl std::fmt::Display for JsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for JsonError {}
+
 struct JsonParser<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
 }
 
-fn json_parse(vm: &Vm, s: &str) -> Result<Value, String> {
+fn json_parse(vm: &Vm, s: &str) -> Result<Value, JsonError> {
     let mut p = JsonParser {
         src: s,
         bytes: s.as_bytes(),
@@ -195,7 +206,7 @@ fn json_parse(vm: &Vm, s: &str) -> Result<Value, String> {
     let v = p.parse_value(vm)?;
     p.skip_ws();
     if p.pos != p.bytes.len() {
-        return Err("末尾に余分な文字があります".to_string());
+        return Err(JsonError("末尾に余分な文字があります".to_string()));
     }
     Ok(v)
 }
@@ -212,7 +223,9 @@ impl<'a> JsonParser<'a> {
             if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
                 self.pos += 1;
             } else if b >= 0x80 {
-                let ch = self.src[self.pos..].chars().next().unwrap();
+                let Some(ch) = self.src[self.pos..].chars().next() else {
+                    break;
+                };
                 if ch.is_whitespace() {
                     self.pos += ch.len_utf8();
                 } else {
@@ -225,19 +238,19 @@ impl<'a> JsonParser<'a> {
     }
 
     #[inline]
-    fn expect(&mut self, c: u8) -> Result<(), String> {
+    fn expect(&mut self, c: u8) -> Result<(), JsonError> {
         if self.peek() == Some(c) {
             self.pos += 1;
             Ok(())
         } else {
-            Err(format!(
+            Err(JsonError(format!(
                 "'{}' を期待しました（位置 {}）",
                 c as char, self.pos
-            ))
+            )))
         }
     }
 
-    fn parse_value(&mut self, vm: &Vm) -> Result<Value, String> {
+    fn parse_value(&mut self, vm: &Vm) -> Result<Value, JsonError> {
         self.skip_ws();
         match self.peek() {
             Some(b'{') => self.parse_object(vm),
@@ -256,24 +269,24 @@ impl<'a> JsonParser<'a> {
                 Ok(Value::Null)
             }
             Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
-            _ => Err(format!("値を期待しました（位置 {}）", self.pos)),
+            _ => Err(JsonError(format!("値を期待しました（位置 {}）", self.pos))),
         }
     }
 
-    fn expect_word(&mut self, w: &[u8]) -> Result<(), String> {
+    fn expect_word(&mut self, w: &[u8]) -> Result<(), JsonError> {
         if self.bytes[self.pos..].starts_with(w) {
             self.pos += w.len();
             Ok(())
         } else {
-            Err(format!(
+            Err(JsonError(format!(
                 "'{}' を期待しました（位置 {}）",
                 std::str::from_utf8(w).unwrap_or(""),
                 self.pos
-            ))
+            )))
         }
     }
 
-    fn parse_object(&mut self, vm: &Vm) -> Result<Value, String> {
+    fn parse_object(&mut self, vm: &Vm) -> Result<Value, JsonError> {
         self.expect(b'{')?;
         let mut obj_data = ObjData::new(ObjKind::Plain);
         self.skip_ws();
@@ -297,13 +310,18 @@ impl<'a> JsonParser<'a> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(format!("',' か '}}' を期待しました（位置 {}）", self.pos)),
+                _ => {
+                    return Err(JsonError(format!(
+                        "',' か '}}' を期待しました（位置 {}）",
+                        self.pos
+                    )))
+                }
             }
         }
         Ok(vm.alloc_obj(obj_data))
     }
 
-    fn parse_array(&mut self, vm: &Vm) -> Result<Value, String> {
+    fn parse_array(&mut self, vm: &Vm) -> Result<Value, JsonError> {
         self.expect(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
@@ -323,13 +341,18 @@ impl<'a> JsonParser<'a> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(format!("',' か ']' を期待しました（位置 {}）", self.pos)),
+                _ => {
+                    return Err(JsonError(format!(
+                        "',' か ']' を期待しました（位置 {}）",
+                        self.pos
+                    )))
+                }
             }
         }
         Ok(vm.alloc_array(items))
     }
 
-    fn parse_string_rc(&mut self) -> Result<Rc<str>, String> {
+    fn parse_string_rc(&mut self) -> Result<Rc<str>, JsonError> {
         self.expect(b'"')?;
         let start = self.pos;
         // エスケープ無しの高速パス（大半の JSON 文字列・キーがここに落ちる）
@@ -348,7 +371,7 @@ impl<'a> JsonParser<'a> {
         out.push_str(&self.src[start..self.pos]);
         loop {
             match self.peek() {
-                None => return Err("文字列が閉じられていません".to_string()),
+                None => return Err(JsonError("文字列が閉じられていません".to_string())),
                 Some(b'"') => {
                     self.pos += 1;
                     break;
@@ -366,17 +389,17 @@ impl<'a> JsonParser<'a> {
                         Some(b'f') => out.push('\u{c}'),
                         Some(b'u') => {
                             if self.pos + 5 > self.bytes.len() {
-                                return Err("不正な \\u エスケープです".to_string());
+                                return Err(JsonError("不正な \\u エスケープです".to_string()));
                             }
                             let hex = &self.src[self.pos + 1..self.pos + 5];
                             let code = u32::from_str_radix(hex, 16)
-                                .map_err(|_| "不正な \\u エスケープです".to_string())?;
+                                .map_err(|_| JsonError("不正な \\u エスケープです".to_string()))?;
                             if let Some(c) = char::from_u32(code) {
                                 out.push(c);
                             }
                             self.pos += 4;
                         }
-                        _ => return Err("不正なエスケープです".to_string()),
+                        _ => return Err(JsonError("不正なエスケープです".to_string())),
                     }
                     self.pos += 1;
                 }
@@ -396,7 +419,7 @@ impl<'a> JsonParser<'a> {
         Ok(Rc::from(out))
     }
 
-    fn parse_number(&mut self) -> Result<Value, String> {
+    fn parse_number(&mut self) -> Result<Value, JsonError> {
         let start = self.pos;
         let neg = if self.peek() == Some(b'-') {
             self.pos += 1;
@@ -446,6 +469,6 @@ impl<'a> JsonParser<'a> {
         self.src[start..self.pos]
             .parse::<f64>()
             .map(Value::Number)
-            .map_err(|_| "不正な数値です".to_string())
+            .map_err(|_| JsonError("不正な数値です".to_string()))
     }
 }

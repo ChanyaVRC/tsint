@@ -9,6 +9,12 @@ use super::expr::expr_contains_closure;
 use super::pattern::pattern_names;
 use super::{err, CResult, Compiler, Ctrl};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JumpControl {
+    Break,
+    Continue,
+}
+
 impl Compiler {
     /// ブロック（文リスト）を新しいレキシカルスコープでコンパイルする。
     pub(super) fn compile_block_new_scope(&mut self, stmts: &[Stmt]) -> CResult<()> {
@@ -49,7 +55,7 @@ impl Compiler {
             StmtKind::VarDecl { decls, .. } => {
                 for d in decls {
                     for name in pattern_names(&d.name) {
-                        self.declare_local(&name);
+                        self.declare_local(name);
                     }
                 }
             }
@@ -133,7 +139,7 @@ impl Compiler {
                 is_of,
                 ..
             } => self.compile_for_in_of(None, left, right, body, *is_of, line)?,
-            StmtKind::Switch { disc, cases } => self.compile_switch(None, disc, cases, line)?,
+            StmtKind::Switch { disc, cases } => self.compile_switch(disc, cases, line)?,
             StmtKind::Try {
                 block,
                 handler,
@@ -153,8 +159,8 @@ impl Compiler {
                 match d.as_ref() {
                     DefaultExportable::Expr(e) => self.compile_expr(e)?,
                     DefaultExportable::Function(f) => {
-                        let name = f.name.clone().unwrap_or_default();
-                        let tpl = self.compile_function(f, &name, false)?;
+                        let name = f.name.as_deref().unwrap_or("");
+                        let tpl = self.compile_function(f, name)?;
                         let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                         self.emit(OpCode::MakeClosure(c), line);
                     }
@@ -172,11 +178,11 @@ impl Compiler {
     }
 
     fn compile_function_decl_value(&mut self, f: &Function, line: u32) -> CResult<()> {
-        let name = f.name.clone().unwrap_or_default();
-        let template = self.compile_function(f, &name, false)?;
+        let name = f.name.as_deref().unwrap_or("");
+        let template = self.compile_function(f, name)?;
         let cidx = self.add_const(Const::FunctionTemplate(Rc::new(template)));
         self.emit(OpCode::MakeClosure(cidx), line);
-        self.emit_bind_var(&name, line);
+        self.emit_bind_var(name, line);
         Ok(())
     }
 
@@ -240,7 +246,7 @@ impl Compiler {
                 ForInit::VarDecl(kind, decls) => {
                     for d in decls {
                         for name in pattern_names(&d.name) {
-                            let slot = self.declare_local(&name);
+                            let slot = self.declare_local(name);
                             if *kind != ast::VarKind::Var {
                                 per_iter_slots.push(slot);
                             }
@@ -336,7 +342,7 @@ impl Compiler {
             ForInit::VarDecl(_, decls) => {
                 let pat = &decls[0].name;
                 for name in pattern_names(pat) {
-                    self.declare_local(&name);
+                    self.declare_local(name);
                 }
                 self.compile_bind_pattern(pat, line)?;
             }
@@ -417,27 +423,19 @@ impl Compiler {
         }
     }
 
-    fn compile_switch(
-        &mut self,
-        label: Option<Rc<str>>,
-        disc: &Expr,
-        cases: &[SwitchCase],
-        line: u32,
-    ) -> CResult<()> {
+    fn compile_switch(&mut self, disc: &Expr, cases: &[SwitchCase], line: u32) -> CResult<()> {
         self.compile_expr(disc)?;
         let saved_len = self.cur().locals.len();
-        let mut all_stmts: Vec<&Stmt> = Vec::new();
         for c in cases {
             for s in &c.body {
-                all_stmts.push(s);
+                self.hoist_stmt_names(s)?;
             }
         }
-        for s in &all_stmts {
-            self.hoist_stmt_names(s)?;
-        }
-        for s in &all_stmts {
-            if let StmtKind::FunctionDecl(f) = &s.kind {
-                self.compile_function_decl_value(f, s.span.start.line)?;
+        for c in cases {
+            for s in &c.body {
+                if let StmtKind::FunctionDecl(f) = &s.kind {
+                    self.compile_function_decl_value(f, s.span.start.line)?;
+                }
             }
         }
 
@@ -498,34 +496,58 @@ impl Compiler {
                 self.patch_jump(idx, end);
             }
         }
-        let _ = label;
         self.cur().locals.truncate(saved_len);
         Ok(())
     }
 
-    fn compile_break(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
-        let len = self.cur().control.len();
-        let mut i = len;
+    /// コントロールスタックを逆順に辿り、対象エントリの位置と通過した `finally` 節を収集する。
+    fn unwind_control_to(
+        &mut self,
+        kind: JumpControl,
+        label: Option<&str>,
+        line: u32,
+    ) -> CResult<usize> {
+        let is_break = kind == JumpControl::Break;
         let mut finallies: Vec<(usize, Rc<[Stmt]>)> = Vec::new();
-        let target_idx = loop {
-            if i == 0 {
-                return Err(err(line, "break の対象が見つかりません"));
-            }
-            i -= 1;
+        let mut target_idx = None;
+        for i in (0..self.cur().control.len()).rev() {
             match &self.cur().control[i] {
                 Ctrl::TryFinally { finally } => finallies.push((i, finally.clone())),
-                Ctrl::Loop { label: l, .. } if label.is_none() || l.as_deref() == label => break i,
-                Ctrl::Switch { .. } if label.is_none() => break i,
-                Ctrl::Labeled { label: l, .. } if label.is_some() && Some(&**l) == label => {
-                    break i
+                Ctrl::Loop { label: l, .. } if label.is_none() || l.as_deref() == label => {
+                    target_idx = Some(i);
+                    break;
                 }
-                Ctrl::FuncBoundary => return Err(err(line, "break の対象が見つかりません")),
+                Ctrl::Switch { .. } if is_break && label.is_none() => {
+                    target_idx = Some(i);
+                    break;
+                }
+                Ctrl::Labeled { label: l, .. }
+                    if is_break && label.is_some() && Some(&**l) == label =>
+                {
+                    target_idx = Some(i);
+                    break;
+                }
+                Ctrl::FuncBoundary => break,
                 _ => {}
             }
-        };
+        }
+        let target = target_idx.ok_or_else(|| {
+            err(
+                line,
+                match kind {
+                    JumpControl::Break => "break の対象が見つかりません",
+                    JumpControl::Continue => "continue の対象が見つかりません",
+                },
+            )
+        })?;
         for (idx, fb) in &finallies {
             self.compile_finally_copy(*idx, fb)?;
         }
+        Ok(target)
+    }
+
+    fn compile_break(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
+        let target_idx = self.unwind_control_to(JumpControl::Break, label, line)?;
         let jidx = self.emit_jump(OpCode::Jump, line);
         match &mut self.cur().control[target_idx] {
             Ctrl::Loop { break_patches, .. }
@@ -537,24 +559,7 @@ impl Compiler {
     }
 
     fn compile_continue(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
-        let len = self.cur().control.len();
-        let mut i = len;
-        let mut finallies: Vec<(usize, Rc<[Stmt]>)> = Vec::new();
-        let target_idx = loop {
-            if i == 0 {
-                return Err(err(line, "continue の対象が見つかりません"));
-            }
-            i -= 1;
-            match &self.cur().control[i] {
-                Ctrl::TryFinally { finally } => finallies.push((i, finally.clone())),
-                Ctrl::Loop { label: l, .. } if label.is_none() || l.as_deref() == label => break i,
-                Ctrl::FuncBoundary => return Err(err(line, "continue の対象が見つかりません")),
-                _ => {}
-            }
-        };
-        for (idx, fb) in &finallies {
-            self.compile_finally_copy(*idx, fb)?;
-        }
+        let target_idx = self.unwind_control_to(JumpControl::Continue, label, line)?;
         let jidx = self.emit_jump(OpCode::Jump, line);
         if let Ctrl::Loop {
             continue_patches, ..
@@ -622,7 +627,7 @@ impl Compiler {
             let saved_len = self.cur().locals.len();
             if let Some(pat) = &h.param {
                 for name in pattern_names(pat) {
-                    self.declare_local(&name);
+                    self.declare_local(name);
                 }
                 self.compile_bind_pattern(pat, line)?;
             } else {
@@ -643,7 +648,7 @@ impl Compiler {
 
         let unwind_addr = if let Some(fin) = &finally_rc {
             let addr = self.cur_addr();
-            let exc_slot = self.cur().get_or_make_exc_slot();
+            let exc_slot = self.cur().exc_slot();
             self.emit(OpCode::BindLocal(exc_slot), line);
             self.compile_block_new_scope(fin)?;
             self.emit(OpCode::GetLocal(exc_slot), line);

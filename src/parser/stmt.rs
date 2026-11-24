@@ -1,9 +1,15 @@
 //! 文のパース: 宣言・制御構造・class・import/export・TS のアンビエント宣言。
 
-use super::expr::is_keyword_like;
+use super::expr::{is_keyword_like, FnNameMode};
 use super::{PResult, Parser};
 use crate::ast::*;
 use crate::lexer::{Punct, TokenKind};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopJumpKind {
+    Break,
+    Continue,
+}
 
 impl Parser {
     pub(super) fn parse_stmt(&mut self) -> PResult<Stmt> {
@@ -23,13 +29,13 @@ impl Parser {
             "var" | "let" | "const" => self.parse_var_decl_stmt(),
             "function" => {
                 self.bump();
-                let f = self.parse_function_tail(false, false)?;
+                let f = self.parse_function_tail(false, FnNameMode::Required)?;
                 Ok(self.mk_stmt(start, StmtKind::FunctionDecl(Box::new(f))))
             }
             "async" if self.peek_word_is(1, "function") && !self.peek_kind_newline(1) => {
                 self.bump();
                 self.bump();
-                let f = self.parse_function_tail(true, false)?;
+                let f = self.parse_function_tail(true, FnNameMode::Required)?;
                 Ok(self.mk_stmt(start, StmtKind::FunctionDecl(Box::new(f))))
             }
             "class" => {
@@ -44,8 +50,8 @@ impl Parser {
             "try" => self.parse_try_stmt(),
             "throw" => self.parse_throw_stmt(),
             "return" => self.parse_return_stmt(),
-            "break" => self.parse_break_continue(true),
-            "continue" => self.parse_break_continue(false),
+            "break" => self.parse_break_continue(LoopJumpKind::Break),
+            "continue" => self.parse_break_continue(LoopJumpKind::Continue),
             "import" => self.parse_import_stmt(),
             "export" => self.parse_export_stmt(),
             "interface" => {
@@ -208,32 +214,14 @@ impl Parser {
                 self.skip_type()?;
             }
             if self.is_word("of") || self.is_word("in") {
-                let is_of = self.is_word("of");
-                self.bump();
-                let right = if is_of {
-                    self.parse_assign_expr()?
-                } else {
-                    self.parse_expr()?
-                };
-                self.expect_punct(Punct::RParen)?;
-                let body = Box::new(self.parse_stmt()?);
-                let left = Box::new(ForInit::VarDecl(
+                let left = ForInit::VarDecl(
                     kind,
                     vec![VarDeclarator {
                         name: first_pattern,
                         init: None,
                     }],
-                ));
-                return Ok(self.mk_stmt(
-                    start,
-                    StmtKind::ForIn {
-                        left,
-                        right: Box::new(right),
-                        body,
-                        is_of,
-                        is_await,
-                    },
-                ));
+                );
+                return self.parse_for_in_of_tail(start, left, is_await);
             }
             let first_init = if self.eat_punct(Punct::Eq) {
                 Some(Box::new(self.parse_assign_expr()?))
@@ -256,80 +244,49 @@ impl Parser {
                 };
                 decls.push(VarDeclarator { name: pat, init });
             }
-            self.expect_punct(Punct::Semi)?;
-            let test = if !self.is_punct(Punct::Semi) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::Semi)?;
-            let update = if !self.is_punct(Punct::RParen) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::RParen)?;
-            let body = Box::new(self.parse_stmt()?);
-            return Ok(self.mk_stmt(
-                start,
-                StmtKind::For {
-                    init: Some(Box::new(ForInit::VarDecl(kind, decls))),
-                    test,
-                    update,
-                    body,
-                },
-            ));
+            return self.parse_for_c_style_tail(start, Some(ForInit::VarDecl(kind, decls)));
         }
 
         if self.is_punct(Punct::Semi) {
-            self.bump();
-            let test = if !self.is_punct(Punct::Semi) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::Semi)?;
-            let update = if !self.is_punct(Punct::RParen) {
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_punct(Punct::RParen)?;
-            let body = Box::new(self.parse_stmt()?);
-            return Ok(self.mk_stmt(
-                start,
-                StmtKind::For {
-                    init: None,
-                    test,
-                    update,
-                    body,
-                },
-            ));
+            return self.parse_for_c_style_tail(start, None);
         }
 
         // 式から始まる init（`for (a of b)` / 通常の for-loop 両対応）。
         let first_expr = self.parse_expr()?;
         if self.is_word("of") || self.is_word("in") {
-            let is_of = self.is_word("of");
-            self.bump();
-            let right = if is_of {
-                self.parse_assign_expr()?
-            } else {
-                self.parse_expr()?
-            };
-            self.expect_punct(Punct::RParen)?;
-            let body = Box::new(self.parse_stmt()?);
-            return Ok(self.mk_stmt(
-                start,
-                StmtKind::ForIn {
-                    left: Box::new(ForInit::Expr(Box::new(first_expr))),
-                    right: Box::new(right),
-                    body,
-                    is_of,
-                    is_await,
-                },
-            ));
+            return self.parse_for_in_of_tail(start, ForInit::Expr(Box::new(first_expr)), is_await);
         }
+        self.parse_for_c_style_tail(start, Some(ForInit::Expr(Box::new(first_expr))))
+    }
+
+    fn parse_for_in_of_tail(
+        &mut self,
+        start: Span,
+        left: ForInit,
+        is_await: bool,
+    ) -> PResult<Stmt> {
+        let is_of = self.is_word("of");
+        self.bump();
+        let right = if is_of {
+            self.parse_assign_expr()?
+        } else {
+            self.parse_expr()?
+        };
+        self.expect_punct(Punct::RParen)?;
+        let body = Box::new(self.parse_stmt()?);
+        Ok(self.mk_stmt(
+            start,
+            StmtKind::ForIn {
+                left: Box::new(left),
+                right: Box::new(right),
+                body,
+                is_of,
+                is_await,
+            },
+        ))
+    }
+
+    fn parse_for_c_style_tail(&mut self, start: Span, init: Option<ForInit>) -> PResult<Stmt> {
         self.expect_punct(Punct::Semi)?;
         let test = if !self.is_punct(Punct::Semi) {
             Some(Box::new(self.parse_expr()?))
@@ -347,7 +304,7 @@ impl Parser {
         Ok(self.mk_stmt(
             start,
             StmtKind::For {
-                init: Some(Box::new(ForInit::Expr(Box::new(first_expr)))),
+                init: init.map(Box::new),
                 test,
                 update,
                 body,
@@ -461,7 +418,7 @@ impl Parser {
         Ok(self.mk_stmt(start, StmtKind::Return(arg)))
     }
 
-    fn parse_break_continue(&mut self, is_break: bool) -> PResult<Stmt> {
+    fn parse_break_continue(&mut self, jump: LoopJumpKind) -> PResult<Stmt> {
         let start = self.cur_span();
         self.bump(); // break/continue
         let label = if !self.cur().newline_before {
@@ -477,10 +434,9 @@ impl Parser {
             None
         };
         self.consume_semi()?;
-        let kind = if is_break {
-            StmtKind::Break(label)
-        } else {
-            StmtKind::Continue(label)
+        let kind = match jump {
+            LoopJumpKind::Break => StmtKind::Break(label),
+            LoopJumpKind::Continue => StmtKind::Continue(label),
         };
         Ok(self.mk_stmt(start, kind))
     }
@@ -658,7 +614,8 @@ impl Parser {
     fn parse_import_stmt(&mut self) -> PResult<Stmt> {
         let start = self.cur_span();
         self.expect_word("import")?;
-        if let TokenKind::Str(s) = self.cur().kind.clone() {
+        if let TokenKind::Str(s) = &self.cur().kind {
+            let s = s.clone();
             self.bump();
             self.consume_semi()?;
             return Ok(self.mk_stmt(
@@ -794,7 +751,7 @@ impl Parser {
     fn parse_export_default(&mut self, start: Span) -> PResult<Stmt> {
         if self.is_word("function") {
             self.bump();
-            let f = self.parse_function_tail(false, true)?;
+            let f = self.parse_function_tail(false, FnNameMode::Optional)?;
             return Ok(self.mk_stmt(
                 start,
                 StmtKind::ExportDefault(Box::new(DefaultExportable::Function(Box::new(f)))),
@@ -803,7 +760,7 @@ impl Parser {
         if self.is_word("async") && self.peek_word_is(1, "function") {
             self.bump();
             self.bump();
-            let f = self.parse_function_tail(true, true)?;
+            let f = self.parse_function_tail(true, FnNameMode::Optional)?;
             return Ok(self.mk_stmt(
                 start,
                 StmtKind::ExportDefault(Box::new(DefaultExportable::Function(Box::new(f)))),
@@ -842,8 +799,9 @@ impl Parser {
     }
 
     fn expect_string_lit(&mut self) -> PResult<String> {
-        match self.cur().kind.clone() {
+        match &self.cur().kind {
             TokenKind::Str(s) => {
+                let s = s.clone();
                 self.bump();
                 Ok(s)
             }
@@ -858,7 +816,8 @@ impl Parser {
         self.expect_word("declare")?;
         if self.is_word("module") || self.is_word("namespace") || self.is_word("global") {
             self.bump();
-            let name = if let TokenKind::Str(s) = self.cur().kind.clone() {
+            let name = if let TokenKind::Str(s) = &self.cur().kind {
+                let s = s.clone();
                 self.bump();
                 s
             } else if self.ident_name().is_some() {

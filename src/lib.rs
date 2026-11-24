@@ -13,6 +13,8 @@
 //!
 //! 対応範囲や設計方針は README を参照。
 
+#![forbid(unsafe_code)]
+
 pub mod ast;
 pub mod builtins;
 pub mod bytecode;
@@ -57,6 +59,28 @@ impl std::fmt::Display for InterpError {
     }
 }
 
+impl std::error::Error for InterpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InterpError::Parse(e) => Some(e),
+            InterpError::Compile(e) => Some(e),
+            InterpError::Runtime(_) => None,
+        }
+    }
+}
+
+impl From<ParseError> for InterpError {
+    fn from(e: ParseError) -> Self {
+        InterpError::Parse(e)
+    }
+}
+
+impl From<compiler::CompileError> for InterpError {
+    fn from(e: compiler::CompileError) -> Self {
+        InterpError::Compile(e)
+    }
+}
+
 /// `tsint` の公開エントリポイント。`Interpreter::new()` → `register_native` /
 /// `register_native_async` → `run_module` / `run_module_graph` の順で使う。
 pub struct Interpreter {
@@ -64,6 +88,7 @@ pub struct Interpreter {
 }
 
 impl Interpreter {
+    /// 組み込みオブジェクト一式を備えた新しいインタプリタを生成する。
     pub fn new() -> Self {
         Interpreter { vm: vm::Vm::new() }
     }
@@ -130,6 +155,7 @@ impl Interpreter {
         self.vm.run_event_loop()
     }
 
+    /// 内部の [`vm::Vm`] への可変参照を返す。
     pub fn vm(&mut self) -> &mut vm::Vm {
         &mut self.vm
     }
@@ -147,8 +173,8 @@ impl Interpreter {
         source: &str,
         name: &str,
     ) -> Result<Vec<(Rc<str>, value::Value)>, InterpError> {
-        let module = parse_module(source, name).map_err(InterpError::Parse)?;
-        let chunk = compiler::compile_module(&module).map_err(InterpError::Compile)?;
+        let module = parse_module(source, name)?;
+        let chunk = compiler::compile_module(&module)?;
         self.vm
             .run_module(chunk)
             .map_err(|thrown| InterpError::Runtime(self.vm.to_display_string(&thrown)))

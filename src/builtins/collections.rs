@@ -1,9 +1,8 @@
 //! `Map` / `Set` コンストラクタおよびプロトタイプメソッド群。
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{arg, native};
+use super::{arg, arg_ref, native};
 use crate::value::*;
 use crate::vm::{array_values, Vm};
 
@@ -23,9 +22,7 @@ pub(super) fn install_map_set_ctors(vm: &mut Vm) {
                     }
                 }
             }
-            Ok(Value::Object(Rc::new(RefCell::new(ObjData::new(
-                ObjKind::Map(data),
-            )))))
+            Ok(vm.alloc_obj(ObjData::new(ObjKind::Map(data))))
         }),
     );
     vm.register_native(
@@ -40,9 +37,7 @@ pub(super) fn install_map_set_ctors(vm: &mut Vm) {
                     }
                 }
             }
-            Ok(Value::Object(Rc::new(RefCell::new(ObjData::new(
-                ObjKind::Set(data),
-            )))))
+            Ok(vm.alloc_obj(ObjData::new(ObjKind::Set(data))))
         }),
     );
 }
@@ -113,7 +108,7 @@ pub(super) fn call_map_method(
 ) -> Option<Result<Value, Value>> {
     Some(match name {
         "get" => {
-            let key = args.first().unwrap_or(&Value::Undefined);
+            let key = arg_ref(args, 0);
             let val = with_map_ref(&this, |m| m.find(key).map(|i| m.entries[i].1.clone()))
                 .flatten()
                 .unwrap_or(Value::Undefined);
@@ -126,12 +121,12 @@ pub(super) fn call_map_method(
             Ok(this)
         }
         "has" => {
-            let key = args.first().unwrap_or(&Value::Undefined);
+            let key = arg_ref(args, 0);
             let found = with_map_ref(&this, |m| m.find(key).is_some()).unwrap_or(false);
             Ok(Value::Bool(found))
         }
         "delete" => {
-            let key = args.first().unwrap_or(&Value::Undefined);
+            let key = arg_ref(args, 0);
             let deleted = with_map_mut(&this, |m| m.delete(key)).unwrap_or(false);
             Ok(Value::Bool(deleted))
         }
@@ -203,12 +198,12 @@ pub(super) fn call_set_method(
             Ok(this)
         }
         "has" => {
-            let v = args.first().unwrap_or(&Value::Undefined);
+            let v = arg_ref(args, 0);
             let found = with_set_ref(&this, |s| s.find(v).is_some()).unwrap_or(false);
             Ok(Value::Bool(found))
         }
         "delete" => {
-            let v = args.first().unwrap_or(&Value::Undefined);
+            let v = arg_ref(args, 0);
             let deleted = with_set_mut(&this, |s| s.delete(v)).unwrap_or(false);
             Ok(Value::Bool(deleted))
         }

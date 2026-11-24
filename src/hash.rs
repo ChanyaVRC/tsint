@@ -30,20 +30,17 @@ impl Hasher for FxHasher {
 
     #[inline]
     fn write(&mut self, mut bytes: &[u8]) {
-        while bytes.len() >= 8 {
-            let chunk: [u8; 8] = bytes[..8].try_into().unwrap();
-            self.add_to_hash(u64::from_ne_bytes(chunk));
-            bytes = &bytes[8..];
+        while let Some((chunk, rest)) = bytes.split_first_chunk::<8>() {
+            self.add_to_hash(u64::from_ne_bytes(*chunk));
+            bytes = rest;
         }
-        if bytes.len() >= 4 {
-            let chunk: [u8; 4] = bytes[..4].try_into().unwrap();
-            self.add_to_hash(u32::from_ne_bytes(chunk) as u64);
-            bytes = &bytes[4..];
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<4>() {
+            self.add_to_hash(u32::from_ne_bytes(*chunk) as u64);
+            bytes = rest;
         }
-        if bytes.len() >= 2 {
-            let chunk: [u8; 2] = bytes[..2].try_into().unwrap();
-            self.add_to_hash(u16::from_ne_bytes(chunk) as u64);
-            bytes = &bytes[2..];
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<2>() {
+            self.add_to_hash(u16::from_ne_bytes(*chunk) as u64);
+            bytes = rest;
         }
         if let Some(&b) = bytes.first() {
             self.add_to_hash(b as u64);

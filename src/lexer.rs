@@ -121,6 +121,8 @@ impl std::fmt::Display for LexError {
     }
 }
 
+impl std::error::Error for LexError {}
+
 /// テンプレートリテラルの `${` によって開かれたブレース文脈か、
 /// 通常の `{` かを区別するためのスタック要素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,18 @@ enum BraceCtx {
     Block,
     Template,
 }
+
+/// テンプレートリテラル断片の開始位置。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TemplatePartPos {
+    /// 先頭バッククォート直後（`NoSubTemplate` / `TemplateHead`）。
+    Head,
+    /// `${...}` を閉じた `}` の直後（`TemplateTail` / `TemplateMiddle`）。
+    Continuation,
+}
+
+/// `f64` で厳密に表現できる 10 進整数桁数の高速パス上限。
+const FAST_INT_MAX_DIGITS: usize = 15;
 
 /// 正規表現リテラルが許されるかどうかを、直前の意味のあるトークンから判定する。
 /// 「識別子・数値・文字列・`)` `]` `++` `--` の直後」は除算、それ以外は正規表現。
@@ -297,6 +311,35 @@ impl<'a> Lexer<'a> {
         Ok(out)
     }
 
+    /// 現在位置（非 EOF かつ UTF-8 文字境界）の 1 文字を読み取る。
+    #[inline]
+    fn cur_non_ascii_char(&self) -> char {
+        self.src[self.pos..]
+            .chars()
+            .next()
+            .expect("pos は常に有効な UTF-8 境界を指す")
+    }
+
+    /// 改行・ASCII・非 ASCII の 1 文字分だけカーソルを進める。
+    #[inline]
+    fn bump_byte_or_utf8(&mut self, b: u8) -> bool {
+        if b == b'\n' {
+            self.pos += 1;
+            self.line += 1;
+            self.col = 1;
+            true
+        } else if b < 0x80 {
+            self.pos += 1;
+            self.col += 1;
+            false
+        } else {
+            let c = self.cur_non_ascii_char();
+            self.pos += c.len_utf8();
+            self.col += 1;
+            false
+        }
+    }
+
     /// 空白・改行・コメントを読み飛ばし、改行が含まれていたかを返す。
     fn skip_trivia(&mut self) -> bool {
         let mut saw_newline = false;
@@ -321,14 +364,7 @@ impl<'a> Lexer<'a> {
                             if c == b'\n' {
                                 break;
                             }
-                            if c < 0x80 {
-                                self.pos += 1;
-                                self.col += 1;
-                            } else {
-                                let ch = self.src[self.pos..].chars().next().unwrap();
-                                self.pos += ch.len_utf8();
-                                self.col += 1;
-                            }
+                            self.bump_byte_or_utf8(c);
                         }
                     }
                     Some(b'*') => {
@@ -340,25 +376,15 @@ impl<'a> Lexer<'a> {
                                 self.col += 2;
                                 break;
                             }
-                            if c == b'\n' {
+                            if self.bump_byte_or_utf8(c) {
                                 saw_newline = true;
-                                self.pos += 1;
-                                self.line += 1;
-                                self.col = 1;
-                            } else if c < 0x80 {
-                                self.pos += 1;
-                                self.col += 1;
-                            } else {
-                                let ch = self.src[self.pos..].chars().next().unwrap();
-                                self.pos += ch.len_utf8();
-                                self.col += 1;
                             }
                         }
                     }
                     _ => break,
                 },
                 0x80..=0xff => {
-                    let ch = self.src[self.pos..].chars().next().unwrap();
+                    let ch = self.cur_non_ascii_char();
                     if ch.is_whitespace() {
                         self.pos += ch.len_utf8();
                         self.col += 1;
@@ -387,11 +413,11 @@ impl<'a> Lexer<'a> {
         let kind = if b < 0x80 {
             if b == b'`' {
                 self.advance_ascii();
-                self.read_template_part(true)?
+                self.read_template_part(TemplatePartPos::Head)?
             } else if b == b'}' && self.brace_stack.last() == Some(&BraceCtx::Template) {
                 self.brace_stack.pop();
                 self.advance_ascii();
-                self.read_template_part(false)?
+                self.read_template_part(TemplatePartPos::Continuation)?
             } else if b.is_ascii_digit()
                 || (b == b'.' && self.peek_byte_at(1).is_some_and(|d| d.is_ascii_digit()))
             {
@@ -406,7 +432,7 @@ impl<'a> Lexer<'a> {
                 self.read_punct()?
             }
         } else {
-            let c = self.src[self.pos..].chars().next().unwrap();
+            let c = self.cur_non_ascii_char();
             if is_ident_start(c) {
                 self.read_ident()
             } else {
@@ -434,7 +460,7 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             } else {
-                let c = self.src[self.pos..].chars().next().unwrap();
+                let c = self.cur_non_ascii_char();
                 if is_ident_part(c) {
                     self.pos += c.len_utf8();
                     self.col += 1;
@@ -496,7 +522,7 @@ impl<'a> Lexer<'a> {
 
         while let Some(b) = self.peek_byte() {
             if b.is_ascii_digit() {
-                if int_digits < 15 {
+                if int_digits < FAST_INT_MAX_DIGITS {
                     int_acc = int_acc * 10 + (b - b'0') as i64;
                 }
                 int_digits += 1;
@@ -539,7 +565,7 @@ impl<'a> Lexer<'a> {
         let end = self.pos;
         self.eat_byte(b'n'); // BigInt サフィックス
 
-        if !is_float && int_digits > 0 && int_digits <= 15 {
+        if !is_float && int_digits > 0 && int_digits <= FAST_INT_MAX_DIGITS {
             return Ok(TokenKind::Number(int_acc as f64));
         }
         let v: f64 = if !has_sep {
@@ -570,18 +596,7 @@ impl<'a> Lexer<'a> {
             if b == b'\\' {
                 break;
             }
-            if b == b'\n' {
-                self.pos += 1;
-                self.line += 1;
-                self.col = 1;
-            } else if b < 0x80 {
-                self.pos += 1;
-                self.col += 1;
-            } else {
-                let c = self.src[self.pos..].chars().next().unwrap();
-                self.pos += c.len_utf8();
-                self.col += 1;
-            }
+            self.bump_byte_or_utf8(b);
         }
         if self.pos >= bytes.len() {
             return Err(self.err("文字列リテラルが閉じられていません"));
@@ -605,24 +620,35 @@ impl<'a> Lexer<'a> {
                         if b == quote || b == b'\\' {
                             break;
                         }
-                        if b == b'\n' {
-                            self.pos += 1;
-                            self.line += 1;
-                            self.col = 1;
-                        } else if b < 0x80 {
-                            self.pos += 1;
-                            self.col += 1;
-                        } else {
-                            let c = self.src[self.pos..].chars().next().unwrap();
-                            self.pos += c.len_utf8();
-                            self.col += 1;
-                        }
+                        self.bump_byte_or_utf8(b);
                     }
                     s.push_str(&self.src[chunk_start..self.pos]);
                 }
             }
         }
         Ok(TokenKind::Str(s))
+    }
+
+    fn read_fixed_hex_escape(&mut self, digits: usize, out: &mut String) {
+        let mut code = 0u32;
+        let mut ok = true;
+        for _ in 0..digits {
+            if let Some(h) = self.peek_char() {
+                self.advance_char();
+                if let Some(d) = h.to_digit(16) {
+                    code = (code << 4) | d;
+                } else {
+                    ok = false;
+                }
+            } else {
+                ok = false;
+            }
+        }
+        if ok {
+            if let Some(ch) = char::from_u32(code) {
+                out.push(ch);
+            }
+        }
     }
 
     fn read_escape(&mut self, out: &mut String) -> Result<(), LexError> {
@@ -641,50 +667,35 @@ impl<'a> Lexer<'a> {
             '\r' => {
                 self.eat_byte(b'\n');
             }
-            'x' => {
-                let mut hex = String::new();
-                for _ in 0..2 {
-                    if let Some(h) = self.peek_char() {
-                        hex.push(h);
-                        self.advance_char();
-                    }
-                }
-                if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                    if let Some(ch) = char::from_u32(code) {
-                        out.push(ch);
-                    }
-                }
-            }
+            'x' => self.read_fixed_hex_escape(2, out),
             'u' => {
                 if self.peek_byte() == Some(b'{') {
                     self.advance_ascii();
-                    let mut hex = String::new();
+                    let mut code = 0u32;
+                    let mut any = false;
+                    let mut ok = true;
                     while let Some(h) = self.peek_char() {
                         if h == '}' {
                             break;
                         }
-                        hex.push(h);
                         self.advance_char();
+                        any = true;
+                        match h
+                            .to_digit(16)
+                            .and_then(|d| code.checked_mul(16).and_then(|v| v.checked_add(d)))
+                        {
+                            Some(next) => code = next,
+                            None => ok = false,
+                        }
                     }
                     self.eat_byte(b'}');
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                    if any && ok {
                         if let Some(ch) = char::from_u32(code) {
                             out.push(ch);
                         }
                     }
                 } else {
-                    let mut hex = String::new();
-                    for _ in 0..4 {
-                        if let Some(h) = self.peek_char() {
-                            hex.push(h);
-                            self.advance_char();
-                        }
-                    }
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
-                        }
-                    }
+                    self.read_fixed_hex_escape(4, out);
                 }
             }
             other => out.push(other),
@@ -693,9 +704,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// テンプレートリテラルの断片を 1 つ読む。
-    /// `is_head` が true ならバッククォート直後（Head/NoSub）、false なら
-    /// `}` 直後（Middle/Tail）の読み取り。
-    fn read_template_part(&mut self, is_head: bool) -> Result<TokenKind, LexError> {
+    fn read_template_part(&mut self, part_pos: TemplatePartPos) -> Result<TokenKind, LexError> {
         let start = self.pos;
         let bytes = self.bytes;
         let mut s: Option<String> = None;
@@ -712,10 +721,9 @@ impl<'a> Lexer<'a> {
                         None => self.src[chunk_start..self.pos].to_owned(),
                     };
                     self.advance_ascii();
-                    return Ok(if is_head {
-                        TokenKind::NoSubTemplate(result)
-                    } else {
-                        TokenKind::TemplateTail(result)
+                    return Ok(match part_pos {
+                        TemplatePartPos::Head => TokenKind::NoSubTemplate(result),
+                        TemplatePartPos::Continuation => TokenKind::TemplateTail(result),
                     });
                 }
                 Some(b'$') if bytes.get(self.pos + 1) == Some(&b'{') => {
@@ -729,10 +737,9 @@ impl<'a> Lexer<'a> {
                     self.pos += 2;
                     self.col += 2;
                     self.brace_stack.push(BraceCtx::Template);
-                    return Ok(if is_head {
-                        TokenKind::TemplateHead(result)
-                    } else {
-                        TokenKind::TemplateMiddle(result)
+                    return Ok(match part_pos {
+                        TemplatePartPos::Head => TokenKind::TemplateHead(result),
+                        TemplatePartPos::Continuation => TokenKind::TemplateMiddle(result),
                     });
                 }
                 Some(b'\\') => {
@@ -742,19 +749,8 @@ impl<'a> Lexer<'a> {
                     self.read_escape(buf)?;
                     chunk_start = self.pos;
                 }
-                Some(b'\n') => {
-                    self.pos += 1;
-                    self.line += 1;
-                    self.col = 1;
-                }
-                Some(b) if b < 0x80 => {
-                    self.pos += 1;
-                    self.col += 1;
-                }
-                Some(_) => {
-                    let c = self.src[self.pos..].chars().next().unwrap();
-                    self.pos += c.len_utf8();
-                    self.col += 1;
+                Some(b) => {
+                    self.bump_byte_or_utf8(b);
                 }
             }
         }

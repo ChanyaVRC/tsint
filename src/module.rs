@@ -1,7 +1,7 @@
 //! T5a: ES モジュールシステム。
 //!
 //! 設計方針:
-//! - VM/コンパイラ本体（`vm.rs`/`compiler.rs`/`bytecode.rs`）にはほぼ手を
+//! - VM/コンパイラ本体（`crate::vm`/`crate::compiler`/`crate::bytecode`）にはほぼ手を
 //!   入れない。`import`/`export ... from` を含む AST を、依存モジュールの
 //!   評価が終わった後に「名前空間オブジェクトを保持するグローバル変数から
 //!   `const` で読み出す」形へ **AST レベルで書き換えてから**
@@ -24,7 +24,6 @@
 //!   Noiria のコーパスの前提の下、`Vm::run_module` と同じ「完全に解決する
 //!   はず」経路で評価する。解決しなければ `ModuleError::Runtime` になる。
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{
@@ -32,6 +31,7 @@ use crate::ast::{
     VarDeclarator, VarKind,
 };
 use crate::compiler::{self, CompileError};
+use crate::hash::FastHashMap;
 use crate::value::Value;
 use crate::vm::ModuleTaskState;
 use crate::{parse_module, Interpreter, ParseError};
@@ -96,6 +96,18 @@ impl std::fmt::Display for ModuleError {
             ModuleError::Runtime { resolved, message } => {
                 write!(f, "{resolved} の実行時エラー: {message}")
             }
+        }
+    }
+}
+
+impl std::error::Error for ModuleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ModuleError::Parse { source, .. } => Some(source),
+            ModuleError::Compile { source, .. } => Some(source),
+            ModuleError::Resolve { .. }
+            | ModuleError::Load { .. }
+            | ModuleError::Runtime { .. } => None,
         }
     }
 }
@@ -176,9 +188,9 @@ struct Loader<'i, 'h> {
     interp: &'i mut Interpreter,
     host: &'h dyn ModuleHost,
     /// resolved specifier -> 名前空間オブジェクトを保持するグローバル変数名。
-    cache: HashMap<String, Rc<str>>,
+    cache: FastHashMap<String, Rc<str>>,
     /// resolved specifier -> export 名一覧（`export * from` 用）。
-    export_names: HashMap<String, Vec<Rc<str>>>,
+    export_names: FastHashMap<String, Vec<Rc<str>>>,
     next_id: u32,
 }
 
@@ -198,6 +210,57 @@ impl<'i, 'h> Loader<'i, 'h> {
             })
     }
 
+    /// 解決済みモジュールを読み込み・書き換え・コンパイルしてチャンクを返す。
+    fn compile_resolved(
+        &mut self,
+        resolved: &str,
+    ) -> Result<Rc<crate::bytecode::Chunk>, ModuleError> {
+        let source = self
+            .host
+            .load(resolved)
+            .map_err(|message| ModuleError::Load {
+                resolved: resolved.to_string(),
+                message,
+            })?;
+        let parsed = parse_module(&source, resolved).map_err(|source| ModuleError::Parse {
+            resolved: resolved.to_string(),
+            source,
+        })?;
+        let rewritten = self.rewrite_module(parsed, resolved)?;
+        compiler::compile_module(&rewritten).map_err(|source| ModuleError::Compile {
+            resolved: resolved.to_string(),
+            source,
+        })
+    }
+
+    fn push_reexport(
+        &mut self,
+        out: &mut Vec<Stmt>,
+        ns_name: &str,
+        source_name: &str,
+        exported: String,
+        line: u32,
+    ) {
+        let tmp = self.fresh_name("reexp");
+        out.push(const_decl(
+            &tmp,
+            member_expr(ident_expr(ns_name, line), source_name, line),
+            line,
+        ));
+        out.push(Stmt {
+            id: 0,
+            span: line_span(line),
+            kind: StmtKind::ExportNamed {
+                specifiers: vec![ast::ExportSpecifier::Named {
+                    local: tmp,
+                    exported,
+                }],
+                source: None,
+                type_only: false,
+            },
+        });
+    }
+
     /// 依存モジュールを読み込み・評価し（キャッシュ済みなら再利用）、
     /// その名前空間オブジェクトを保持するグローバル変数名を返す。
     fn load_dependency(&mut self, resolved: &str) -> Result<Rc<str>, ModuleError> {
@@ -212,23 +275,7 @@ impl<'i, 'h> Loader<'i, 'h> {
         self.cache.insert(resolved.to_string(), ns_name.clone());
         self.interp.define_global(&ns_name, ns_obj.clone());
 
-        let source = self
-            .host
-            .load(resolved)
-            .map_err(|message| ModuleError::Load {
-                resolved: resolved.to_string(),
-                message,
-            })?;
-        let parsed = parse_module(&source, resolved).map_err(|source| ModuleError::Parse {
-            resolved: resolved.to_string(),
-            source,
-        })?;
-        let rewritten = self.rewrite_module(parsed, resolved)?;
-        let chunk =
-            compiler::compile_module(&rewritten).map_err(|source| ModuleError::Compile {
-                resolved: resolved.to_string(),
-                source,
-            })?;
+        let chunk = self.compile_resolved(resolved)?;
         let exports =
             self.interp
                 .vm()
@@ -309,24 +356,7 @@ impl<'i, 'h> Loader<'i, 'h> {
                 let ns_name = self.load_dependency(&resolved)?;
                 for spec in specifiers {
                     let ast::ExportSpecifier::Named { local, exported } = spec;
-                    let tmp = self.fresh_name("reexp");
-                    out.push(const_decl(
-                        &tmp,
-                        member_expr(ident_expr(&ns_name, line), &local, line),
-                        line,
-                    ));
-                    out.push(Stmt {
-                        id: 0,
-                        span: line_span(line),
-                        kind: StmtKind::ExportNamed {
-                            specifiers: vec![ast::ExportSpecifier::Named {
-                                local: tmp,
-                                exported,
-                            }],
-                            source: None,
-                            type_only: false,
-                        },
-                    });
+                    self.push_reexport(out, &ns_name, &local, exported, line);
                 }
             }
             StmtKind::ExportAll {
@@ -353,24 +383,7 @@ impl<'i, 'h> Loader<'i, 'h> {
                     if &*name == "default" {
                         continue;
                     }
-                    let tmp = self.fresh_name("reexp");
-                    out.push(const_decl(
-                        &tmp,
-                        member_expr(ident_expr(&ns_name, line), &name, line),
-                        line,
-                    ));
-                    out.push(Stmt {
-                        id: 0,
-                        span: line_span(line),
-                        kind: StmtKind::ExportNamed {
-                            specifiers: vec![ast::ExportSpecifier::Named {
-                                local: tmp,
-                                exported: name.to_string(),
-                            }],
-                            source: None,
-                            type_only: false,
-                        },
-                    });
+                    self.push_reexport(out, &ns_name, &name, name.to_string(), line);
                 }
             }
             other => out.push(Stmt {
@@ -399,28 +412,12 @@ impl Interpreter {
         let mut loader = Loader {
             interp: self,
             host,
-            cache: HashMap::new(),
-            export_names: HashMap::new(),
+            cache: FastHashMap::default(),
+            export_names: FastHashMap::default(),
             next_id: 0,
         };
         let resolved = loader.resolve(entry_specifier, "<entry>")?;
-        let source = loader
-            .host
-            .load(&resolved)
-            .map_err(|message| ModuleError::Load {
-                resolved: resolved.clone(),
-                message,
-            })?;
-        let parsed = parse_module(&source, &resolved).map_err(|source| ModuleError::Parse {
-            resolved: resolved.clone(),
-            source,
-        })?;
-        let rewritten = loader.rewrite_module(parsed, &resolved)?;
-        let chunk =
-            compiler::compile_module(&rewritten).map_err(|source| ModuleError::Compile {
-                resolved: resolved.clone(),
-                source,
-            })?;
+        let chunk = loader.compile_resolved(&resolved)?;
         let outcome = loader
             .interp
             .vm()

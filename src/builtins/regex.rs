@@ -14,6 +14,17 @@ thread_local! {
     static KEY_GROUPS: Rc<str> = Rc::from("groups");
 }
 
+/// `Value` が `ObjKind::Regex` であればコンパイル済み正規表現の `Rc` を返す。
+#[inline]
+pub(super) fn as_regex(v: &Value) -> Option<Rc<crate::regex::Regex>> {
+    if let Value::Object(o) = v {
+        if let ObjKind::Regex(r) = &o.borrow().kind {
+            return Some(r.clone());
+        }
+    }
+    None
+}
+
 /// `new RegExp(...)` / `RegExp(...)` の実装。
 pub(super) fn install_regexp(vm: &mut Vm) {
     vm.register_native(
@@ -21,14 +32,10 @@ pub(super) fn install_regexp(vm: &mut Vm) {
         2,
         Rc::new(|vm, _this, args| {
             let (pattern, default_flags) = match args.first() {
-                Some(Value::Object(o)) if matches!(o.borrow().kind, ObjKind::Regex(_)) => {
-                    let re = match &o.borrow().kind {
-                        ObjKind::Regex(r) => r.clone(),
-                        _ => unreachable!(),
-                    };
-                    (re.source.clone(), re.flags.clone())
-                }
-                Some(v) => (vm.to_display_string(v), String::new()),
+                Some(v) => match as_regex(v) {
+                    Some(re) => (re.source.clone(), re.flags.clone()),
+                    None => (vm.to_display_string(v), String::new()),
+                },
                 None => (String::new(), String::new()),
             };
             let flags = match args.get(1) {
@@ -36,8 +43,8 @@ pub(super) fn install_regexp(vm: &mut Vm) {
                 Some(v) => vm.to_display_string(v),
             };
             match crate::regex::Regex::compile(&pattern, &flags) {
-                Ok(re) => Ok(crate::vm::new_regex_value(Rc::new(re))),
-                Err(e) => Err(vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0))),
+                Ok(re) => Ok(vm.alloc_regex_value(Rc::new(re))),
+                Err(e) => Err(vm.syntax_error(format!("不正な正規表現です: {e}"))),
             }
         }),
     );
@@ -45,19 +52,17 @@ pub(super) fn install_regexp(vm: &mut Vm) {
 
 /// 文字列引数またはコンパイル済み正規表現を `Rc<Regex>` に統一する。
 pub(super) fn coerce_to_regex(vm: &mut Vm, v: &Value) -> Result<Rc<crate::regex::Regex>, Value> {
-    if let Value::Object(o) = v {
-        if let ObjKind::Regex(re) = &o.borrow().kind {
-            return Ok(re.clone());
-        }
+    if let Some(re) = as_regex(v) {
+        return Ok(re);
     }
     let pattern = vm.to_display_string(v);
     crate::regex::Regex::compile(&pattern, "")
         .map(Rc::new)
-        .map_err(|e| vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0)))
+        .map_err(|e| vm.syntax_error(format!("不正な正規表現です: {e}")))
 }
 
 pub(super) fn regex_err(vm: &Vm, e: crate::regex::RegexError) -> Value {
-    vm.range_error(format!("正規表現の実行中にエラーが発生しました: {}", e.0))
+    vm.range_error(format!("正規表現の実行中にエラーが発生しました: {e}"))
 }
 
 fn regex_last_index(o: &ObjRef) -> usize {
@@ -386,6 +391,46 @@ pub(super) fn string_replace(
     string_replace_literal(vm, s, pattern, replacement, force_all)
 }
 
+/// ゼロ幅一致時に無限ループを避けつつ次の検索開始位置を返す。
+#[inline]
+pub(super) fn next_search_pos(mat: &RegexMatch) -> usize {
+    if mat.end == mat.start {
+        mat.end + 1
+    } else {
+        mat.end
+    }
+}
+
+fn run_regex_replace_loop(
+    vm: &mut Vm,
+    re: &crate::regex::Regex,
+    chars: &[char],
+    scratch: &mut RegexScratch,
+    global: bool,
+    out: &mut String,
+    mut on_match: impl FnMut(&mut Vm, &RegexMatch, &mut String) -> Result<(), Value>,
+) -> Result<(), Value> {
+    let mut pos = 0usize;
+    let mut search_from = 0usize;
+    while search_from <= chars.len() {
+        let Some(mat) = re
+            .search_with_scratch(chars, search_from, scratch)
+            .map_err(|e| regex_err(vm, e))?
+        else {
+            break;
+        };
+        out.extend(&chars[pos..mat.start]);
+        on_match(vm, &mat, out)?;
+        pos = mat.end;
+        search_from = next_search_pos(&mat);
+        if !global {
+            break;
+        }
+    }
+    out.extend(&chars[pos..]);
+    Ok(())
+}
+
 fn string_replace_regex(
     vm: &mut Vm,
     s: &str,
@@ -398,35 +443,16 @@ fn string_replace_regex(
         let has_dollar = template.contains('$');
         return with_chars_buf(s, |chars| {
             let mut out = String::with_capacity(s.len());
-            let mut pos = 0usize;
-            let mut search_from = 0usize;
-            with_regex_scratch(|scratch| -> Result<(), Value> {
-                while search_from <= chars.len() {
-                    let Some(mat) = re
-                        .search_with_scratch(chars, search_from, scratch)
-                        .map_err(|e| regex_err(vm, e))?
-                    else {
-                        break;
-                    };
-                    out.extend(&chars[pos..mat.start]);
+            with_regex_scratch(|scratch| {
+                run_regex_replace_loop(vm, re, chars, scratch, global, &mut out, |_, mat, dst| {
                     if has_dollar {
-                        expand_regex_template_into(&template, chars, &mat, &mut out);
+                        expand_regex_template_into(&template, chars, mat, dst);
                     } else {
-                        out.push_str(&template);
+                        dst.push_str(&template);
                     }
-                    pos = mat.end;
-                    search_from = if mat.end == mat.start {
-                        mat.end + 1
-                    } else {
-                        mat.end
-                    };
-                    if !global {
-                        break;
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })
             })?;
-            out.extend(&chars[pos..]);
             Ok(Value::str(out))
         });
     }
@@ -434,28 +460,15 @@ fn string_replace_regex(
     let chars: Vec<char> = s.chars().collect();
     let mut scratch = RegexScratch::default();
     let mut out = String::with_capacity(s.len());
-    let mut pos = 0usize;
-    let mut search_from = 0usize;
-    while search_from <= chars.len() {
-        let Some(mat) = re
-            .search_with_scratch(&chars, search_from, &mut scratch)
-            .map_err(|e| regex_err(vm, e))?
-        else {
-            break;
-        };
-        out.extend(&chars[pos..mat.start]);
-        call_regex_replace_cb_into(vm, replacement, &chars, &mat, s, &mut out)?;
-        pos = mat.end;
-        search_from = if mat.end == mat.start {
-            mat.end + 1
-        } else {
-            mat.end
-        };
-        if !global {
-            break;
-        }
-    }
-    out.extend(&chars[pos..]);
+    run_regex_replace_loop(
+        vm,
+        re,
+        &chars,
+        &mut scratch,
+        global,
+        &mut out,
+        |vm, mat, dst| call_regex_replace_cb_into(vm, replacement, &chars, mat, s, dst),
+    )?;
     Ok(Value::str(out))
 }
 
@@ -595,11 +608,7 @@ pub(super) fn regex_split(
                     });
                 }
                 p = mat.end;
-                search_from = if mat.end == mat.start {
-                    mat.end + 1
-                } else {
-                    mat.end
-                };
+                search_from = next_search_pos(&mat);
             }
             Ok(())
         })?;

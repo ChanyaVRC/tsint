@@ -3,6 +3,24 @@
 use super::charclass::{CharClass, ClassAtom};
 use super::RegexError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuantifierMode {
+    Greedy,
+    Lazy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WordBoundary {
+    Match,
+    NonMatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LookaheadKind {
+    Positive,
+    Negative,
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum Ast {
     Empty,
@@ -13,12 +31,12 @@ pub(super) enum Ast {
     Alt(Vec<Ast>),
     Group(usize, Box<Ast>),
     NonCap(Box<Ast>),
-    Repeat(Box<Ast>, u32, Option<u32>, bool),
+    Repeat(Box<Ast>, u32, Option<u32>, QuantifierMode),
     Start,
     End,
-    WordB(bool),
+    WordB(WordBoundary),
     Backref(usize),
-    Look(Box<Ast>, bool),
+    Look(Box<Ast>, LookaheadKind),
 }
 
 enum ClassEscape {
@@ -143,8 +161,12 @@ impl Parser {
     fn parse_repeat(&mut self) -> Result<Ast, RegexError> {
         let atom = self.parse_atom()?;
         if let Some((min, max)) = self.try_parse_quantifier_bounds()? {
-            let greedy = !self.eat('?');
-            Ok(Ast::Repeat(Box::new(atom), min, max, greedy))
+            let mode = if self.eat('?') {
+                QuantifierMode::Lazy
+            } else {
+                QuantifierMode::Greedy
+            };
+            Ok(Ast::Repeat(Box::new(atom), min, max, mode))
         } else {
             Ok(atom)
         }
@@ -265,11 +287,11 @@ impl Parser {
             } else if self.eat('=') {
                 let inner = self.parse_alt()?;
                 self.expect(')')?;
-                return Ok(Ast::Look(Box::new(inner), false));
+                return Ok(Ast::Look(Box::new(inner), LookaheadKind::Positive));
             } else if self.eat('!') {
                 let inner = self.parse_alt()?;
                 self.expect(')')?;
-                return Ok(Ast::Look(Box::new(inner), true));
+                return Ok(Ast::Look(Box::new(inner), LookaheadKind::Negative));
             } else if self.peek() == Some('<') {
                 if self.peek_at(1) == Some('=') || self.peek_at(1) == Some('!') {
                     return Err(RegexError(
@@ -336,8 +358,8 @@ impl Parser {
             'W' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotWord])),
             's' => Ast::Class(CharClass::new(false, vec![ClassAtom::Space])),
             'S' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotSpace])),
-            'b' => Ast::WordB(true),
-            'B' => Ast::WordB(false),
+            'b' => Ast::WordB(WordBoundary::Match),
+            'B' => Ast::WordB(WordBoundary::NonMatch),
             'n' => Ast::Char('\n'),
             'r' => Ast::Char('\r'),
             't' => Ast::Char('\t'),

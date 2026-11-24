@@ -4,7 +4,7 @@
 //! - 命令は「1 関数分の線形な列」（`Chunk`）にコンパイルされる。ネストした
 //!   関数は別チャンクとして `chunk.functions` に保持し、`MakeClosure` 命令が
 //!   実行時にクロージャオブジェクトを作る。
-//! - VM（`vm.rs`）はこの命令列を Rust の再帰呼び出しを使わずに実行する。
+//! - VM（`crate::vm`）はこの命令列を Rust の再帰呼び出しを使わずに実行する。
 //!   関数呼び出しは Rust スタックではなく `Vm.frames: Vec<Frame>`
 //!   （ヒープ上の明示スタック）に積む。これにより `await` 等の命令境界で
 //!   実行を中断し、後で再開することが可能になる —
@@ -213,7 +213,33 @@ pub enum OpCode {
     Await,
 }
 
+impl OpCode {
+    /// ジャンプ命令のターゲットアドレスを書き換えたコピーを返す。非ジャンプ命令なら `None`。
+    #[inline]
+    pub(crate) fn with_jump_target(self, target: JumpAddr) -> Option<Self> {
+        Some(match self {
+            OpCode::Jump(_) => OpCode::Jump(target),
+            OpCode::JumpIfFalse(_) => OpCode::JumpIfFalse(target),
+            OpCode::JumpIfTrue(_) => OpCode::JumpIfTrue(target),
+            OpCode::LtJumpIfFalse(_) => OpCode::LtJumpIfFalse(target),
+            OpCode::LtEqJumpIfFalse(_) => OpCode::LtEqJumpIfFalse(target),
+            OpCode::GtJumpIfFalse(_) => OpCode::GtJumpIfFalse(target),
+            OpCode::GtEqJumpIfFalse(_) => OpCode::GtEqJumpIfFalse(target),
+            OpCode::StrictEqJumpIfFalse(_) => OpCode::StrictEqJumpIfFalse(target),
+            OpCode::StrictNotEqJumpIfFalse(_) => OpCode::StrictNotEqJumpIfFalse(target),
+            OpCode::JumpIfNullish(_) => OpCode::JumpIfNullish(target),
+            OpCode::JumpIfNullishCall(_) => OpCode::JumpIfNullishCall(target),
+            OpCode::JumpIfFalsyKeep(_) => OpCode::JumpIfFalsyKeep(target),
+            OpCode::JumpIfTruthyKeep(_) => OpCode::JumpIfTruthyKeep(target),
+            OpCode::JumpIfNotNullishKeep(_) => OpCode::JumpIfNotNullishKeep(target),
+            OpCode::JumpIfNotUndefinedKeep(_) => OpCode::JumpIfNotUndefinedKeep(target),
+            _ => return None,
+        })
+    }
+}
+
 /// 定数表に置けるコンパイル時定数。
+#[derive(Clone)]
 pub enum Const {
     Number(f64),
     Str(Rc<str>),
@@ -221,18 +247,6 @@ pub enum Const {
     FunctionTemplate(Rc<FunctionTemplate>),
     ClassTemplate(Rc<ClassTemplate>),
     Regex(Rc<crate::regex::Regex>),
-}
-
-impl Clone for Const {
-    fn clone(&self) -> Self {
-        match self {
-            Const::Number(n) => Const::Number(*n),
-            Const::Str(s) => Const::Str(s.clone()),
-            Const::FunctionTemplate(f) => Const::FunctionTemplate(f.clone()),
-            Const::ClassTemplate(c) => Const::ClassTemplate(c.clone()),
-            Const::Regex(r) => Const::Regex(r.clone()),
-        }
-    }
 }
 
 /// クロージャがどこから値を捕捉するかの記述。
@@ -407,6 +421,30 @@ impl Chunk {
             Const::Number(n) => Value::Number(*n),
             Const::Str(s) => Value::Str(s.clone()),
             _ => panic!("定数 {idx} は値化できません"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn const_function_template(&self, idx: ConstIdx) -> Rc<FunctionTemplate> {
+        match &self.consts[idx as usize] {
+            Const::FunctionTemplate(t) => t.clone(),
+            _ => panic!("定数 {idx} は FunctionTemplate ではありません"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn const_class_template(&self, idx: ConstIdx) -> Rc<ClassTemplate> {
+        match &self.consts[idx as usize] {
+            Const::ClassTemplate(t) => t.clone(),
+            _ => panic!("定数 {idx} は ClassTemplate ではありません"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn const_regex(&self, idx: ConstIdx) -> Rc<crate::regex::Regex> {
+        match &self.consts[idx as usize] {
+            Const::Regex(r) => r.clone(),
+            _ => panic!("定数 {idx} は Regex ではありません"),
         }
     }
 }

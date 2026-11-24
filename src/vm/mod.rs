@@ -29,6 +29,7 @@ pub use ops::{
     to_primitive, to_property_key_string, to_string_basic, to_uint32,
 };
 pub(crate) use ops::{number_to_js_string_into, to_string_into};
+pub(crate) use props::own_enumerable_keys;
 
 /// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。
 pub(super) const GC_MIN_THRESHOLD: usize = 2048;
@@ -41,7 +42,7 @@ thread_local! {
     /// ASCII 単一文字の `Rc<str>` キャッシュ（`str[i]` のゼロ確保高速パス用）。
     static ASCII_CHARS: [Rc<str>; 128] = std::array::from_fn(|b| {
         let ch = [b as u8];
-        Rc::from(std::str::from_utf8(&ch).unwrap())
+        Rc::from(std::str::from_utf8(&ch).expect("0..128 は常に有効な ASCII UTF-8"))
     });
 }
 
@@ -215,9 +216,12 @@ pub struct HostPromise {
 }
 
 impl HostPromise {
+    /// 紐づく JS `Promise` を指定値で解決（fulfill）する。
     pub fn resolve(&self, vm: &mut Vm, value: Value) {
         vm.settle_host_promise(self.promise.clone(), Ok(value));
     }
+
+    /// 紐づく JS `Promise` を指定値で棄却（reject）する。
     pub fn reject(&self, vm: &mut Vm, value: Value) {
         vm.settle_host_promise(self.promise.clone(), Err(value));
     }
@@ -226,6 +230,14 @@ impl HostPromise {
 pub(super) enum CallOutcome {
     Immediate(Value),
     FramePushed,
+}
+
+/// 呼び出し元オペランドスタック上に `callee` スロットが積まれているか
+/// （`OpCode::Call` は `[this, callee, args...]`、`OpCode::CallMethod` は `[obj, args...]`）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StackCalleeSlot {
+    Present,
+    Omitted,
 }
 
 pub struct Vm {
@@ -327,16 +339,19 @@ impl Vm {
             frame.upvalues = f.upvalues.clone();
             frame.stack.clear();
             if needs_raw {
-                if Rc::ptr_eq(&frame.raw_args, &self.empty_args)
-                    || Rc::strong_count(&frame.raw_args) != 1
-                {
+                if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
+                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                        v.clear();
+                        v.extend_from_slice(args);
+                    } else {
+                        let mut v = self.take_args_buf();
+                        v.extend_from_slice(args);
+                        frame.raw_args = Rc::new(v);
+                    }
+                } else {
                     let mut v = self.take_args_buf();
                     v.extend_from_slice(args);
                     frame.raw_args = Rc::new(v);
-                } else {
-                    let v = Rc::get_mut(&mut frame.raw_args).unwrap();
-                    v.clear();
-                    v.extend_from_slice(args);
                 }
             } else if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
                 v.clear();
@@ -374,7 +389,7 @@ impl Vm {
         &mut self,
         fo: &Rc<FunctionObj>,
         argc: usize,
-        has_callee_slot: bool,
+        callee_slot: StackCalleeSlot,
     ) {
         let needs_raw = fo.chunk.needs_raw_args && argc > 0;
         let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
@@ -399,16 +414,18 @@ impl Vm {
             let n = caller.stack.len();
             let arg_start = n - argc;
             if needs_raw {
-                if Rc::ptr_eq(&frame.raw_args, &self.empty_args)
-                    || Rc::strong_count(&frame.raw_args) != 1
-                {
+                let mut reused = false;
+                if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
+                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                        v.clear();
+                        v.extend(caller.stack.drain(arg_start..));
+                        reused = true;
+                    }
+                }
+                if !reused {
                     let mut v = self.args_pool.pop().unwrap_or_default();
                     v.extend(caller.stack.drain(arg_start..));
                     frame.raw_args = Rc::new(v);
-                } else {
-                    let v = Rc::get_mut(&mut frame.raw_args).unwrap();
-                    v.clear();
-                    v.extend(caller.stack.drain(arg_start..));
                 }
                 for i in 0..sp {
                     let val = frame.raw_args.get(i).cloned().unwrap_or(Value::Undefined);
@@ -432,7 +449,7 @@ impl Vm {
                     frame.locals[param_base + i].set(Value::Undefined);
                 }
             }
-            if has_callee_slot {
+            if callee_slot == StackCalleeSlot::Present {
                 caller.stack.pop(); // callee
             }
             caller.stack.pop().unwrap() // this
@@ -518,7 +535,7 @@ impl Vm {
     }
 
     pub fn start_module_task(&mut self, chunk: Rc<Chunk>) -> Result<ModuleTaskState, Value> {
-        let frame = Frame::new(chunk, Rc::new(Vec::new()), Rc::new(Vec::new()));
+        let frame = Frame::new(chunk, self.empty_upvalues.clone(), self.empty_args.clone());
         self.frames = vec![frame];
         let (_, owner) = self.new_pending_promise();
         self.drive_current_task(owner.clone());
@@ -595,10 +612,41 @@ impl Vm {
     pub fn reference_error(&self, msg: impl Into<String>) -> Value {
         self.make_error("ReferenceError", msg.into())
     }
+
+    pub fn syntax_error(&self, msg: impl Into<String>) -> Value {
+        self.make_error("SyntaxError", msg.into())
+    }
 }
 
 impl Default for Vm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // VM が保持する全ルートを先に解放する。循環参照を持たないオブジェクトは
+        // この時点で通常の Rc::drop により即座に解放される。
+        self.frames.clear();
+        self.globals.clear();
+        self.pending_module_exports = None;
+        self.microtasks.clear();
+        self.maybe_unhandled.clear();
+        self.current_owner_promise = None;
+        self.frame_pool.clear();
+        self.args_pool.clear();
+
+        // ルート解放後も生存している追跡オブジェクト（循環参照または外部 Rust 保持）が
+        // 存在する場合のみ trial-deletion GC を走らせ、到達不能な循環参照を確実に回収する。
+        // 外部 Rust コードが保持している Value は strong_count 検査によりそのまま保護される。
+        let has_remaining = self
+            .gc_objects
+            .borrow()
+            .iter()
+            .any(|w| w.strong_count() > 0);
+        if has_remaining {
+            self.collect_garbage();
+        }
     }
 }
