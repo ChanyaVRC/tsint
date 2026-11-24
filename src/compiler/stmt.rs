@@ -144,14 +144,18 @@ impl Compiler {
                 block,
                 handler,
                 finalizer,
-            } => self.compile_try(block, handler.as_ref(), finalizer.as_deref(), line)?,
+            } => self.compile_try(block, handler.as_deref(), finalizer.as_deref(), line)?,
             StmtKind::Throw(e) => {
                 self.compile_expr(e)?;
                 self.emit(OpCode::Throw, line);
             }
             StmtKind::Return(e) => self.compile_return(e.as_deref(), line)?,
-            StmtKind::Break(label) => self.compile_break(label.as_deref(), line)?,
-            StmtKind::Continue(label) => self.compile_continue(label.as_deref(), line)?,
+            StmtKind::Break(label) => {
+                self.compile_jump_control(JumpControl::Break, label.as_deref(), line)?
+            }
+            StmtKind::Continue(label) => {
+                self.compile_jump_control(JumpControl::Continue, label.as_deref(), line)?
+            }
             StmtKind::Labeled { label, body } => self.compile_labeled(label, body, line)?,
             StmtKind::Import(_) => return Err(err(line, "import 文は未対応です")),
             StmtKind::ExportNamed { .. } | StmtKind::ExportAll { .. } => {}
@@ -368,17 +372,13 @@ impl Compiler {
         }) = self.cur().control.last_mut()
         {
             let patches = std::mem::take(continue_patches);
-            for idx in patches {
-                self.patch_jump(idx, addr);
-            }
+            self.patch_all(patches, addr);
         }
     }
 
     fn pop_loop_breaks(&mut self, end_addr: u32) {
         if let Some(Ctrl::Loop { break_patches, .. }) = self.cur().control.pop() {
-            for idx in break_patches {
-                self.patch_jump(idx, end_addr);
-            }
+            self.patch_all(break_patches, end_addr);
         }
     }
 
@@ -414,9 +414,7 @@ impl Compiler {
                 self.compile_stmt(body)?;
                 let end = self.cur_addr();
                 if let Some(Ctrl::Labeled { break_patches, .. }) = self.cur().control.pop() {
-                    for idx in break_patches {
-                        self.patch_jump(idx, end);
-                    }
+                    self.patch_all(break_patches, end);
                 }
                 Ok(())
             }
@@ -492,9 +490,7 @@ impl Compiler {
         let end = self.cur_addr();
         self.patch_jump(end_trampoline_jump, end);
         if let Some(Ctrl::Switch { break_patches }) = self.cur().control.pop() {
-            for idx in break_patches {
-                self.patch_jump(idx, end);
-            }
+            self.patch_all(break_patches, end);
         }
         self.cur().locals.truncate(saved_len);
         Ok(())
@@ -546,26 +542,28 @@ impl Compiler {
         Ok(target)
     }
 
-    fn compile_break(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
-        let target_idx = self.unwind_control_to(JumpControl::Break, label, line)?;
+    fn compile_jump_control(
+        &mut self,
+        kind: JumpControl,
+        label: Option<&str>,
+        line: u32,
+    ) -> CResult<()> {
+        let target_idx = self.unwind_control_to(kind, label, line)?;
         let jidx = self.emit_jump(OpCode::Jump, line);
-        match &mut self.cur().control[target_idx] {
-            Ctrl::Loop { break_patches, .. }
-            | Ctrl::Switch { break_patches }
-            | Ctrl::Labeled { break_patches, .. } => break_patches.push(jidx),
+        match (kind, &mut self.cur().control[target_idx]) {
+            (
+                JumpControl::Break,
+                Ctrl::Loop { break_patches, .. }
+                | Ctrl::Switch { break_patches }
+                | Ctrl::Labeled { break_patches, .. },
+            ) => break_patches.push(jidx),
+            (
+                JumpControl::Continue,
+                Ctrl::Loop {
+                    continue_patches, ..
+                },
+            ) => continue_patches.push(jidx),
             _ => unreachable!(),
-        }
-        Ok(())
-    }
-
-    fn compile_continue(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
-        let target_idx = self.unwind_control_to(JumpControl::Continue, label, line)?;
-        let jidx = self.emit_jump(OpCode::Jump, line);
-        if let Ctrl::Loop {
-            continue_patches, ..
-        } = &mut self.cur().control[target_idx]
-        {
-            continue_patches.push(jidx);
         }
         Ok(())
     }

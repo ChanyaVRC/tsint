@@ -12,6 +12,12 @@
 
 use crate::ast::{Pos, Span};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegexToken {
+    pub pattern: String,
+    pub flags: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Ident(String),
@@ -25,10 +31,7 @@ pub enum TokenKind {
     TemplateMiddle(String),
     /// `` }...` `` — 末尾断片。
     TemplateTail(String),
-    Regex {
-        pattern: String,
-        flags: String,
-    },
+    Regex(Box<RegexToken>),
     Punct(Punct),
     Eof,
 }
@@ -174,7 +177,7 @@ fn regex_allowed_after(kind: &TokenKind) -> bool {
         | TokenKind::Str(_)
         | TokenKind::NoSubTemplate(_)
         | TokenKind::TemplateTail(_)
-        | TokenKind::Regex { .. } => false,
+        | TokenKind::Regex(_) => false,
         TokenKind::Punct(p) => !matches!(
             p,
             Punct::RParen | Punct::RBracket | Punct::PlusPlus | Punct::MinusMinus
@@ -709,17 +712,18 @@ impl<'a> Lexer<'a> {
         let bytes = self.bytes;
         let mut s: Option<String> = None;
         let mut chunk_start = start;
+        let finish = |buf: Option<String>, tail: &str| match buf {
+            Some(mut b) => {
+                b.push_str(tail);
+                b
+            }
+            None => tail.to_owned(),
+        };
         loop {
             match bytes.get(self.pos).copied() {
                 None => return Err(self.err("テンプレートリテラルが閉じられていません")),
                 Some(b'`') => {
-                    let result = match s {
-                        Some(mut buf) => {
-                            buf.push_str(&self.src[chunk_start..self.pos]);
-                            buf
-                        }
-                        None => self.src[chunk_start..self.pos].to_owned(),
-                    };
+                    let result = finish(s, &self.src[chunk_start..self.pos]);
                     self.advance_ascii();
                     return Ok(match part_pos {
                         TemplatePartPos::Head => TokenKind::NoSubTemplate(result),
@@ -727,13 +731,7 @@ impl<'a> Lexer<'a> {
                     });
                 }
                 Some(b'$') if bytes.get(self.pos + 1) == Some(&b'{') => {
-                    let result = match s {
-                        Some(mut buf) => {
-                            buf.push_str(&self.src[chunk_start..self.pos]);
-                            buf
-                        }
-                        None => self.src[chunk_start..self.pos].to_owned(),
-                    };
+                    let result = finish(s, &self.src[chunk_start..self.pos]);
                     self.pos += 2;
                     self.col += 2;
                     self.brace_stack.push(BraceCtx::Template);
@@ -789,15 +787,40 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
-                    return Ok(TokenKind::Regex {
+                    return Ok(TokenKind::Regex(Box::new(RegexToken {
                         pattern: self.src[pat_start..pat_end].to_owned(),
                         flags: self.src[flags_start..self.pos].to_owned(),
-                    });
+                    })));
                 }
                 Some(_) => {
                     self.advance_char();
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn eq_or(&mut self, with_eq: Punct, plain: Punct) -> Punct {
+        if self.eat_byte(b'=') {
+            with_eq
+        } else {
+            plain
+        }
+    }
+
+    #[inline]
+    fn double_or_eq(
+        &mut self,
+        b: u8,
+        double_eq: Punct,
+        double: Punct,
+        single_eq: Punct,
+        single: Punct,
+    ) -> Punct {
+        if self.eat_byte(b) {
+            self.eq_or(double_eq, double)
+        } else {
+            self.eq_or(single_eq, single)
         }
     }
 
@@ -825,6 +848,7 @@ impl<'a> Lexer<'a> {
             b'~' => Tilde,
             b'@' => At,
             b'#' => Hash,
+            b':' => Colon,
             b'.' => {
                 if self.peek_byte() == Some(b'.') && self.peek_byte_at(1) == Some(b'.') {
                     self.advance_ascii();
@@ -834,20 +858,14 @@ impl<'a> Lexer<'a> {
                     Dot
                 }
             }
-            b':' => Colon,
             b'?' => {
                 if self.peek_byte() == Some(b'.')
                     && !self.peek_byte_at(1).is_some_and(|d| d.is_ascii_digit())
                 {
                     self.advance_ascii();
                     QuestionDot
-                } else if self.peek_byte() == Some(b'?') {
-                    self.advance_ascii();
-                    if self.eat_byte(b'=') {
-                        QuestionQuestionEq
-                    } else {
-                        QuestionQuestion
-                    }
+                } else if self.eat_byte(b'?') {
+                    self.eq_or(QuestionQuestionEq, QuestionQuestion)
                 } else {
                     Question
                 }
@@ -855,55 +873,27 @@ impl<'a> Lexer<'a> {
             b'+' => {
                 if self.eat_byte(b'+') {
                     PlusPlus
-                } else if self.eat_byte(b'=') {
-                    PlusEq
                 } else {
-                    Plus
+                    self.eq_or(PlusEq, Plus)
                 }
             }
             b'-' => {
                 if self.eat_byte(b'-') {
                     MinusMinus
-                } else if self.eat_byte(b'=') {
-                    MinusEq
                 } else {
-                    Minus
+                    self.eq_or(MinusEq, Minus)
                 }
             }
-            b'*' => {
-                if self.eat_byte(b'*') {
-                    if self.eat_byte(b'=') {
-                        StarStarEq
-                    } else {
-                        StarStar
-                    }
-                } else if self.eat_byte(b'=') {
-                    StarEq
-                } else {
-                    Star
-                }
-            }
-            b'/' => {
-                if self.eat_byte(b'=') {
-                    SlashEq
-                } else {
-                    Slash
-                }
-            }
-            b'%' => {
-                if self.eat_byte(b'=') {
-                    PercentEq
-                } else {
-                    Percent
-                }
-            }
+            b'*' => self.double_or_eq(b'*', StarStarEq, StarStar, StarEq, Star),
+            b'/' => self.eq_or(SlashEq, Slash),
+            b'%' => self.eq_or(PercentEq, Percent),
+            b'^' => self.eq_or(CaretEq, Caret),
+            b'<' => self.double_or_eq(b'<', LtLtEq, LtLt, LtEq, Lt),
+            b'&' => self.double_or_eq(b'&', AmpAmpEq, AmpAmp, AmpEq, Amp),
+            b'|' => self.double_or_eq(b'|', PipePipeEq, PipePipe, PipeEq, Pipe),
             b'=' => {
-                if self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'=') {
-                    self.advance_ascii();
-                    self.advance_ascii();
-                    EqEqEq
-                } else if self.eat_byte(b'=') {
-                    EqEq
+                if self.eat_byte(b'=') {
+                    self.eq_or(EqEqEq, EqEq)
                 } else if self.eat_byte(b'>') {
                     Arrow
                 } else {
@@ -911,85 +901,17 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'!' => {
-                if self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'=') {
-                    self.advance_ascii();
-                    self.advance_ascii();
-                    NotEqEq
-                } else if self.eat_byte(b'=') {
-                    NotEq
+                if self.eat_byte(b'=') {
+                    self.eq_or(NotEqEq, NotEq)
                 } else {
                     Bang
                 }
             }
-            b'<' => {
-                if self.peek_byte() == Some(b'<') {
-                    self.advance_ascii();
-                    if self.eat_byte(b'=') {
-                        LtLtEq
-                    } else {
-                        LtLt
-                    }
-                } else if self.eat_byte(b'=') {
-                    LtEq
-                } else {
-                    Lt
-                }
-            }
             b'>' => {
-                if self.peek_byte() == Some(b'>') && self.peek_byte_at(1) == Some(b'>') {
-                    self.advance_ascii();
-                    self.advance_ascii();
-                    if self.eat_byte(b'=') {
-                        GtGtGtEq
-                    } else {
-                        GtGtGt
-                    }
-                } else if self.peek_byte() == Some(b'>') {
-                    self.advance_ascii();
-                    if self.eat_byte(b'=') {
-                        GtGtEq
-                    } else {
-                        GtGt
-                    }
-                } else if self.eat_byte(b'=') {
-                    GtEq
+                if self.eat_byte(b'>') {
+                    self.double_or_eq(b'>', GtGtGtEq, GtGtGt, GtGtEq, GtGt)
                 } else {
-                    Gt
-                }
-            }
-            b'&' => {
-                if self.peek_byte() == Some(b'&') {
-                    self.advance_ascii();
-                    if self.eat_byte(b'=') {
-                        AmpAmpEq
-                    } else {
-                        AmpAmp
-                    }
-                } else if self.eat_byte(b'=') {
-                    AmpEq
-                } else {
-                    Amp
-                }
-            }
-            b'|' => {
-                if self.peek_byte() == Some(b'|') {
-                    self.advance_ascii();
-                    if self.eat_byte(b'=') {
-                        PipePipeEq
-                    } else {
-                        PipePipe
-                    }
-                } else if self.eat_byte(b'=') {
-                    PipeEq
-                } else {
-                    Pipe
-                }
-            }
-            b'^' => {
-                if self.eat_byte(b'=') {
-                    CaretEq
-                } else {
-                    Caret
+                    self.eq_or(GtEq, Gt)
                 }
             }
             other => return Err(self.err(format!("不正な文字です: {:?}", other as char))),

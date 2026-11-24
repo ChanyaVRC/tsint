@@ -37,31 +37,11 @@ impl Vm {
             }
             self.track_object(&obj);
             if let Ok(b) = obj.try_borrow() {
-                let mut push_untracked = |child: &ObjRef| {
+                gc_visit_obj_data(&b, None, &mut |child| {
                     if Rc::weak_count(child) == 0 {
                         stack.push(child.clone());
                     }
-                };
-                gc_visit_props_and_proto(&b, &mut push_untracked);
-                match &b.kind {
-                    ObjKind::Array(items) => {
-                        for it in items {
-                            gc_visit_value(it, &mut push_untracked);
-                        }
-                    }
-                    ObjKind::Map(m) => {
-                        for (k, val) in &m.entries {
-                            gc_visit_value(k, &mut push_untracked);
-                            gc_visit_value(val, &mut push_untracked);
-                        }
-                    }
-                    ObjKind::Set(s) => {
-                        for val in &s.values {
-                            gc_visit_value(val, &mut push_untracked);
-                        }
-                    }
-                    _ => {}
-                }
+                });
             }
         }
     }
@@ -170,31 +150,39 @@ impl Vm {
             });
         }
 
-        // ---- Phase 2: 死亡済み弱参照の除去と未マーク候補の収集 ----
-        let raw_weaks = std::mem::take(&mut *self.gc_objects.borrow_mut());
-        let mut live_weaks: Vec<Weak<RefCell<ObjData>>> = Vec::with_capacity(raw_weaks.len());
-        let mut seen_weaks: FastHashSet<usize> =
-            FastHashSet::with_capacity_and_hasher(raw_weaks.len(), Default::default());
+        // ---- Phase 2: 死亡済み弱参照の除去と未マーク候補の収集（in-place 圧縮） ----
+        let mut live_weaks = std::mem::take(&mut *self.gc_objects.borrow_mut());
+        let mut seen_weaks: FastHashSet<usize> = FastHashSet::default();
         let mut candidates: Vec<(usize, ObjRef)> = Vec::new();
         let mut candidate_idx: FastHashMap<usize, usize> = FastHashMap::default();
 
-        for w in raw_weaks {
-            if let Some(rc) = w.upgrade() {
-                let ptr = Rc::as_ptr(&rc) as usize;
-                if !seen_weaks.insert(ptr) {
-                    continue;
-                }
-                live_weaks.push(w);
-                if !marked.contains(&ptr) {
-                    let idx = candidates.len();
-                    candidate_idx.insert(ptr, idx);
-                    candidates.push((ptr, rc));
-                }
+        live_weaks.retain(|w| {
+            let Some(rc) = w.upgrade() else {
+                return false;
+            };
+            let ptr = Rc::as_ptr(&rc) as usize;
+            if w.weak_count() > 1 && !seen_weaks.insert(ptr) {
+                return false;
             }
-        }
+            if !marked.contains(&ptr) {
+                let idx = candidates.len();
+                candidate_idx.insert(ptr, idx);
+                candidates.push((ptr, rc));
+            }
+            true
+        });
+
+        let finish_weaks = |weaks: &mut Vec<Weak<RefCell<ObjData>>>| -> usize {
+            let live_count = weaks.len();
+            let cap_limit = live_count.saturating_mul(4).max(GC_MIN_THRESHOLD);
+            if weaks.capacity() > cap_limit {
+                weaks.shrink_to(live_count.saturating_mul(2).max(GC_MIN_THRESHOLD));
+            }
+            live_count
+        };
 
         if candidates.is_empty() {
-            let live_count = live_weaks.len();
+            let live_count = finish_weaks(&mut live_weaks);
             *self.gc_objects.borrow_mut() = live_weaks;
             self.gc_allocs_since_last.set(0);
             self.gc_threshold = (live_count * 2).max(GC_MIN_THRESHOLD);
@@ -259,7 +247,7 @@ impl Vm {
         drop(candidates);
         live_weaks.retain(|w| w.strong_count() > 0);
 
-        let live_count = live_weaks.len();
+        let live_count = finish_weaks(&mut live_weaks);
         *self.gc_objects.borrow_mut() = live_weaks;
         self.gc_allocs_since_last.set(0);
         self.gc_threshold = (live_count * 2).max(GC_MIN_THRESHOLD);
@@ -359,11 +347,11 @@ fn gc_visit_props_and_proto(b: &ObjData, f: &mut impl FnMut(&ObjRef)) {
     for (_, slot) in b.props.iter() {
         match slot {
             PropSlot::Value(v) => gc_visit_value(v, f),
-            PropSlot::Accessor { get, set } => {
-                if let Some(v) = get {
+            PropSlot::Accessor(acc) => {
+                if let Some(v) = &acc.get {
                     gc_visit_value(v, f);
                 }
-                if let Some(v) = set {
+                if let Some(v) = &acc.set {
                     gc_visit_value(v, f);
                 }
             }
@@ -419,7 +407,7 @@ fn gc_visit_obj_data(
             if let Some(ctor) = &cd.ctor {
                 gc_visit_fn_upvalues(ctor, dedup.as_deref_mut(), f);
             }
-            for (_, init) in &cd.instance_fields {
+            for (_, init) in cd.instance_fields.iter() {
                 if let Some(fo) = init {
                     gc_visit_fn_upvalues(fo, dedup.as_deref_mut(), f);
                 }

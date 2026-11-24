@@ -8,7 +8,7 @@ use crate::value::*;
 
 use super::ops::{
     array_values, js_add, js_compare, loose_eq, to_int32, to_number, to_property_key_string,
-    to_string_basic, to_string_into, to_uint32,
+    to_string_into, to_uint32, with_str_buf_rc,
 };
 use super::{ascii_char_rc, LocalSlot, RunOutcome, Vm};
 
@@ -65,6 +65,60 @@ impl Vm {
                 let gc_due_ptr = &self.gc_allocs_since_last;
                 let gc_thresh = self.gc_threshold;
                 let native_depth = self.native_call_depth;
+
+                macro_rules! pop_v {
+                    () => {
+                        frame.stack.pop().expect("オペランドスタックが空です")
+                    };
+                }
+                macro_rules! top_mut {
+                    () => {
+                        frame.stack.last_mut().expect("オペランドスタックが空です")
+                    };
+                }
+                macro_rules! bin_num {
+                    ($op:expr) => {{
+                        let b = pop_v!();
+                        let a = top_mut!();
+                        let f: fn(f64, f64) -> f64 = $op;
+                        let r = match (&*a, &b) {
+                            (Value::Number(x), Value::Number(y)) => f(*x, *y),
+                            _ => f(to_number(a), to_number(&b)),
+                        };
+                        *a = Value::Number(r);
+                    }};
+                }
+                macro_rules! bin_cmp {
+                    ($num_op:expr, $ord_op:expr) => {{
+                        let b = pop_v!();
+                        let a = top_mut!();
+                        let r = match (&*a, &b) {
+                            (Value::Number(x), Value::Number(y)) => $num_op(*x, *y),
+                            _ => js_compare(a, &b).is_some_and($ord_op),
+                        };
+                        *a = Value::Bool(r);
+                    }};
+                }
+                macro_rules! cmp_jump_false {
+                    ($addr:expr, $num_op:expr, $ord_op:expr) => {{
+                        let b = pop_v!();
+                        let a = pop_v!();
+                        let cond = match (&a, &b) {
+                            (Value::Number(x), Value::Number(y)) => $num_op(*x, *y),
+                            _ => js_compare(&a, &b).is_some_and($ord_op),
+                        };
+                        if !cond {
+                            ip = $addr as usize;
+                        }
+                    }};
+                }
+                macro_rules! bin_bit {
+                    ($op:expr) => {{
+                        let b = pop_v!();
+                        let a = top_mut!();
+                        *a = Value::Number($op(a, &b) as f64);
+                    }};
+                }
 
                 loop {
                     let op_ip = ip;
@@ -376,185 +430,92 @@ impl Vm {
 
                         // --- 算術・比較・ビット演算の高速パス ---
                         OpCode::Add => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = top_mut!();
                             match (&*a, &b) {
                                 (Value::Number(x), Value::Number(y)) => *a = Value::Number(*x + *y),
                                 _ => *a = js_add(a, &b),
                             }
                         }
-                        OpCode::Sub => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x - *y,
-                                _ => to_number(a) - to_number(&b),
-                            };
-                            *a = Value::Number(r);
-                        }
-                        OpCode::Mul => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x * *y,
-                                _ => to_number(a) * to_number(&b),
-                            };
-                            *a = Value::Number(r);
-                        }
-                        OpCode::Div => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x / *y,
-                                _ => to_number(a) / to_number(&b),
-                            };
-                            *a = Value::Number(r);
-                        }
-                        OpCode::Mod => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x % *y,
-                                _ => to_number(a) % to_number(&b),
-                            };
-                            *a = Value::Number(r);
-                        }
-                        OpCode::Pow => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => x.powf(*y),
-                                _ => to_number(a).powf(to_number(&b)),
-                            };
-                            *a = Value::Number(r);
-                        }
+                        OpCode::Sub => bin_num!(|x, y| x - y),
+                        OpCode::Mul => bin_num!(|x, y| x * y),
+                        OpCode::Div => bin_num!(|x, y| x / y),
+                        OpCode::Mod => bin_num!(|x, y| x % y),
+                        OpCode::Pow => bin_num!(f64::powf),
                         OpCode::Eq => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = top_mut!();
                             *a = Value::Bool(loose_eq(a, &b));
                         }
                         OpCode::NotEq => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = top_mut!();
                             *a = Value::Bool(!loose_eq(a, &b));
                         }
                         OpCode::StrictEq => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = top_mut!();
                             *a = Value::Bool(strict_eq(a, &b));
                         }
                         OpCode::StrictNotEq => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = top_mut!();
                             *a = Value::Bool(!strict_eq(a, &b));
                         }
-                        OpCode::Lt => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x < *y,
-                                _ => js_compare(a, &b) == Some(std::cmp::Ordering::Less),
-                            };
-                            *a = Value::Bool(r);
-                        }
-                        OpCode::Gt => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x > *y,
-                                _ => js_compare(a, &b) == Some(std::cmp::Ordering::Greater),
-                            };
-                            *a = Value::Bool(r);
-                        }
+                        OpCode::Lt => bin_cmp!(|x, y| x < y, |o| o == std::cmp::Ordering::Less),
+                        OpCode::Gt => bin_cmp!(|x, y| x > y, |o| o == std::cmp::Ordering::Greater),
                         OpCode::LtEq => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x <= *y,
-                                _ => js_compare(a, &b)
-                                    .is_some_and(|o| o != std::cmp::Ordering::Greater),
-                            };
-                            *a = Value::Bool(r);
+                            bin_cmp!(|x, y| x <= y, |o| o != std::cmp::Ordering::Greater)
                         }
-                        OpCode::GtEq => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = match (&*a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x >= *y,
-                                _ => {
-                                    js_compare(a, &b).is_some_and(|o| o != std::cmp::Ordering::Less)
-                                }
-                            };
-                            *a = Value::Bool(r);
-                        }
+                        OpCode::GtEq => bin_cmp!(|x, y| x >= y, |o| o != std::cmp::Ordering::Less),
                         OpCode::Shl => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = to_int32(a).wrapping_shl(to_int32(&b) as u32 & 31);
-                            *a = Value::Number(r as f64);
+                            bin_bit!(|a, b| to_int32(a).wrapping_shl(to_int32(b) as u32 & 31))
                         }
                         OpCode::Shr => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = to_int32(a).wrapping_shr(to_int32(&b) as u32 & 31);
-                            *a = Value::Number(r as f64);
+                            bin_bit!(|a, b| to_int32(a).wrapping_shr(to_int32(b) as u32 & 31))
                         }
                         OpCode::UShr => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            let r = to_uint32(a).wrapping_shr(to_int32(&b) as u32 & 31);
-                            *a = Value::Number(r as f64);
+                            bin_bit!(|a, b| to_uint32(a).wrapping_shr(to_int32(b) as u32 & 31))
                         }
-                        OpCode::BitAnd => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            *a = Value::Number((to_int32(a) & to_int32(&b)) as f64);
-                        }
-                        OpCode::BitOr => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            *a = Value::Number((to_int32(a) | to_int32(&b)) as f64);
-                        }
-                        OpCode::BitXor => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
-                            *a = Value::Number((to_int32(a) ^ to_int32(&b)) as f64);
-                        }
+                        OpCode::BitAnd => bin_bit!(|a, b| to_int32(a) & to_int32(b)),
+                        OpCode::BitOr => bin_bit!(|a, b| to_int32(a) | to_int32(b)),
+                        OpCode::BitXor => bin_bit!(|a, b| to_int32(a) ^ to_int32(b)),
                         OpCode::Neg => {
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let a = top_mut!();
                             *a = Value::Number(-to_number(a));
                         }
                         OpCode::Pos => {
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let a = top_mut!();
                             *a = Value::Number(to_number(a));
                         }
                         OpCode::Not => {
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let a = top_mut!();
                             *a = Value::Bool(!a.to_bool());
                         }
                         OpCode::BitNot => {
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let a = top_mut!();
                             *a = Value::Number(!to_int32(a) as f64);
                         }
                         OpCode::TypeOf => {
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let a = top_mut!();
                             *a = Value::str(a.type_of());
                         }
                         OpCode::ToStringOp => {
-                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let a = top_mut!();
                             if !matches!(a, Value::Str(_)) {
-                                *a = Value::Str(to_string_basic(a).into());
+                                *a = Value::Str(with_str_buf_rc(|buf| to_string_into(a, buf)));
                             }
                         }
                         OpCode::ConcatStrings(count) => {
                             let cnt = count as usize;
                             let start = frame.stack.len() - cnt;
-                            let mut buf = String::new();
-                            for v in &frame.stack[start..] {
-                                to_string_into(v, &mut buf);
-                            }
+                            let rc = with_str_buf_rc(|buf| {
+                                for v in &frame.stack[start..] {
+                                    to_string_into(v, buf);
+                                }
+                            });
                             frame.stack.truncate(start);
-                            frame.stack.push(Value::Str(buf.into()));
+                            frame.stack.push(Value::Str(rc));
                         }
 
                         // --- 制御フロー・融合比較ジャンプ ---
@@ -568,14 +529,12 @@ impl Vm {
                             }
                         }
                         OpCode::JumpIfFalse(addr) => {
-                            let v = frame.stack.pop().expect("オペランドスタックが空です");
-                            if !v.to_bool() {
+                            if !pop_v!().to_bool() {
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfTrue(addr) => {
-                            let v = frame.stack.pop().expect("オペランドスタックが空です");
-                            if v.to_bool() {
+                            if pop_v!().to_bool() {
                                 let target = addr as usize;
                                 ip = target;
                                 if target <= op_ip
@@ -588,146 +547,86 @@ impl Vm {
                             }
                         }
                         OpCode::LtJumpIfFalse(addr) => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.pop().expect("オペランドスタックが空です");
-                            let cond = match (&a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x < *y,
-                                _ => js_compare(&a, &b) == Some(std::cmp::Ordering::Less),
-                            };
-                            if !cond {
-                                ip = addr as usize;
-                            }
+                            cmp_jump_false!(addr, |x, y| x < y, |o| o == std::cmp::Ordering::Less)
                         }
                         OpCode::LtEqJumpIfFalse(addr) => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.pop().expect("オペランドスタックが空です");
-                            let cond = match (&a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x <= *y,
-                                _ => js_compare(&a, &b)
-                                    .is_some_and(|o| o != std::cmp::Ordering::Greater),
-                            };
-                            if !cond {
-                                ip = addr as usize;
-                            }
+                            cmp_jump_false!(addr, |x, y| x <= y, |o| o
+                                != std::cmp::Ordering::Greater)
                         }
                         OpCode::GtJumpIfFalse(addr) => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.pop().expect("オペランドスタックが空です");
-                            let cond = match (&a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x > *y,
-                                _ => js_compare(&a, &b) == Some(std::cmp::Ordering::Greater),
-                            };
-                            if !cond {
-                                ip = addr as usize;
-                            }
+                            cmp_jump_false!(addr, |x, y| x > y, |o| o
+                                == std::cmp::Ordering::Greater)
                         }
                         OpCode::GtEqJumpIfFalse(addr) => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.pop().expect("オペランドスタックが空です");
-                            let cond = match (&a, &b) {
-                                (Value::Number(x), Value::Number(y)) => *x >= *y,
-                                _ => js_compare(&a, &b)
-                                    .is_some_and(|o| o != std::cmp::Ordering::Less),
-                            };
-                            if !cond {
-                                ip = addr as usize;
-                            }
+                            cmp_jump_false!(addr, |x, y| x >= y, |o| o != std::cmp::Ordering::Less)
                         }
                         OpCode::StrictEqJumpIfFalse(addr) => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = pop_v!();
                             if !strict_eq(&a, &b) {
                                 ip = addr as usize;
                             }
                         }
                         OpCode::StrictNotEqJumpIfFalse(addr) => {
-                            let b = frame.stack.pop().expect("オペランドスタックが空です");
-                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            let b = pop_v!();
+                            let a = pop_v!();
                             if strict_eq(&a, &b) {
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfNullish(addr) => {
-                            if frame
-                                .stack
-                                .last()
-                                .expect("オペランドスタックが空です")
-                                .is_nullish()
-                            {
-                                *frame.stack.last_mut().unwrap() = Value::Undefined;
+                            if top_mut!().is_nullish() {
+                                *top_mut!() = Value::Undefined;
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfNullishCall(addr) => {
-                            if frame
-                                .stack
-                                .last()
-                                .expect("オペランドスタックが空です")
-                                .is_nullish()
-                            {
+                            if top_mut!().is_nullish() {
                                 frame.stack.pop();
-                                *frame.stack.last_mut().unwrap() = Value::Undefined;
+                                *top_mut!() = Value::Undefined;
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfFalsyKeep(addr) => {
-                            if !frame
-                                .stack
-                                .last()
-                                .expect("オペランドスタックが空です")
-                                .to_bool()
-                            {
+                            if !top_mut!().to_bool() {
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfTruthyKeep(addr) => {
-                            if frame
-                                .stack
-                                .last()
-                                .expect("オペランドスタックが空です")
-                                .to_bool()
-                            {
+                            if top_mut!().to_bool() {
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfNotNullishKeep(addr) => {
-                            if !frame
-                                .stack
-                                .last()
-                                .expect("オペランドスタックが空です")
-                                .is_nullish()
-                            {
+                            if !top_mut!().is_nullish() {
                                 ip = addr as usize;
                             }
                         }
                         OpCode::JumpIfNotUndefinedKeep(addr) => {
-                            if !matches!(
-                                frame.stack.last().expect("オペランドスタックが空です"),
-                                Value::Undefined
-                            ) {
+                            if !matches!(top_mut!(), Value::Undefined) {
                                 ip = addr as usize;
                             } else {
                                 frame.stack.pop();
                             }
                         }
                         OpCode::ArrayPush => {
-                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            let v = pop_v!();
                             if let Some(Value::Object(o)) = frame.stack.last() {
                                 if let ObjKind::Array(items) = &mut o.borrow_mut().kind {
                                     items.push(v);
                                 }
                             }
                         }
-                        OpCode::ObjectSetProp(cidx) => {
+                        OpCode::ObjectSetProp(cidx) | OpCode::ObjectSetMethod(cidx) => {
                             let name = frame.chunk.const_str(cidx);
-                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            let v = pop_v!();
                             if let Some(Value::Object(o)) = frame.stack.last() {
                                 o.borrow_mut().props.set_value(name, v);
                             }
                         }
                         OpCode::ObjectSetComputed => {
-                            let v = frame.stack.pop().expect("オペランドスタックが空です");
-                            let key = frame.stack.pop().expect("オペランドスタックが空です");
+                            let v = pop_v!();
+                            let key = pop_v!();
                             if let Some(Value::Object(o)) = frame.stack.last() {
                                 let name: Rc<str> = match &key {
                                     Value::Str(s) => s.clone(),
@@ -736,25 +635,12 @@ impl Vm {
                                 o.borrow_mut().props.set_value(name, v);
                             }
                         }
-                        OpCode::ObjectSetMethod(cidx) => {
+                        OpCode::ObjectDefineGetter(cidx) | OpCode::ObjectDefineSetter(cidx) => {
+                            let is_get = matches!(op, OpCode::ObjectDefineGetter(_));
                             let name = frame.chunk.const_str(cidx);
-                            let f = frame.stack.pop().expect("オペランドスタックが空です");
+                            let f = pop_v!();
                             if let Some(Value::Object(o)) = frame.stack.last() {
-                                o.borrow_mut().props.set_value(name, f);
-                            }
-                        }
-                        OpCode::ObjectDefineGetter(cidx) => {
-                            let name = frame.chunk.const_str(cidx);
-                            let f = frame.stack.pop().expect("オペランドスタックが空です");
-                            if let Some(Value::Object(o)) = frame.stack.last() {
-                                o.borrow_mut().props.define_accessor(name, true, f);
-                            }
-                        }
-                        OpCode::ObjectDefineSetter(cidx) => {
-                            let name = frame.chunk.const_str(cidx);
-                            let f = frame.stack.pop().expect("オペランドスタックが空です");
-                            if let Some(Value::Object(o)) = frame.stack.last() {
-                                o.borrow_mut().props.define_accessor(name, false, f);
+                                o.borrow_mut().props.define_accessor(name, is_get, f);
                             }
                         }
 
@@ -782,6 +668,11 @@ impl Vm {
                 Err(thrown) => self.unwind(thrown, stop_depth)?,
             }
         }
+    }
+
+    #[inline]
+    fn cur_const_str(&self, cidx: ConstIdx) -> Rc<str> {
+        self.frames.last().unwrap().chunk.const_str(cidx)
     }
 
     /// フレーム変更・VM 状態アクセス・低頻度命令を実行する外側ハンドラ。
@@ -821,7 +712,7 @@ impl Vm {
                 .exec_call_method(cidx as ConstIdx, argc as usize, op_ip)
                 .map(|()| None),
             OpCode::GetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let obj = self.pop();
                 self.get_prop_ic(&obj, &name, op_ip).map(|v| {
                     self.push(v);
@@ -829,7 +720,7 @@ impl Vm {
                 })
             }
             OpCode::SetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let value = self.pop();
                 let obj = self.pop();
                 self.set_prop_rc(&obj, &name, value.clone()).map(|()| {
@@ -861,7 +752,7 @@ impl Vm {
                 Err(self.reference_error("変数が初期化される前にアクセスされました（TDZ）"))
             }
             OpCode::GetGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 match self.globals.get(&name) {
                     Some(cell) => {
                         let v = cell.borrow().clone();
@@ -878,7 +769,7 @@ impl Vm {
                 }
             }
             OpCode::SetGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let v = self.top().clone();
                 match self.globals.get(&name) {
                     Some(cell) => {
@@ -889,7 +780,7 @@ impl Vm {
                 }
             }
             OpCode::BindGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let v = self.pop();
                 self.globals.insert(name, Rc::new(RefCell::new(v)));
                 Ok(None)
@@ -906,7 +797,7 @@ impl Vm {
                 Ok(None)
             }
             OpCode::DeleteProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let obj = self.pop();
                 let ok = self.delete_prop(&obj, &name);
                 self.push(Value::Bool(ok));
@@ -951,7 +842,7 @@ impl Vm {
                 }
             }
             OpCode::TypeOfGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let s = match self.globals.get(&name) {
                     Some(cell) => {
                         let v = cell.borrow().clone();
@@ -966,10 +857,7 @@ impl Vm {
                 self.push(Value::str(s));
                 Ok(None)
             }
-            OpCode::Throw => {
-                let v = self.pop();
-                Err(v)
-            }
+            OpCode::Throw => Err(self.pop()),
             OpCode::MakeClosure(cidx) => {
                 let tpl = self
                     .frames
@@ -1006,14 +894,21 @@ impl Vm {
                     None
                 })
             }
-            OpCode::NewObject => {
-                let o = self.alloc_plain_object();
+            OpCode::NewObject | OpCode::NewObjectWithCap(_) => {
+                let o = match op {
+                    OpCode::NewObjectWithCap(cap) => self.alloc_plain_object_with_cap(cap as usize),
+                    _ => self.alloc_plain_object(),
+                };
                 self.push(o);
                 self.maybe_gc_if_top_level();
                 Ok(None)
             }
-            OpCode::NewArray => {
-                let a = self.alloc_array(Vec::new());
+            OpCode::NewArray | OpCode::NewArrayWithCap(_) => {
+                let items = match op {
+                    OpCode::NewArrayWithCap(cap) => Vec::with_capacity(cap as usize),
+                    _ => Vec::new(),
+                };
+                let a = self.alloc_array(items);
                 self.push(a);
                 self.maybe_gc_if_top_level();
                 Ok(None)
@@ -1041,7 +936,7 @@ impl Vm {
                             .iter()
                             .filter_map(|(k, s)| match s {
                                 PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                                PropSlot::Accessor { .. } => None,
+                                PropSlot::Accessor(_) => None,
                             })
                             .collect();
                         let arr_items = match &sb.kind {

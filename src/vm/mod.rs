@@ -28,7 +28,7 @@ pub use ops::{
     array_values, is_callable, loose_eq, new_regex_value, number_to_js_string, to_int32, to_number,
     to_primitive, to_property_key_string, to_string_basic, to_uint32,
 };
-pub(crate) use ops::{number_to_js_string_into, to_string_into};
+pub(crate) use ops::{number_to_js_string_into, to_string_into, with_str_buf_rc};
 pub(crate) use props::own_enumerable_keys;
 
 /// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。
@@ -305,7 +305,7 @@ impl Vm {
     #[inline]
     pub(super) fn put_args_buf(&mut self, mut buf: Vec<Value>) {
         buf.clear();
-        if self.args_pool.len() < MAX_ARGS_POOL {
+        if self.args_pool.len() < MAX_ARGS_POOL && buf.capacity() <= 64 {
             self.args_pool.push(buf);
         }
     }
@@ -315,13 +315,65 @@ impl Vm {
         frame.stack.clear();
         frame.locals.clear();
         if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
-            v.clear();
+            if v.capacity() <= 64 {
+                v.clear();
+            } else {
+                frame.raw_args = self.empty_args.clone();
+            }
         } else {
             frame.raw_args = self.empty_args.clone();
         }
         frame.upvalues = self.empty_upvalues.clone();
-        if self.frame_pool.len() < MAX_FRAME_POOL {
+        if self.frame_pool.len() < MAX_FRAME_POOL
+            && frame.stack.capacity() <= 128
+            && frame.locals.capacity() <= 128
+        {
             self.frame_pool.push(frame);
+        }
+    }
+
+    #[inline]
+    fn acquire_pooled_frame(&mut self, fo: &Rc<FunctionObj>) -> Frame {
+        if let Some(mut frame) = self.frame_pool.pop() {
+            frame.chunk = fo.chunk.clone();
+            frame.ip = 0;
+            frame.upvalues = fo.upvalues.clone();
+            frame.stack.clear();
+            frame.reinit_locals();
+            frame
+        } else {
+            Frame::new(
+                fo.chunk.clone(),
+                fo.upvalues.clone(),
+                self.empty_args.clone(),
+            )
+        }
+    }
+
+    #[inline]
+    fn fill_frame_raw_args(
+        &mut self,
+        frame: &mut Frame,
+        needs_raw: bool,
+        fill: impl FnOnce(&mut Vec<Value>),
+    ) {
+        if needs_raw {
+            if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
+                if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                    v.clear();
+                    fill(v);
+                    return;
+                }
+            }
+            let mut v = self.take_args_buf();
+            fill(&mut v);
+            frame.raw_args = Rc::new(v);
+        } else if !frame.raw_args.is_empty() {
+            if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                v.clear();
+            } else {
+                frame.raw_args = self.empty_args.clone();
+            }
         }
     }
 
@@ -333,43 +385,8 @@ impl Vm {
         args: &[Value],
     ) -> Frame {
         let needs_raw = f.chunk.needs_raw_args && !args.is_empty();
-        let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
-            frame.chunk = f.chunk.clone();
-            frame.ip = 0;
-            frame.upvalues = f.upvalues.clone();
-            frame.stack.clear();
-            if needs_raw {
-                if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
-                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
-                        v.clear();
-                        v.extend_from_slice(args);
-                    } else {
-                        let mut v = self.take_args_buf();
-                        v.extend_from_slice(args);
-                        frame.raw_args = Rc::new(v);
-                    }
-                } else {
-                    let mut v = self.take_args_buf();
-                    v.extend_from_slice(args);
-                    frame.raw_args = Rc::new(v);
-                }
-            } else if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
-                v.clear();
-            } else {
-                frame.raw_args = self.empty_args.clone();
-            }
-            frame.reinit_locals();
-            frame
-        } else {
-            let raw_args = if needs_raw {
-                let mut v = self.take_args_buf();
-                v.extend_from_slice(args);
-                Rc::new(v)
-            } else {
-                self.empty_args.clone()
-            };
-            Frame::new(f.chunk.clone(), f.upvalues.clone(), raw_args)
-        };
+        let mut frame = self.acquire_pooled_frame(f);
+        self.fill_frame_raw_args(&mut frame, needs_raw, |v| v.extend_from_slice(args));
         let param_base = if !f.is_arrow && !frame.locals.is_empty() {
             frame.locals[0].set(this);
             1usize
@@ -392,27 +409,13 @@ impl Vm {
         callee_slot: StackCalleeSlot,
     ) {
         let needs_raw = fo.chunk.needs_raw_args && argc > 0;
-        let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
-            frame.chunk = fo.chunk.clone();
-            frame.ip = 0;
-            frame.upvalues = fo.upvalues.clone();
-            frame.stack.clear();
-            frame.reinit_locals();
-            frame
-        } else {
-            Frame::new(
-                fo.chunk.clone(),
-                fo.upvalues.clone(),
-                self.empty_args.clone(),
-            )
-        };
+        let mut frame = self.acquire_pooled_frame(fo);
         let sp = fo.chunk.simple_param_count as usize;
         let param_base = usize::from(!fo.is_arrow && !frame.locals.is_empty());
 
         let this = {
             let caller = self.frames.last_mut().unwrap();
-            let n = caller.stack.len();
-            let arg_start = n - argc;
+            let arg_start = caller.stack.len() - argc;
             if needs_raw {
                 let mut reused = false;
                 if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
@@ -476,18 +479,17 @@ impl Vm {
         self.alloc_obj(ObjData::new(ObjKind::Plain))
     }
 
+    pub(crate) fn alloc_plain_object_with_cap(&self, cap: usize) -> Value {
+        self.alloc_obj(ObjData::with_props_cap(ObjKind::Plain, cap))
+    }
+
     pub(crate) fn alloc_array(&self, items: Vec<Value>) -> Value {
         self.alloc_obj(ObjData::new(ObjKind::Array(items)))
     }
 
     pub(crate) fn alloc_regex_value(&self, re: Rc<crate::regex::Regex>) -> Value {
-        thread_local! {
-            static KEY_LAST_INDEX: Rc<str> = Rc::from("lastIndex");
-        }
-        let mut o = ObjData::new(ObjKind::Regex(re));
-        o.props
-            .set_value(KEY_LAST_INDEX.with(|k| k.clone()), Value::Number(0.0));
-        self.alloc_obj(o)
+        // `lastIndex` は読み取り既定値が 0.0 のため遅延確保する（非 global 正規表現での PropMap 確保ゼロ）。
+        self.alloc_obj(ObjData::new(ObjKind::Regex(re)))
     }
 
     pub(crate) fn alloc_native_with_captures(
@@ -497,12 +499,12 @@ impl Vm {
         captures: Vec<ObjRef>,
         f: NativeFn,
     ) -> Value {
-        self.alloc_obj(ObjData::new(ObjKind::Native(NativeObj {
+        self.alloc_obj(ObjData::new(ObjKind::Native(Box::new(NativeObj {
             name: name.into(),
             arity,
             f,
-            captures,
-        })))
+            captures: captures.into_boxed_slice(),
+        }))))
     }
 
     pub(super) fn wrap_function(&self, fo: Rc<FunctionObj>) -> Value {

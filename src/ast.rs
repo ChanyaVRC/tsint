@@ -73,36 +73,27 @@ fn count_stmts_rec(list: &[Stmt], stmts: &mut usize, funcs: &mut usize) {
     }
 }
 
+fn count_func_rec(f: &Function, stmts: &mut usize, funcs: &mut usize) {
+    *funcs += 1;
+    if let Some(b) = &f.body {
+        count_stmts_rec(b, stmts, funcs);
+    }
+    if let Some(eb) = &f.expr_body {
+        count_expr_rec(eb, stmts, funcs);
+    }
+    for p in &f.params {
+        if let Some(d) = &p.default {
+            count_expr_rec(d, stmts, funcs);
+        }
+    }
+}
+
 fn count_stmt_rec(s: &Stmt, stmts: &mut usize, funcs: &mut usize) {
     *stmts += 1;
     match &s.kind {
-        StmtKind::Block(b) => count_stmts_rec(b, stmts, funcs),
-        StmtKind::VarDecl { decls, .. } => {
-            for d in decls {
-                if let Some(init) = &d.init {
-                    count_expr_rec(init, stmts, funcs);
-                }
-            }
-        }
-        StmtKind::Expr(e) => count_expr_rec(e, stmts, funcs),
-        StmtKind::FunctionDecl(f) => {
-            *funcs += 1;
-            if let Some(b) = &f.body {
-                count_stmts_rec(b, stmts, funcs);
-            }
-        }
+        StmtKind::Block(b) | StmtKind::TsModule { body: b, .. } => count_stmts_rec(b, stmts, funcs),
+        StmtKind::FunctionDecl(f) => count_func_rec(f, stmts, funcs),
         StmtKind::ClassDecl(c) => count_class_rec(c, stmts, funcs),
-        StmtKind::If { test, cons, alt } => {
-            count_expr_rec(test, stmts, funcs);
-            count_stmt_rec(cons, stmts, funcs);
-            if let Some(a) = alt {
-                count_stmt_rec(a, stmts, funcs);
-            }
-        }
-        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            count_expr_rec(test, stmts, funcs);
-            count_stmt_rec(body, stmts, funcs);
-        }
         StmtKind::For {
             init,
             test,
@@ -129,58 +120,22 @@ fn count_stmt_rec(s: &Stmt, stmts: &mut usize, funcs: &mut usize) {
             }
             count_stmt_rec(body, stmts, funcs);
         }
-        StmtKind::ForIn { right, body, .. } => {
-            count_expr_rec(right, stmts, funcs);
-            count_stmt_rec(body, stmts, funcs);
-        }
-        StmtKind::Switch { disc, cases } => {
-            count_expr_rec(disc, stmts, funcs);
-            for c in cases {
-                if let Some(t) = &c.test {
-                    count_expr_rec(t, stmts, funcs);
-                }
-                count_stmts_rec(&c.body, stmts, funcs);
-            }
-        }
-        StmtKind::Try {
-            block,
-            handler,
-            finalizer,
-        } => {
-            count_stmts_rec(block, stmts, funcs);
-            if let Some(h) = handler {
-                count_stmts_rec(&h.body, stmts, funcs);
-            }
-            if let Some(f) = finalizer {
-                count_stmts_rec(f, stmts, funcs);
-            }
-        }
-        StmtKind::Throw(e) => count_expr_rec(e, stmts, funcs),
-        StmtKind::Return(Some(e)) => count_expr_rec(e, stmts, funcs),
-        StmtKind::Labeled { body, .. } => count_stmt_rec(body, stmts, funcs),
         StmtKind::ExportDefault(d) => match d.as_ref() {
             DefaultExportable::Expr(e) => count_expr_rec(e, stmts, funcs),
-            DefaultExportable::Function(f) => {
-                *funcs += 1;
-                if let Some(b) = &f.body {
-                    count_stmts_rec(b, stmts, funcs);
-                }
-            }
+            DefaultExportable::Function(f) => count_func_rec(f, stmts, funcs),
             DefaultExportable::Class(c) => count_class_rec(c, stmts, funcs),
         },
-        StmtKind::ExportDecl(inner) => count_stmt_rec(inner, stmts, funcs),
-        StmtKind::TsModule { body, .. } => count_stmts_rec(body, stmts, funcs),
-        _ => {}
+        _ => {
+            s.for_each_child_expr(&mut |e| count_expr_rec(e, stmts, funcs));
+            s.for_each_child_stmt(&mut |c| count_stmt_rec(c, stmts, funcs));
+        }
     }
 }
 
 fn count_class_rec(c: &Class, stmts: &mut usize, funcs: &mut usize) {
     for m in &c.members {
         if let Some(f) = &m.function {
-            *funcs += 1;
-            if let Some(b) = &f.body {
-                count_stmts_rec(b, stmts, funcs);
-            }
+            count_func_rec(f, stmts, funcs);
         }
         if let Some(v) = &m.value {
             count_expr_rec(v, stmts, funcs);
@@ -190,38 +145,18 @@ fn count_class_rec(c: &Class, stmts: &mut usize, funcs: &mut usize) {
 
 fn count_expr_rec(e: &Expr, stmts: &mut usize, funcs: &mut usize) {
     match &e.kind {
-        ExprKind::Function(f) | ExprKind::Arrow(f) => {
-            *funcs += 1;
-            if let Some(b) = &f.body {
-                count_stmts_rec(b, stmts, funcs);
-            }
-            if let Some(eb) = &f.expr_body {
-                count_expr_rec(eb, stmts, funcs);
-            }
-            for p in &f.params {
-                if let Some(d) = &p.default {
-                    count_expr_rec(d, stmts, funcs);
-                }
-            }
-        }
+        ExprKind::Function(f) | ExprKind::Arrow(f) => count_func_rec(f, stmts, funcs),
         ExprKind::Class(c) => count_class_rec(c, stmts, funcs),
         ExprKind::ObjectLit(props) => {
             for p in props {
                 match p {
                     ObjectProp::KeyValue { value, .. } => count_expr_rec(value, stmts, funcs),
                     ObjectProp::Spread(e) => count_expr_rec(e, stmts, funcs),
-                    ObjectProp::Method { function, .. } => {
-                        *funcs += 1;
-                        if let Some(b) = &function.body {
-                            count_stmts_rec(b, stmts, funcs);
-                        }
-                    }
+                    ObjectProp::Method { function, .. } => count_func_rec(function, stmts, funcs),
                 }
             }
         }
-        _ => {
-            e.for_each_child(&mut |c| count_expr_rec(c, stmts, funcs));
-        }
+        _ => e.for_each_child(&mut |c| count_expr_rec(c, stmts, funcs)),
     }
 }
 
@@ -254,7 +189,7 @@ pub struct VarDeclarator {
 
 #[derive(Debug, Clone)]
 pub enum ForInit {
-    VarDecl(VarKind, Vec<VarDeclarator>),
+    VarDecl(VarKind, Box<[VarDeclarator]>),
     Expr(Box<Expr>),
 }
 
@@ -262,13 +197,13 @@ pub enum ForInit {
 pub struct SwitchCase {
     /// None は default 節。
     pub test: Option<Box<Expr>>,
-    pub body: Vec<Stmt>,
+    pub body: Box<[Stmt]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CatchClause {
     pub param: Option<Pattern>,
-    pub body: Vec<Stmt>,
+    pub body: Box<[Stmt]>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +218,7 @@ pub enum ImportSpecifier {
 
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
-    pub specifiers: Vec<ImportSpecifier>,
+    pub specifiers: Box<[ImportSpecifier]>,
     pub source: String,
     /// `import type { ... }` — 型のみ import（実行時には何も束縛しない）。
     pub type_only: bool,
@@ -306,10 +241,10 @@ pub enum StmtKind {
     Empty,
     Debugger,
     Expr(Box<Expr>),
-    Block(Vec<Stmt>),
+    Block(Box<[Stmt]>),
     VarDecl {
         kind: VarKind,
-        decls: Vec<VarDeclarator>,
+        decls: Box<[VarDeclarator]>,
     },
     FunctionDecl(Box<Function>),
     ClassDecl(Box<Class>),
@@ -341,12 +276,12 @@ pub enum StmtKind {
     },
     Switch {
         disc: Box<Expr>,
-        cases: Vec<SwitchCase>,
+        cases: Box<[SwitchCase]>,
     },
     Try {
-        block: Vec<Stmt>,
-        handler: Option<CatchClause>,
-        finalizer: Option<Vec<Stmt>>,
+        block: Box<[Stmt]>,
+        handler: Option<Box<CatchClause>>,
+        finalizer: Option<Box<[Stmt]>>,
     },
     Throw(Box<Expr>),
     Return(Option<Box<Expr>>),
@@ -356,16 +291,16 @@ pub enum StmtKind {
         label: String,
         body: Box<Stmt>,
     },
-    Import(ImportDecl),
+    Import(Box<ImportDecl>),
     ExportNamed {
-        specifiers: Vec<ExportSpecifier>,
+        specifiers: Box<[ExportSpecifier]>,
         /// `export { a } from "mod"` の再エクスポート元。
-        source: Option<String>,
+        source: Option<Box<str>>,
         type_only: bool,
     },
     ExportAll {
         /// `export * as ns from "mod"` の ns。
-        as_name: Option<String>,
+        as_name: Option<Box<str>>,
         source: String,
     },
     ExportDefault(Box<DefaultExportable>),
@@ -382,7 +317,7 @@ pub enum StmtKind {
     /// `declare module "..." { ... }` / `declare namespace ... { ... }`
     TsModule {
         name: String,
-        body: Vec<Stmt>,
+        body: Box<[Stmt]>,
     },
     /// `declare` が付いた素のアンビエント宣言（module 以外）。中身は捨てる。
     TsAmbientDecl,
@@ -483,10 +418,10 @@ impl Stmt {
 pub struct Function {
     pub id: NodeId,
     pub span: Span,
-    pub name: Option<String>,
-    pub params: Vec<Param>,
+    pub name: Option<Box<str>>,
+    pub params: Box<[Param]>,
     /// None は本体を持たないアンビエント宣言（.d.ts 由来のオーバーロード等）。
-    pub body: Option<Vec<Stmt>>,
+    pub body: Option<Box<[Stmt]>>,
     /// アロー関数の式本体（`x => x + 1`）。body と排他。
     pub expr_body: Option<Box<Expr>>,
     pub is_async: bool,
@@ -504,11 +439,11 @@ pub struct Param {
 pub enum Pattern {
     Ident(String),
     Object {
-        props: Vec<ObjectPatternProp>,
+        props: Box<[ObjectPatternProp]>,
         rest: Option<Box<Pattern>>,
     },
     Array {
-        elements: Vec<Option<Pattern>>,
+        elements: Box<[Option<Pattern>]>,
         rest: Option<Box<Pattern>>,
     },
     /// 分割代入内のデフォルト値付き要素（例: `{ a = 1 }`）。
@@ -547,7 +482,7 @@ pub struct ClassMember {
     pub kind: ClassMemberKind,
     pub is_static: bool,
     pub name: PropertyKey,
-    pub function: Option<Function>,
+    pub function: Option<Box<Function>>,
     pub value: Option<Box<Expr>>,
 }
 
@@ -555,9 +490,9 @@ pub struct ClassMember {
 pub struct Class {
     pub id: NodeId,
     pub span: Span,
-    pub name: Option<String>,
+    pub name: Option<Box<str>>,
     pub super_class: Option<Box<Expr>>,
-    pub members: Vec<ClassMember>,
+    pub members: Box<[ClassMember]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,14 +600,14 @@ pub enum ExprKind {
     TemplateLit {
         /// テンプレートの文字列断片。exprs より 1 つ多い。
         quasis: Vec<String>,
-        exprs: Vec<Expr>,
+        exprs: Box<[Expr]>,
     },
     RegexLit {
         pattern: String,
         flags: String,
     },
-    ArrayLit(Vec<Option<Expr>>),
-    ObjectLit(Vec<ObjectProp>),
+    ArrayLit(Box<[Option<Expr>]>),
+    ObjectLit(Box<[ObjectProp]>),
     Function(Box<Function>),
     Arrow(Box<Function>),
     Class(Box<Class>),
@@ -707,19 +642,19 @@ pub enum ExprKind {
     },
     Call {
         callee: Box<Expr>,
-        args: Vec<Expr>,
+        args: Box<[Expr]>,
         optional: bool,
     },
     New {
         callee: Box<Expr>,
-        args: Vec<Expr>,
+        args: Box<[Expr]>,
     },
     Member {
         obj: Box<Expr>,
         prop: PropertyKey,
         optional: bool,
     },
-    Sequence(Vec<Expr>),
+    Sequence(Box<[Expr]>),
     Spread(Box<Expr>),
     Await(Box<Expr>),
     /// `expr as Type` / `expr as const` — 型は捨てる。

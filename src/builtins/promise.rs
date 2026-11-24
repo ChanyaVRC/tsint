@@ -3,9 +3,11 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use super::{arg, arg_ref, native};
+use super::{arg, arg_ref, lookup_method, native, set_props};
 use crate::value::*;
 use crate::vm::{is_callable, Vm};
+
+const PROMISE_METHODS: &[(&str, usize)] = &[("then", 2), ("catch", 1), ("finally", 1)];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettleMode {
@@ -105,13 +107,15 @@ pub(super) fn install_promise(vm: &mut Vm) {
         }
         Ok(result_val)
     });
-    if let Value::Object(o) = &ctor {
-        let mut b = o.borrow_mut();
-        b.props.set_value(Rc::from("resolve"), resolve);
-        b.props.set_value(Rc::from("reject"), reject);
-        b.props.set_value(Rc::from("race"), race);
-        b.props.set_value(Rc::from("all"), all);
-    }
+    set_props(
+        &ctor,
+        [
+            ("resolve", resolve),
+            ("reject", reject),
+            ("race", race),
+            ("all", all),
+        ],
+    );
     vm.define_global("Promise", ctor);
 }
 
@@ -137,15 +141,40 @@ fn settle_forward_fn(vm: &Vm, target: ObjRef, mode: SettleMode) -> Value {
 }
 
 pub(super) fn promise_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "then" => ("then", 2),
-        "catch" => ("catch", 1),
-        "finally" => ("finally", 1),
-        _ => return None,
-    };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_promise_method(vm, this, static_name, args).unwrap()
-    }))
+    lookup_method(PROMISE_METHODS, name, call_promise_method)
+}
+
+fn finally_wrapper(vm: &Vm, cb: &Value, reject: bool) -> Value {
+    if let Value::Object(cb_obj) = cb {
+        let weak = Rc::downgrade(cb_obj);
+        vm.alloc_native_with_captures(
+            "",
+            1,
+            vec![cb_obj.clone()],
+            Rc::new(move |vm, _this, args| {
+                let v = arg(args, 0);
+                if let Some(c) = weak.upgrade() {
+                    vm.call_value(Value::Object(c), Value::Undefined, &[])?;
+                }
+                if reject {
+                    Err(v)
+                } else {
+                    Ok(v)
+                }
+            }),
+        )
+    } else {
+        let cb_c = cb.clone();
+        native("", 1, move |vm, _this, args| {
+            let v = arg(args, 0);
+            vm.call_value(cb_c.clone(), Value::Undefined, &[])?;
+            if reject {
+                Err(v)
+            } else {
+                Ok(v)
+            }
+        })
+    }
 }
 
 pub(super) fn call_promise_method(
@@ -154,107 +183,35 @@ pub(super) fn call_promise_method(
     name: &str,
     args: &[Value],
 ) -> Option<Result<Value, Value>> {
-    Some(match name {
-        "then" => (|| {
-            let Value::Object(p) = &this else {
-                return Err(vm.type_error("Promise ではありません"));
-            };
-            let on_fulfilled = match arg(args, 0) {
-                v if is_callable(&v) => Some(v),
-                _ => None,
-            };
-            let on_rejected = match arg(args, 1) {
-                v if is_callable(&v) => Some(v),
-                _ => None,
-            };
-            let (result_val, result_obj) = vm.new_pending_promise();
-            vm.add_promise_reaction(
-                p,
-                PromiseReaction::Then {
-                    on_fulfilled,
-                    on_rejected,
-                    result_promise: result_obj,
-                },
-            );
-            Ok(result_val)
-        })(),
-        "catch" => (|| {
-            let Value::Object(p) = &this else {
-                return Err(vm.type_error("Promise ではありません"));
-            };
-            let on_rejected = match arg(args, 0) {
-                v if is_callable(&v) => Some(v),
-                _ => None,
-            };
-            let (result_val, result_obj) = vm.new_pending_promise();
-            vm.add_promise_reaction(
-                p,
-                PromiseReaction::Then {
-                    on_fulfilled: None,
-                    on_rejected,
-                    result_promise: result_obj,
-                },
-            );
-            Ok(result_val)
-        })(),
-        "finally" => (|| {
-            let Value::Object(p) = &this else {
-                return Err(vm.type_error("Promise ではありません"));
-            };
+    let as_callable = |i: usize| {
+        let v = arg(args, i);
+        is_callable(&v).then_some(v)
+    };
+    let reaction = match name {
+        "then" => (as_callable(0), as_callable(1)),
+        "catch" => (None, as_callable(0)),
+        "finally" => {
             let cb = arg(args, 0);
-            let (result_val, result_obj) = vm.new_pending_promise();
-            let (on_fulfilled, on_rejected) = if let Value::Object(cb_obj) = cb {
-                let cb_w1 = Rc::downgrade(&cb_obj);
-                let on_f = vm.alloc_native_with_captures(
-                    "",
-                    1,
-                    vec![cb_obj.clone()],
-                    Rc::new(move |vm, _this, args| {
-                        let v = arg(args, 0);
-                        if let Some(c) = cb_w1.upgrade() {
-                            vm.call_value(Value::Object(c), Value::Undefined, &[])?;
-                        }
-                        Ok(v)
-                    }),
-                );
-                let cb_w2 = Rc::downgrade(&cb_obj);
-                let on_r = vm.alloc_native_with_captures(
-                    "",
-                    1,
-                    vec![cb_obj],
-                    Rc::new(move |vm, _this, args| {
-                        let e = arg(args, 0);
-                        if let Some(c) = cb_w2.upgrade() {
-                            vm.call_value(Value::Object(c), Value::Undefined, &[])?;
-                        }
-                        Err(e)
-                    }),
-                );
-                (on_f, on_r)
-            } else {
-                let cb_f = cb.clone();
-                let on_f = native("", 1, move |vm, _this, args| {
-                    let v = arg(args, 0);
-                    vm.call_value(cb_f.clone(), Value::Undefined, &[])?;
-                    Ok(v)
-                });
-                let on_r = native("", 1, move |vm, _this, args| {
-                    let e = arg(args, 0);
-                    vm.call_value(cb.clone(), Value::Undefined, &[])?;
-                    Err(e)
-                });
-                (on_f, on_r)
-            };
-            vm.add_promise_reaction(
-                p,
-                PromiseReaction::Then {
-                    on_fulfilled: Some(on_fulfilled),
-                    on_rejected: Some(on_rejected),
-                    result_promise: result_obj,
-                },
-            );
-            Ok(result_val)
-        })(),
+            (
+                Some(finally_wrapper(vm, &cb, false)),
+                Some(finally_wrapper(vm, &cb, true)),
+            )
+        }
         _ => return None,
-    })
+    };
+    Some((|| {
+        let Value::Object(p) = &this else {
+            return Err(vm.type_error("Promise ではありません"));
+        };
+        let (result_val, result_obj) = vm.new_pending_promise();
+        vm.add_promise_reaction(
+            p,
+            PromiseReaction::Then {
+                on_fulfilled: reaction.0,
+                on_rejected: reaction.1,
+                result_promise: result_obj,
+            },
+        );
+        Ok(result_val)
+    })())
 }

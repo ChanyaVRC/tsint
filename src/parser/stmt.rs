@@ -1,7 +1,7 @@
 //! 文のパース: 宣言・制御構造・class・import/export・TS のアンビエント宣言。
 
 use super::expr::{is_keyword_like, FnNameMode};
-use super::{PResult, Parser};
+use super::{PResult, Parser, SmallStage};
 use crate::ast::*;
 use crate::lexer::{Punct, TokenKind};
 
@@ -70,8 +70,7 @@ impl Parser {
             }
             _ => {
                 if self.peek_is_punct(1, Punct::Colon) && !is_keyword_like(word) {
-                    let label = word.to_owned();
-                    self.bump(); // ラベル名
+                    let label = self.bump_ident().unwrap();
                     self.bump(); // ':'
                     let body = Box::new(self.parse_stmt()?);
                     return Ok(self.mk_stmt(start, StmtKind::Labeled { label, body }));
@@ -81,14 +80,14 @@ impl Parser {
         }
     }
 
-    pub(super) fn parse_block_stmts(&mut self) -> PResult<Vec<Stmt>> {
+    pub(super) fn parse_block_stmts(&mut self) -> PResult<Box<[Stmt]>> {
         self.expect_punct(Punct::LBrace)?;
-        let mut stmts = Vec::new();
+        let mut stmts = SmallStage::new();
         while !self.is_punct(Punct::RBrace) {
             stmts.push(self.parse_stmt()?);
         }
         self.expect_punct(Punct::RBrace)?;
-        Ok(stmts)
+        Ok(stmts.into_boxed_slice())
     }
 
     fn parse_expr_stmt(&mut self) -> PResult<Stmt> {
@@ -117,29 +116,33 @@ impl Parser {
         Ok(self.mk_stmt(start, StmtKind::VarDecl { kind, decls }))
     }
 
+    fn parse_single_var_declarator(&mut self) -> PResult<VarDeclarator> {
+        let pattern = self.parse_binding_pattern()?;
+        self.eat_punct(Punct::Bang); // 確定代入アサーション `let x!: T;`
+        if self.eat_punct(Punct::Colon) {
+            self.skip_type()?;
+        }
+        let init = if self.eat_punct(Punct::Eq) {
+            Some(Box::new(self.parse_assign_expr()?))
+        } else {
+            None
+        };
+        Ok(VarDeclarator {
+            name: pattern,
+            init,
+        })
+    }
+
     /// `,` 区切りの宣言子リスト。`for (let ...)` の init 部分とも共有する。
-    fn parse_var_declarators(&mut self) -> PResult<Vec<VarDeclarator>> {
-        let mut decls = Vec::new();
+    fn parse_var_declarators(&mut self) -> PResult<Box<[VarDeclarator]>> {
+        let mut decls = SmallStage::new();
         loop {
-            let pattern = self.parse_binding_pattern()?;
-            self.eat_punct(Punct::Bang); // 確定代入アサーション `let x!: T;`
-            if self.eat_punct(Punct::Colon) {
-                self.skip_type()?;
-            }
-            let init = if self.eat_punct(Punct::Eq) {
-                Some(Box::new(self.parse_assign_expr()?))
-            } else {
-                None
-            };
-            decls.push(VarDeclarator {
-                name: pattern,
-                init,
-            });
+            decls.push(self.parse_single_var_declarator()?);
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
         }
-        Ok(decls)
+        Ok(decls.into_boxed_slice())
     }
 
     // ---------- 制御構造 ----------
@@ -216,10 +219,10 @@ impl Parser {
             if self.is_word("of") || self.is_word("in") {
                 let left = ForInit::VarDecl(
                     kind,
-                    vec![VarDeclarator {
+                    Box::new([VarDeclarator {
                         name: first_pattern,
                         init: None,
-                    }],
+                    }]),
                 );
                 return self.parse_for_in_of_tail(start, left, is_await);
             }
@@ -228,23 +231,18 @@ impl Parser {
             } else {
                 None
             };
-            let mut decls = vec![VarDeclarator {
+            let mut decls = SmallStage::new();
+            decls.push(VarDeclarator {
                 name: first_pattern,
                 init: first_init,
-            }];
+            });
             while self.eat_punct(Punct::Comma) {
-                let pat = self.parse_binding_pattern()?;
-                if self.eat_punct(Punct::Colon) {
-                    self.skip_type()?;
-                }
-                let init = if self.eat_punct(Punct::Eq) {
-                    Some(Box::new(self.parse_assign_expr()?))
-                } else {
-                    None
-                };
-                decls.push(VarDeclarator { name: pat, init });
+                decls.push(self.parse_single_var_declarator()?);
             }
-            return self.parse_for_c_style_tail(start, Some(ForInit::VarDecl(kind, decls)));
+            return self.parse_for_c_style_tail(
+                start,
+                Some(ForInit::VarDecl(kind, decls.into_boxed_slice())),
+            );
         }
 
         if self.is_punct(Punct::Semi) {
@@ -319,7 +317,7 @@ impl Parser {
         let disc = self.parse_expr()?;
         self.expect_punct(Punct::RParen)?;
         self.expect_punct(Punct::LBrace)?;
-        let mut cases = Vec::new();
+        let mut cases = SmallStage::new();
         while !self.is_punct(Punct::RBrace) {
             if self.eat_word("case") {
                 let test = self.parse_expr()?;
@@ -342,17 +340,17 @@ impl Parser {
             start,
             StmtKind::Switch {
                 disc: Box::new(disc),
-                cases,
+                cases: cases.into_boxed_slice(),
             },
         ))
     }
 
-    fn parse_case_body(&mut self) -> PResult<Vec<Stmt>> {
-        let mut stmts = Vec::new();
+    fn parse_case_body(&mut self) -> PResult<Box<[Stmt]>> {
+        let mut stmts = SmallStage::new();
         while !self.is_punct(Punct::RBrace) && !self.is_word("case") && !self.is_word("default") {
             stmts.push(self.parse_stmt()?);
         }
-        Ok(stmts)
+        Ok(stmts.into_boxed_slice())
     }
 
     fn parse_try_stmt(&mut self) -> PResult<Stmt> {
@@ -373,7 +371,7 @@ impl Parser {
                 None
             };
             let body = self.parse_block_stmts()?;
-            handler = Some(CatchClause { param, body });
+            handler = Some(Box::new(CatchClause { param, body }));
         }
         if self.eat_word("finally") {
             finalizer = Some(self.parse_block_stmts()?);
@@ -421,15 +419,10 @@ impl Parser {
     fn parse_break_continue(&mut self, jump: LoopJumpKind) -> PResult<Stmt> {
         let start = self.cur_span();
         self.bump(); // break/continue
-        let label = if !self.cur().newline_before {
-            match self.cur_ident() {
-                Some(name) if !is_keyword_like(name) => {
-                    let s = name.to_owned();
-                    self.bump();
-                    Some(s)
-                }
-                _ => None,
-            }
+        let label = if !self.cur().newline_before
+            && self.cur_ident().is_some_and(|n| !is_keyword_like(n))
+        {
+            self.bump_ident()
         } else {
             None
         };
@@ -449,13 +442,7 @@ impl Parser {
         let name = if self.is_word("extends") || self.is_punct(Punct::LBrace) {
             None
         } else {
-            match self.ident_name() {
-                Some(n) => {
-                    self.bump();
-                    Some(n)
-                }
-                None => None,
-            }
+            self.bump_ident().map(String::into_boxed_str)
         };
         self.skip_type_params()?;
         let super_class = if self.eat_word("extends") {
@@ -473,7 +460,7 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::LBrace)?;
-        let mut members = Vec::new();
+        let mut members = SmallStage::new();
         while !self.is_punct(Punct::RBrace) {
             if self.eat_punct(Punct::Semi) {
                 continue;
@@ -486,7 +473,7 @@ impl Parser {
             span: Span::new(start.start, self.prev_end()),
             name,
             super_class,
-            members,
+            members: members.into_boxed_slice(),
         })
     }
 
@@ -585,7 +572,7 @@ impl Parser {
                 },
                 is_static,
                 name,
-                function: Some(function),
+                function: Some(Box::new(function)),
                 value: None,
             });
         }
@@ -614,17 +601,15 @@ impl Parser {
     fn parse_import_stmt(&mut self) -> PResult<Stmt> {
         let start = self.cur_span();
         self.expect_word("import")?;
-        if let TokenKind::Str(s) = &self.cur().kind {
-            let s = s.clone();
-            self.bump();
+        if let Some(s) = self.bump_str() {
             self.consume_semi()?;
             return Ok(self.mk_stmt(
                 start,
-                StmtKind::Import(ImportDecl {
-                    specifiers: vec![],
+                StmtKind::Import(Box::new(ImportDecl {
+                    specifiers: Box::new([]),
                     source: s,
                     type_only: false,
-                }),
+                })),
             ));
         }
 
@@ -638,7 +623,7 @@ impl Parser {
             false
         };
 
-        let mut specifiers = Vec::new();
+        let mut specifiers = SmallStage::new();
         if !self.is_punct(Punct::Star) && !self.is_punct(Punct::LBrace) {
             let name = self.parse_binding_ident()?;
             specifiers.push(ImportSpecifier::Default(name));
@@ -669,11 +654,11 @@ impl Parser {
         self.consume_semi()?;
         Ok(self.mk_stmt(
             start,
-            StmtKind::Import(ImportDecl {
-                specifiers,
+            StmtKind::Import(Box::new(ImportDecl {
+                specifiers: specifiers.into_boxed_slice(),
                 source,
                 type_only,
-            }),
+            })),
         ))
     }
 
@@ -701,7 +686,7 @@ impl Parser {
 
         if self.is_punct(Punct::LBrace) {
             self.bump();
-            let mut specifiers = Vec::new();
+            let mut specifiers = SmallStage::new();
             while !self.is_punct(Punct::RBrace) {
                 let local = self.parse_export_name()?;
                 let exported = if self.eat_word("as") {
@@ -716,7 +701,7 @@ impl Parser {
             }
             self.expect_punct(Punct::RBrace)?;
             let source = if self.eat_word("from") {
-                Some(self.expect_string_lit()?)
+                Some(self.expect_string_lit()?.into_boxed_str())
             } else {
                 None
             };
@@ -724,7 +709,7 @@ impl Parser {
             return Ok(self.mk_stmt(
                 start,
                 StmtKind::ExportNamed {
-                    specifiers,
+                    specifiers: specifiers.into_boxed_slice(),
                     source,
                     type_only,
                 },
@@ -784,7 +769,7 @@ impl Parser {
     fn parse_export_all(&mut self, start: Span) -> PResult<Stmt> {
         self.expect_punct(Punct::Star)?;
         let as_name = if self.eat_word("as") {
-            Some(self.parse_binding_ident()?)
+            Some(self.parse_binding_ident()?.into_boxed_str())
         } else {
             None
         };
@@ -799,14 +784,8 @@ impl Parser {
     }
 
     fn expect_string_lit(&mut self) -> PResult<String> {
-        match &self.cur().kind {
-            TokenKind::Str(s) => {
-                let s = s.clone();
-                self.bump();
-                Ok(s)
-            }
-            _ => Err(self.err("文字列リテラルが必要です")),
-        }
+        self.bump_str()
+            .ok_or_else(|| self.err("文字列リテラルが必要です"))
     }
 
     // ---------- TS declare ----------
@@ -816,11 +795,9 @@ impl Parser {
         self.expect_word("declare")?;
         if self.is_word("module") || self.is_word("namespace") || self.is_word("global") {
             self.bump();
-            let name = if let TokenKind::Str(s) = &self.cur().kind {
-                let s = s.clone();
-                self.bump();
+            let name = if let Some(s) = self.bump_str() {
                 s
-            } else if self.ident_name().is_some() {
+            } else if self.cur_ident().is_some() {
                 let mut n = self.parse_binding_ident()?;
                 while self.eat_punct(Punct::Dot) {
                     n.push('.');

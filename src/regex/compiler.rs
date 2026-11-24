@@ -3,37 +3,39 @@
 use super::charclass::CharClass;
 use super::parser::{Ast, LookaheadKind, QuantifierMode, WordBoundary};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum Inst {
     Char(char),
     Any,
-    Class(CharClass),
-    Save(usize),
-    Jmp(usize),
-    Split(usize, usize),
+    /// `Regex::classes` の添字。
+    Class(u32),
+    Save(u32),
+    Jmp(u32),
+    Split(u32, u32),
     Match,
     Bol,
     Eol,
     WordB(WordBoundary),
-    Backref(usize),
+    Backref(u32),
     /// 先読み。`sub_pc` から始まるサブプログラム（`Inst::Match` で終わる）を
     /// 現在位置 `sp` から試し、成否（`kind`）を判定してから
     /// `after_pc`（サブプログラムの直後ではなく、先読みブロック全体の直後）
     /// へ進む。
     Look {
-        sub_pc: usize,
-        after_pc: usize,
+        sub_pc: u32,
+        after_pc: u32,
         kind: LookaheadKind,
     },
     /// 無制限（`*`/`+`/`{n,}`）ループの「もう1周するか、抜けるか」の判定。
     LoopBack {
-        mark_slot: usize,
-        loop_pc: usize,
+        mark_slot: u32,
+        loop_pc: u32,
     },
 }
 
 pub(super) struct Compiler {
     pub(super) prog: Vec<Inst>,
+    pub(super) classes: Vec<CharClass>,
     /// キャプチャ用スロット数（`2*(ncaptures+1)`）。スクラッチスロットは
     /// この直後の領域に割り当てるので、衝突しないようにここで把握しておく。
     capture_slots: usize,
@@ -45,6 +47,7 @@ impl Compiler {
     pub(super) fn new(capture_slots: usize) -> Self {
         Compiler {
             prog: Vec::new(),
+            classes: Vec::new(),
             capture_slots,
             scratch_count: 0,
         }
@@ -55,24 +58,18 @@ impl Compiler {
         self.prog.len() - 1
     }
 
-    fn here(&self) -> usize {
-        self.prog.len()
+    fn here(&self) -> u32 {
+        self.prog.len() as u32
     }
 
     /// キャプチャ用スロットと重ならない、量指定子専用のスクラッチスロットを 1 つ確保する。
-    fn alloc_scratch(&mut self) -> usize {
+    fn alloc_scratch(&mut self) -> u32 {
         let s = self.capture_slots + self.scratch_count;
         self.scratch_count += 1;
-        s
+        s as u32
     }
 
-    fn patch_split(
-        &mut self,
-        split_pc: usize,
-        body_start: usize,
-        after: usize,
-        mode: QuantifierMode,
-    ) {
+    fn patch_split(&mut self, split_pc: usize, body_start: u32, after: u32, mode: QuantifierMode) {
         if let Inst::Split(ref mut a, ref mut b) = self.prog[split_pc] {
             match mode {
                 QuantifierMode::Greedy => {
@@ -97,7 +94,9 @@ impl Compiler {
                 self.emit(Inst::Any);
             }
             Ast::Class(cc) => {
-                self.emit(Inst::Class(cc.clone()));
+                let idx = self.classes.len() as u32;
+                self.classes.push(cc.clone());
+                self.emit(Inst::Class(idx));
             }
             Ast::Concat(items) => {
                 for it in items {
@@ -130,9 +129,10 @@ impl Compiler {
                 }
             }
             Ast::Group(idx, inner) => {
-                self.emit(Inst::Save(idx * 2));
+                let slot = (*idx * 2) as u32;
+                self.emit(Inst::Save(slot));
                 self.compile(inner);
-                self.emit(Inst::Save(idx * 2 + 1));
+                self.emit(Inst::Save(slot + 1));
             }
             Ast::NonCap(inner) => self.compile(inner),
             Ast::Repeat(inner, min, max, mode) => self.compile_repeat(inner, *min, *max, *mode),
@@ -146,7 +146,7 @@ impl Compiler {
                 self.emit(Inst::WordB(*wb));
             }
             Ast::Backref(n) => {
-                self.emit(Inst::Backref(*n));
+                self.emit(Inst::Backref(*n as u32));
             }
             Ast::Look(inner, kind) => {
                 let look_pc = self.emit(Inst::Look {
@@ -212,7 +212,7 @@ impl Compiler {
         self.compile(inner);
         self.emit(Inst::LoopBack {
             mark_slot,
-            loop_pc: split_pc,
+            loop_pc: split_pc as u32,
         });
         let after = self.here();
         self.patch_split(split_pc, body_start, after, mode);

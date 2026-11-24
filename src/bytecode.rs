@@ -172,7 +172,11 @@ pub enum OpCode {
     New(u16),
     NewSpread,
     NewObject,
+    /// 初期プロパティ容量ヒント付きで空オブジェクトを生成する。
+    NewObjectWithCap(u16),
     NewArray,
+    /// 初期要素容量ヒント付きで空配列を生成する。
+    NewArrayWithCap(u16),
     /// `stack: [array, value] -> [array]`（value を push、array はそのまま残す）
     ArrayPush,
     /// `stack: [array, holeCount]` は使わず、代わりに elision は LoadUndefined で表現する。
@@ -261,10 +265,10 @@ pub enum UpvalueDesc {
 pub struct FunctionTemplate {
     pub name: Rc<str>,
     pub chunk: Rc<Chunk>,
-    pub upvalues: Vec<UpvalueDesc>,
+    pub upvalues: Box<[UpvalueDesc]>,
+    pub param_count: u16,
     pub is_arrow: bool,
     pub is_async: bool,
-    pub param_count: usize,
     pub has_rest: bool,
 }
 
@@ -281,18 +285,20 @@ pub struct ClassAccessorTemplate {
     pub func: Rc<FunctionTemplate>,
 }
 
+pub type FieldInitTemplates = Box<[(Rc<str>, Option<Rc<FunctionTemplate>>)]>;
+
 pub struct ClassTemplate {
     pub name: Rc<str>,
     pub ctor: Option<Rc<FunctionTemplate>>,
-    pub methods: Vec<ClassMethodTemplate>,
-    pub accessors: Vec<ClassAccessorTemplate>,
+    pub methods: Box<[ClassMethodTemplate]>,
+    pub accessors: Box<[ClassAccessorTemplate]>,
     /// static フィールド初期化子（クラス定義時に一度だけ評価）。
     /// 初期化子は「引数なしで `this`（＝クラス自身 or インスタンス）を
     /// 受け取り値を返す小さな関数」として表現する（クロージャ捕捉の仕組みを
     /// メソッドとまったく同じ経路で再利用するため）。
-    pub static_fields: Vec<(Rc<str>, Option<Rc<FunctionTemplate>>)>,
+    pub static_fields: FieldInitTemplates,
     /// インスタンスフィールド初期化子（`new` のたびに `this` = 新インスタンスで呼ぶ）。
-    pub instance_fields: Vec<(Rc<str>, Option<Rc<FunctionTemplate>>)>,
+    pub instance_fields: FieldInitTemplates,
 }
 
 /// 例外テーブルの 1 エントリ。`try_start..try_end`（命令アドレス範囲）で
@@ -315,20 +321,20 @@ pub struct ExceptionEntry {
 
 pub struct Chunk {
     pub name: Rc<str>,
-    pub code: Vec<OpCode>,
+    pub code: Box<[OpCode]>,
     /// `code[i]` に対応するソース行番号（デバッグ/エラー表示用）。
-    pub lines: Vec<u32>,
-    pub consts: Vec<Const>,
-    pub exception_table: Vec<ExceptionEntry>,
+    pub lines: Box<[u32]>,
+    pub consts: Box<[Const]>,
+    pub exception_table: Box<[ExceptionEntry]>,
     /// このフレームで確保するローカルスロット数（`this` やパラメータ含む）。
     pub num_locals: usize,
     /// 各ローカルスロットが内側クロージャにキャプチャされるかどうか（長さ == `num_locals`）。
     /// `true` のスロットのみ実行時に `Rc<RefCell<Value>>` でボックス化され、
     /// `false` のスロットは非ボックス（`LocalSlot::Direct`）のまま保持される。
-    pub captured_locals: Vec<bool>,
+    pub captured_locals: Box<[bool]>,
     /// モジュールのトップレベルチャンクにのみ意味を持つ:
     /// export 名 -> ローカルスロット の対応表。
-    pub exports: Vec<(Rc<str>, LocalIdx)>,
+    pub exports: Box<[(Rc<str>, LocalIdx)]>,
     /// これがモジュールのトップレベルチャンクなら true（T3: `Return` 実行時に
     /// 「このタスクはモジュール本体である」を `frames.len() == 1` という
     /// 深さだけに頼らず判定するためのマーカー。async 関数呼び出しも
@@ -343,12 +349,27 @@ pub struct Chunk {
     /// `GetArg`/`GetRestArgs` のために `Frame::raw_args` を埋める必要があるか。
     pub(crate) needs_raw_args: bool,
     /// 命令アドレス `ip` ごとのインラインキャッシュ（`PropMap` スロットヒント。`u16::MAX` は未学習）。
-    pub(crate) ic_slots: Vec<Cell<u16>>,
+    pub(crate) ic_slots: Box<[Cell<u16>]>,
 }
 
-impl Chunk {
-    pub fn new(name: impl Into<Rc<str>>) -> Self {
-        Chunk {
+/// コンパイル中に可変長バッファでチャンクを構築し、完了時に余剰容量ゼロの `Chunk` へ確定するビルダー。
+pub(crate) struct ChunkBuilder {
+    pub(crate) name: Rc<str>,
+    pub(crate) code: Vec<OpCode>,
+    pub(crate) lines: Vec<u32>,
+    pub(crate) consts: Vec<Const>,
+    pub(crate) exception_table: Vec<ExceptionEntry>,
+    pub(crate) num_locals: usize,
+    pub(crate) captured_locals: Vec<bool>,
+    pub(crate) exports: Vec<(Rc<str>, LocalIdx)>,
+    pub(crate) is_module: bool,
+    pub(crate) simple_param_count: u16,
+    pub(crate) needs_raw_args: bool,
+}
+
+impl ChunkBuilder {
+    pub(crate) fn new(name: impl Into<Rc<str>>) -> Self {
+        ChunkBuilder {
             name: name.into(),
             code: Vec::new(),
             lines: Vec::new(),
@@ -358,24 +379,50 @@ impl Chunk {
             captured_locals: Vec::new(),
             exports: Vec::new(),
             is_module: false,
-            has_captured_locals: false,
             simple_param_count: 0,
             needs_raw_args: false,
-            ic_slots: Vec::new(),
         }
     }
 
-    pub(crate) fn finalize(&mut self) {
-        self.has_captured_locals = self.captured_locals.iter().any(|&c| c);
+    pub(crate) fn finish(self) -> Chunk {
+        let has_captured_locals = self.captured_locals.iter().any(|&c| c);
         let has_ic_ops = self.code.iter().any(|op| {
             matches!(
                 op,
                 OpCode::GetProp(_) | OpCode::SetProp(_) | OpCode::CallMethod(_, _)
             )
         });
-        if has_ic_ops {
-            self.ic_slots = vec![Cell::new(IC_UNSET); self.code.len()];
+        let ic_slots = if has_ic_ops {
+            vec![Cell::new(IC_UNSET); self.code.len()].into_boxed_slice()
+        } else {
+            Box::new([])
+        };
+        let captured_locals = if has_captured_locals {
+            self.captured_locals.into_boxed_slice()
+        } else {
+            Box::new([])
+        };
+        Chunk {
+            name: self.name,
+            code: self.code.into_boxed_slice(),
+            lines: self.lines.into_boxed_slice(),
+            consts: self.consts.into_boxed_slice(),
+            exception_table: self.exception_table.into_boxed_slice(),
+            num_locals: self.num_locals,
+            captured_locals,
+            exports: self.exports.into_boxed_slice(),
+            is_module: self.is_module,
+            has_captured_locals,
+            simple_param_count: self.simple_param_count,
+            needs_raw_args: self.needs_raw_args,
+            ic_slots,
         }
+    }
+}
+
+impl Chunk {
+    pub fn new(name: impl Into<Rc<str>>) -> Self {
+        ChunkBuilder::new(name).finish()
     }
 
     #[inline]

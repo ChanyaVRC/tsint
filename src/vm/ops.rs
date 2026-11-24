@@ -24,9 +24,7 @@ pub fn array_values(v: &Value) -> Vec<Value> {
 
 /// コンパイル済み正規表現から `RegExp` インスタンスを作る。
 pub fn new_regex_value(re: Rc<crate::regex::Regex>) -> Value {
-    let mut o = ObjData::new(ObjKind::Regex(re));
-    o.props.set_value(Rc::from("lastIndex"), Value::Number(0.0));
-    Value::Object(Rc::new(RefCell::new(o)))
+    Value::Object(Rc::new(RefCell::new(ObjData::new(ObjKind::Regex(re)))))
 }
 
 #[inline]
@@ -98,6 +96,33 @@ pub fn to_primitive(v: &Value) -> Value {
 
 /// 整数フォーマット高速パスを使う `f64` の絶対値上限（`i64` キャストで精度欠落しない範囲）。
 const FAST_INT_FORMAT_LIMIT: f64 = 1e15;
+/// スレッドローカル文字列スクラッチの上限容量（これを超えたら縮める）。
+const MAX_STR_SCRATCH_CAP: usize = 64 * 1024;
+
+thread_local! {
+    static STR_SCRATCH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// 再利用可能なスレッドローカル `String` バッファへ書き込み、単一アロケーションで `Rc<str>` を生成する。
+#[inline]
+pub(crate) fn with_str_buf_rc(f: impl FnOnce(&mut String)) -> Rc<str> {
+    STR_SCRATCH.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            f(&mut buf);
+            let out = Rc::from(buf.as_str());
+            if buf.capacity() > MAX_STR_SCRATCH_CAP {
+                buf.clear();
+                buf.shrink_to(MAX_STR_SCRATCH_CAP);
+            }
+            out
+        } else {
+            let mut local = String::new();
+            f(&mut local);
+            Rc::from(local.as_str())
+        }
+    })
+}
 
 pub(crate) fn number_to_js_string_into(n: f64, out: &mut String) {
     use std::fmt::Write;
@@ -144,6 +169,7 @@ pub fn number_to_js_string(n: f64) -> String {
 }
 
 pub(crate) fn to_string_into(v: &Value, out: &mut String) {
+    use std::fmt::Write;
     match v {
         Value::Str(s) => out.push_str(s),
         Value::Number(n) => number_to_js_string_into(*n, out),
@@ -163,40 +189,15 @@ pub(crate) fn to_string_into(v: &Value, out: &mut String) {
                         }
                     }
                 }
-                _ => {
-                    drop(b);
-                    out.push_str(&to_string_basic(v));
+                ObjKind::Function(f) => {
+                    let _ = write!(out, "function {}() {{ [native code] }}", f.name);
                 }
-            }
-        }
-    }
-}
-
-pub fn to_string_basic(v: &Value) -> String {
-    match v {
-        Value::Undefined | Value::Uninit => "undefined".to_string(),
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-        Value::Number(n) => number_to_js_string(*n),
-        Value::Str(s) => s.to_string(),
-        Value::Object(o) => {
-            let b = o.borrow();
-            match &b.kind {
-                ObjKind::Array(items) => {
-                    let mut out = String::new();
-                    for (i, it) in items.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
-                            to_string_into(it, &mut out);
-                        }
-                    }
-                    out
+                ObjKind::Native(n) => {
+                    let _ = write!(out, "function {}() {{ [native code] }}", n.name);
                 }
-                ObjKind::Function(f) => format!("function {}() {{ [native code] }}", f.name),
-                ObjKind::Native(n) => format!("function {}() {{ [native code] }}", n.name),
-                ObjKind::Class(c) => format!("class {} {{ }}", c.name),
+                ObjKind::Class(c) => {
+                    let _ = write!(out, "class {} {{ }}", c.name);
+                }
                 ObjKind::Error => {
                     let name = match b.props.get("name") {
                         Some(PropSlot::Value(Value::Str(s))) => &**s,
@@ -206,26 +207,43 @@ pub fn to_string_basic(v: &Value) -> String {
                         Some(PropSlot::Value(Value::Str(s))) => &**s,
                         _ => "",
                     };
-                    if msg.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{name}: {msg}")
+                    out.push_str(name);
+                    if !msg.is_empty() {
+                        out.push_str(": ");
+                        out.push_str(msg);
                     }
                 }
-                ObjKind::Regex(re) => format!("/{}/{}", re.source, re.flags),
-                ObjKind::Map(_) => "[object Map]".to_string(),
-                ObjKind::Set(_) => "[object Set]".to_string(),
-                ObjKind::Plain => "[object Object]".to_string(),
+                ObjKind::Regex(re) => {
+                    let _ = write!(out, "/{}/{}", re.source, re.flags);
+                }
+                ObjKind::Map(_) => out.push_str("[object Map]"),
+                ObjKind::Set(_) => out.push_str("[object Set]"),
+                ObjKind::Plain => out.push_str("[object Object]"),
                 ObjKind::Promise(pd) => match &pd.state {
-                    PromiseState::Pending => "Promise { <pending> }".to_string(),
-                    PromiseState::Fulfilled(v) => format!("Promise {{ {} }}", to_string_basic(v)),
+                    PromiseState::Pending => out.push_str("Promise { <pending> }"),
+                    PromiseState::Fulfilled(v) => {
+                        out.push_str("Promise { ");
+                        to_string_into(v, out);
+                        out.push_str(" }");
+                    }
                     PromiseState::Rejected(v) => {
-                        format!("Promise {{ <rejected> {} }}", to_string_basic(v))
+                        out.push_str("Promise { <rejected> ");
+                        to_string_into(v, out);
+                        out.push_str(" }");
                     }
                 },
             }
         }
     }
+}
+
+pub fn to_string_basic(v: &Value) -> String {
+    if let Value::Str(s) = v {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    to_string_into(v, &mut out);
+    out
 }
 
 pub fn to_property_key_string(v: &Value) -> String {
@@ -240,32 +258,26 @@ pub fn to_property_key_string(v: &Value) -> String {
 pub(super) fn js_add(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => Value::Number(*x + *y),
-        (Value::Str(x), Value::Str(y)) => {
-            let mut buf = String::with_capacity(x.len() + y.len());
+        (Value::Str(x), Value::Str(y)) => Value::Str(with_str_buf_rc(|buf| {
             buf.push_str(x);
             buf.push_str(y);
-            Value::Str(buf.into())
-        }
-        (Value::Str(x), other) => {
-            let mut buf = String::with_capacity(x.len() + 16);
+        })),
+        (Value::Str(x), other) => Value::Str(with_str_buf_rc(|buf| {
             buf.push_str(x);
-            to_string_into(other, &mut buf);
-            Value::Str(buf.into())
-        }
-        (other, Value::Str(y)) => {
-            let mut buf = String::with_capacity(y.len() + 16);
-            to_string_into(other, &mut buf);
+            to_string_into(other, buf);
+        })),
+        (other, Value::Str(y)) => Value::Str(with_str_buf_rc(|buf| {
+            to_string_into(other, buf);
             buf.push_str(y);
-            Value::Str(buf.into())
-        }
+        })),
         (Value::Object(_), _) | (_, Value::Object(_)) => {
             let pa = to_primitive(a);
             let pb = to_primitive(b);
             if matches!(pa, Value::Str(_)) || matches!(pb, Value::Str(_)) {
-                let mut buf = String::new();
-                to_string_into(&pa, &mut buf);
-                to_string_into(&pb, &mut buf);
-                Value::Str(buf.into())
+                Value::Str(with_str_buf_rc(|buf| {
+                    to_string_into(&pa, buf);
+                    to_string_into(&pb, buf);
+                }))
             } else {
                 Value::Number(to_number(&pa) + to_number(&pb))
             }

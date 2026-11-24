@@ -96,10 +96,11 @@ fn set_ascii_bit(bits: &mut [u64; 2], b: u8, ignore_case: bool) {
 
 #[derive(Debug, Clone)]
 pub(super) struct CharClass {
-    negate: bool,
-    atoms: Vec<ClassAtom>,
     /// 128 個の ASCII 文字（0..128）に対する事前計算ビットマップ（`negate`/`ignore_case` 反映済み）。
     ascii_bits: [u64; 2],
+    /// 非 ASCII 文字マッチ用アトム（ASCII のみで構成されるクラスはコンパイル後に空にして解放）。
+    atoms: Box<[ClassAtom]>,
+    negate: bool,
     /// 非 ASCII 文字に対して `atoms` を実際に走査する必要があるか。
     has_non_ascii_atoms: bool,
 }
@@ -107,9 +108,9 @@ pub(super) struct CharClass {
 impl CharClass {
     pub(super) fn new(negate: bool, atoms: Vec<ClassAtom>) -> Self {
         CharClass {
-            negate,
-            atoms,
             ascii_bits: [0; 2],
+            atoms: atoms.into_boxed_slice(),
+            negate,
             has_non_ascii_atoms: true,
         }
     }
@@ -186,6 +187,9 @@ impl CharClass {
         }
         self.ascii_bits = bits;
         self.has_non_ascii_atoms = has_non_ascii;
+        if !has_non_ascii {
+            self.atoms = Box::new([]);
+        }
     }
 
     #[inline]

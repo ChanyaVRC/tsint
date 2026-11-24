@@ -2,40 +2,42 @@
 
 use std::rc::Rc;
 
-use super::{native, value_as_cow_str};
+use super::{define_props_obj, native, value_as_cow_str};
 use crate::value::*;
-use crate::vm::{number_to_js_string_into, Vm};
+use crate::vm::{number_to_js_string_into, with_str_buf_rc, Vm};
 
-/// `JSON.stringify` の初期出力バッファ容量。
-const STRINGIFY_INITIAL_CAP: usize = 128;
 /// `f64` で正確に表現できる JSON 整数桁数の高速パス上限。
 const FAST_INT_MAX_DIGITS: usize = 15;
 
 pub(super) fn install_json(vm: &mut Vm) {
-    let json = Value::new_plain_object();
-    let stringify = native("stringify", 1, |_vm, _this, args| {
-        let indent = match args.get(2) {
-            Some(Value::Number(n)) => n.max(0.0) as usize,
-            _ => 0,
-        };
-        let target = args.first().unwrap_or(&Value::Undefined);
-        let mut out = String::with_capacity(STRINGIFY_INITIAL_CAP);
-        if json_stringify_into(target, indent, 0, &mut out) {
-            Ok(Value::str(out))
-        } else {
-            Ok(Value::Undefined)
-        }
-    });
-    let parse = native("parse", 1, |vm, _this, args| {
-        let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-        json_parse(vm, &s).map_err(|e| vm.syntax_error(format!("JSON.parse: {e}")))
-    });
-    if let Value::Object(o) = &json {
-        let mut b = o.borrow_mut();
-        b.props.set_value(Rc::from("stringify"), stringify);
-        b.props.set_value(Rc::from("parse"), parse);
-    }
-    vm.define_global("JSON", json);
+    define_props_obj(
+        vm,
+        "JSON",
+        [
+            (
+                "stringify",
+                native("stringify", 1, |_vm, _this, args| {
+                    let indent = match args.get(2) {
+                        Some(Value::Number(n)) => n.max(0.0) as usize,
+                        _ => 0,
+                    };
+                    let target = args.first().unwrap_or(&Value::Undefined);
+                    let mut ok = false;
+                    let rc = with_str_buf_rc(|out| {
+                        ok = json_stringify_into(target, indent, 0, out);
+                    });
+                    Ok(if ok { Value::Str(rc) } else { Value::Undefined })
+                }),
+            ),
+            (
+                "parse",
+                native("parse", 1, |vm, _this, args| {
+                    let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
+                    json_parse(vm, &s).map_err(|e| vm.syntax_error(format!("JSON.parse: {e}")))
+                }),
+            ),
+        ],
+    );
 }
 
 fn json_quote_into(s: &str, out: &mut String) {

@@ -78,6 +78,41 @@ pub(super) fn native(
     Value::native_fn(name, arity, Rc::new(f))
 }
 
+type MethodDispatch = fn(&mut Vm, Value, &str, &[Value]) -> Option<Result<Value, Value>>;
+
+/// ビルトインプロトタイプメソッドを静的テーブルから解決し、遅延ラッパー関数を生成する。
+pub(super) fn lookup_method(
+    table: &[(&'static str, usize)],
+    name: &str,
+    dispatch: MethodDispatch,
+) -> Option<Value> {
+    let &(static_name, arity) = table.iter().find(|&&(n, _)| n == name)?;
+    Some(native(static_name, arity, move |vm, this, args| {
+        dispatch(vm, this, static_name, args).unwrap()
+    }))
+}
+
+/// オブジェクト値へ静的プロパティ群をまとめて設定する。
+pub(super) fn set_props(obj: &Value, entries: impl IntoIterator<Item = (&'static str, Value)>) {
+    if let Value::Object(o) = obj {
+        let mut b = o.borrow_mut();
+        for (k, v) in entries {
+            b.props.set_value(Rc::from(k), v);
+        }
+    }
+}
+
+/// プロパティ群を持つプレーンオブジェクトを作成しグローバルへ登録する。
+pub(super) fn define_props_obj(
+    vm: &mut Vm,
+    global: &str,
+    entries: impl IntoIterator<Item = (&'static str, Value)>,
+) {
+    let obj = Value::new_plain_object();
+    set_props(&obj, entries);
+    vm.define_global(global, obj);
+}
+
 #[inline]
 pub(super) fn norm_index(v: Option<&Value>, default: i64, len: i64) -> i64 {
     match v {
@@ -96,9 +131,16 @@ pub(super) fn norm_index(v: Option<&Value>, default: i64, len: i64) -> i64 {
 
 #[inline]
 pub(super) fn chars_slice_to_val(chars: &[char]) -> Value {
-    let mut s = String::with_capacity(chars.len());
-    s.extend(chars);
-    Value::str(s)
+    Value::Str(crate::vm::with_str_buf_rc(|buf| buf.extend(chars)))
+}
+
+#[inline]
+pub(super) fn slice_to_val(src: &str, chars: &[char], start: usize, end: usize) -> Value {
+    if src.is_ascii() {
+        Value::str(&src[start..end])
+    } else {
+        chars_slice_to_val(&chars[start..end])
+    }
 }
 
 pub fn install(vm: &mut Vm) {

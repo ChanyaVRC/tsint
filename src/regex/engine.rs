@@ -1,6 +1,6 @@
 //! 正規表現実行器（明示スタック＋アンドゥログによるバックトラッキング）。
 
-use super::charclass::{char_eq, is_line_terminator, is_word};
+use super::charclass::{char_eq, is_line_terminator, is_word, CharClass};
 use super::compiler::Inst;
 use super::parser::{LookaheadKind, WordBoundary};
 use super::RegexError;
@@ -32,6 +32,7 @@ fn rewind_trail(saved: &mut [Option<usize>], trail: &mut Trail, mark: usize) {
 
 pub(super) struct Exec<'a> {
     prog: &'a [Inst],
+    classes: &'a [CharClass],
     chars: &'a [char],
     ignore_case: bool,
     multiline: bool,
@@ -42,8 +43,10 @@ pub(super) struct Exec<'a> {
 }
 
 impl<'a> Exec<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         prog: &'a [Inst],
+        classes: &'a [CharClass],
         chars: &'a [char],
         ignore_case: bool,
         multiline: bool,
@@ -53,6 +56,7 @@ impl<'a> Exec<'a> {
     ) -> Self {
         Exec {
             prog,
+            classes,
             chars,
             ignore_case,
             multiline,
@@ -94,9 +98,9 @@ impl<'a> Exec<'a> {
 
         loop {
             self.step()?;
-            let ok = match &self.prog[pc] {
+            let ok = match self.prog[pc] {
                 Inst::Char(c) => {
-                    if sp < self.chars.len() && char_eq(self.chars[sp], *c, self.ignore_case) {
+                    if sp < self.chars.len() && char_eq(self.chars[sp], c, self.ignore_case) {
                         pc += 1;
                         sp += 1;
                         true
@@ -115,8 +119,10 @@ impl<'a> Exec<'a> {
                         false
                     }
                 }
-                Inst::Class(cc) => {
-                    if sp < self.chars.len() && cc.matches(self.chars[sp], self.ignore_case) {
+                Inst::Class(idx) => {
+                    if sp < self.chars.len()
+                        && self.classes[idx as usize].matches(self.chars[sp], self.ignore_case)
+                    {
                         pc += 1;
                         sp += 1;
                         true
@@ -125,7 +131,7 @@ impl<'a> Exec<'a> {
                     }
                 }
                 Inst::Save(slot) => {
-                    let slot = *slot;
+                    let slot = slot as usize;
                     let prev = saved[slot];
                     if prev != Some(sp) {
                         trail.push((slot, prev));
@@ -135,11 +141,10 @@ impl<'a> Exec<'a> {
                     true
                 }
                 Inst::Jmp(t) => {
-                    pc = *t;
+                    pc = t as usize;
                     true
                 }
                 Inst::Split(a, b) => {
-                    let (a, b) = (*a, *b);
                     if stack.len() >= self.max_depth {
                         return Err(RegexError(
                             "正規表現の再帰の深さ上限を超えました（パターンまたは入力が大きすぎます）"
@@ -147,11 +152,11 @@ impl<'a> Exec<'a> {
                         ));
                     }
                     stack.push(BacktrackFrame {
-                        pc: b,
+                        pc: b as usize,
                         sp,
                         trail_mark: trail.len(),
                     });
-                    pc = a;
+                    pc = a as usize;
                     true
                 }
                 Inst::Match => {
@@ -181,7 +186,7 @@ impl<'a> Exec<'a> {
                 Inst::WordB(wb) => {
                     let before = sp > 0 && is_word(self.chars[sp - 1]);
                     let after = sp < self.chars.len() && is_word(self.chars[sp]);
-                    let want_boundary = *wb == WordBoundary::Match;
+                    let want_boundary = wb == WordBoundary::Match;
                     if (before != after) == want_boundary {
                         pc += 1;
                         true
@@ -190,7 +195,7 @@ impl<'a> Exec<'a> {
                     }
                 }
                 Inst::Backref(n) => {
-                    let slot = n * 2;
+                    let slot = (n as usize) * 2;
                     match (
                         saved.get(slot).copied().flatten(),
                         saved.get(slot + 1).copied().flatten(),
@@ -221,17 +226,16 @@ impl<'a> Exec<'a> {
                     after_pc,
                     kind,
                 } => {
-                    let (sub_pc, after_pc, kind) = (*sub_pc, *after_pc, *kind);
                     let look_trail_mark = trail.len();
                     let matched = self
-                        .run_from(sub_pc, sp, saved, trail, stack, look_depth + 1)?
+                        .run_from(sub_pc as usize, sp, saved, trail, stack, look_depth + 1)?
                         .is_some();
                     let ok = match kind {
                         LookaheadKind::Positive => matched,
                         LookaheadKind::Negative => !matched,
                     };
                     if ok {
-                        pc = after_pc;
+                        pc = after_pc as usize;
                         true
                     } else {
                         rewind_trail(saved, trail, look_trail_mark);
@@ -239,10 +243,9 @@ impl<'a> Exec<'a> {
                     }
                 }
                 Inst::LoopBack { mark_slot, loop_pc } => {
-                    let (mark_slot, loop_pc) = (*mark_slot, *loop_pc);
-                    let progressed = saved.get(mark_slot).copied().flatten() != Some(sp);
+                    let progressed = saved.get(mark_slot as usize).copied().flatten() != Some(sp);
                     if progressed {
-                        pc = loop_pc;
+                        pc = loop_pc as usize;
                     } else {
                         pc += 1;
                     }

@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{arg, arg_ref, native, value_as_cow_str};
+use super::{arg, arg_ref, define_props_obj, native, set_props, value_as_cow_str};
 use crate::value::*;
 use crate::vm::{own_enumerable_keys, to_number, to_string_into, Vm};
 
@@ -12,7 +12,6 @@ use crate::vm::{own_enumerable_keys, to_number, to_string_into, Vm};
 // =====================================================================
 
 pub(super) fn install_console(vm: &mut Vm) {
-    let console = Value::new_plain_object();
     let log = native("log", 0, |vm, _this, args| {
         let mut line = String::new();
         for (i, a) in args.iter().enumerate() {
@@ -24,14 +23,16 @@ pub(super) fn install_console(vm: &mut Vm) {
         (vm.on_log)(&line);
         Ok(Value::Undefined)
     });
-    if let Value::Object(o) = &console {
-        let mut b = o.borrow_mut();
-        b.props.set_value(Rc::from("log"), log.clone());
-        b.props.set_value(Rc::from("error"), log.clone());
-        b.props.set_value(Rc::from("warn"), log.clone());
-        b.props.set_value(Rc::from("info"), log);
-    }
-    vm.define_global("console", console);
+    define_props_obj(
+        vm,
+        "console",
+        [
+            ("log", log.clone()),
+            ("error", log.clone()),
+            ("warn", log.clone()),
+            ("info", log),
+        ],
+    );
 }
 
 // =====================================================================
@@ -39,52 +40,61 @@ pub(super) fn install_console(vm: &mut Vm) {
 // =====================================================================
 
 pub(super) fn install_object(vm: &mut Vm) {
-    let object_global = Value::new_plain_object();
-    let keys = native("keys", 1, |vm, _this, args| {
-        Ok(vm.alloc_array(own_enumerable_keys(arg_ref(args, 0))))
-    });
-    let values = native("values", 1, |vm, _this, args| {
-        Ok(vm.alloc_array(own_enumerable_values(arg_ref(args, 0))))
-    });
-    let entries = native("entries", 1, |vm, _this, args| {
-        let pairs = own_enumerable_entries(vm, arg_ref(args, 0));
-        Ok(vm.alloc_array(pairs))
-    });
-    let assign = native("assign", 2, |_vm, _this, args| {
-        let target = arg(args, 0);
-        let Value::Object(t) = &target else {
-            return Ok(target);
-        };
-        for src in &args[1.min(args.len())..] {
-            if let Value::Object(s) = src {
-                if Rc::ptr_eq(t, s) {
-                    continue;
-                }
-                let entries: Vec<(Rc<str>, Value)> = s
-                    .borrow()
-                    .props
-                    .iter()
-                    .filter_map(|(k, slot)| match slot {
-                        PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                        PropSlot::Accessor { .. } => None,
-                    })
-                    .collect();
-                let mut tb = t.borrow_mut();
-                for (k, v) in entries {
-                    tb.props.set_value(k, v);
-                }
-            }
-        }
-        Ok(target)
-    });
-    if let Value::Object(o) = &object_global {
-        let mut b = o.borrow_mut();
-        b.props.set_value(Rc::from("keys"), keys);
-        b.props.set_value(Rc::from("values"), values);
-        b.props.set_value(Rc::from("entries"), entries);
-        b.props.set_value(Rc::from("assign"), assign);
-    }
-    vm.define_global("Object", object_global);
+    define_props_obj(
+        vm,
+        "Object",
+        [
+            (
+                "keys",
+                native("keys", 1, |vm, _this, args| {
+                    Ok(vm.alloc_array(own_enumerable_keys(arg_ref(args, 0))))
+                }),
+            ),
+            (
+                "values",
+                native("values", 1, |vm, _this, args| {
+                    Ok(vm.alloc_array(own_enumerable_values(arg_ref(args, 0))))
+                }),
+            ),
+            (
+                "entries",
+                native("entries", 1, |vm, _this, args| {
+                    let pairs = own_enumerable_entries(vm, arg_ref(args, 0));
+                    Ok(vm.alloc_array(pairs))
+                }),
+            ),
+            (
+                "assign",
+                native("assign", 2, |_vm, _this, args| {
+                    let target = arg(args, 0);
+                    let Value::Object(t) = &target else {
+                        return Ok(target);
+                    };
+                    for src in &args[1.min(args.len())..] {
+                        if let Value::Object(s) = src {
+                            if Rc::ptr_eq(t, s) {
+                                continue;
+                            }
+                            let entries: Vec<(Rc<str>, Value)> = s
+                                .borrow()
+                                .props
+                                .iter()
+                                .filter_map(|(k, slot)| match slot {
+                                    PropSlot::Value(v) => Some((k.clone(), v.clone())),
+                                    PropSlot::Accessor(_) => None,
+                                })
+                                .collect();
+                            let mut tb = t.borrow_mut();
+                            for (k, v) in entries {
+                                tb.props.set_value(k, v);
+                            }
+                        }
+                    }
+                    Ok(target)
+                }),
+            ),
+        ],
+    );
 }
 
 fn own_enumerable_entries(vm: &Vm, v: &Value) -> Vec<Value> {
@@ -104,7 +114,7 @@ fn own_enumerable_entries(vm: &Vm, v: &Value) -> Vec<Value> {
                         PropSlot::Value(val) => {
                             Some(vm.alloc_array(vec![Value::Str(k.clone()), val.clone()]))
                         }
-                        PropSlot::Accessor { .. } => None,
+                        PropSlot::Accessor(_) => None,
                     })
                     .collect(),
             }
@@ -124,7 +134,7 @@ fn own_enumerable_values(v: &Value) -> Vec<Value> {
                     .iter()
                     .filter_map(|(_, s)| match s {
                         PropSlot::Value(v) => Some(v.clone()),
-                        PropSlot::Accessor { .. } => None,
+                        PropSlot::Accessor(_) => None,
                     })
                     .collect(),
             }
@@ -137,65 +147,66 @@ fn own_enumerable_values(v: &Value) -> Vec<Value> {
 // Math
 // =====================================================================
 
+fn math_minmax(args: &[Value], init: f64, better: fn(f64, f64) -> bool) -> Value {
+    let mut acc = init;
+    for a in args {
+        let n = to_number(a);
+        if n.is_nan() {
+            return Value::Number(f64::NAN);
+        }
+        if better(n, acc) {
+            acc = n;
+        }
+    }
+    Value::Number(acc)
+}
+
 pub(super) fn install_math(vm: &mut Vm) {
-    let math = Value::new_plain_object();
     macro_rules! unary {
         ($name:literal, $f:expr) => {
-            native($name, 1, |_vm, _this, args| {
-                Ok(Value::Number($f(to_number(arg_ref(args, 0)))))
-            })
+            (
+                $name,
+                native($name, 1, |_vm, _this, args| {
+                    Ok(Value::Number($f(to_number(arg_ref(args, 0)))))
+                }),
+            )
         };
     }
-    let floor = unary!("floor", f64::floor);
-    let ceil = unary!("ceil", f64::ceil);
-    let round = unary!("round", |n: f64| (n + 0.5).floor());
-    let abs = unary!("abs", f64::abs);
-    let min = native("min", 2, |_vm, _this, args| {
-        let mut m = f64::INFINITY;
-        for a in args {
-            let n = to_number(a);
-            if n.is_nan() {
-                return Ok(Value::Number(f64::NAN));
-            }
-            if n < m {
-                m = n;
-            }
-        }
-        Ok(Value::Number(m))
-    });
-    let max = native("max", 2, |_vm, _this, args| {
-        let mut m = f64::NEG_INFINITY;
-        for a in args {
-            let n = to_number(a);
-            if n.is_nan() {
-                return Ok(Value::Number(f64::NAN));
-            }
-            if n > m {
-                m = n;
-            }
-        }
-        Ok(Value::Number(m))
-    });
-    let pow = native("pow", 2, |_vm, _this, args| {
-        Ok(Value::Number(
-            to_number(arg_ref(args, 0)).powf(to_number(arg_ref(args, 1))),
-        ))
-    });
-    let random = native("random", 0, |_vm, _this, _args| Ok(Value::Number(0.0)));
-    if let Value::Object(o) = &math {
-        let mut b = o.borrow_mut();
-        b.props.set_value(Rc::from("floor"), floor);
-        b.props.set_value(Rc::from("ceil"), ceil);
-        b.props.set_value(Rc::from("round"), round);
-        b.props.set_value(Rc::from("abs"), abs);
-        b.props.set_value(Rc::from("min"), min);
-        b.props.set_value(Rc::from("max"), max);
-        b.props.set_value(Rc::from("pow"), pow);
-        b.props.set_value(Rc::from("random"), random);
-        b.props
-            .set_value(Rc::from("PI"), Value::Number(std::f64::consts::PI));
-    }
-    vm.define_global("Math", math);
+    define_props_obj(
+        vm,
+        "Math",
+        [
+            unary!("floor", f64::floor),
+            unary!("ceil", f64::ceil),
+            unary!("round", |n: f64| (n + 0.5).floor()),
+            unary!("abs", f64::abs),
+            (
+                "min",
+                native("min", 2, |_vm, _this, args| {
+                    Ok(math_minmax(args, f64::INFINITY, |a, b| a < b))
+                }),
+            ),
+            (
+                "max",
+                native("max", 2, |_vm, _this, args| {
+                    Ok(math_minmax(args, f64::NEG_INFINITY, |a, b| a > b))
+                }),
+            ),
+            (
+                "pow",
+                native("pow", 2, |_vm, _this, args| {
+                    Ok(Value::Number(
+                        to_number(arg_ref(args, 0)).powf(to_number(arg_ref(args, 1))),
+                    ))
+                }),
+            ),
+            (
+                "random",
+                native("random", 0, |_vm, _this, _args| Ok(Value::Number(0.0))),
+            ),
+            ("PI", Value::Number(std::f64::consts::PI)),
+        ],
+    );
 }
 
 // =====================================================================
@@ -206,22 +217,22 @@ pub(super) fn install_number(vm: &mut Vm) {
     let number = native("Number", 1, |_vm, _this, args| {
         Ok(Value::Number(to_number(arg_ref(args, 0))))
     });
-    let is_finite = native("isFinite", 1, |_vm, _this, args| {
-        Ok(Value::Bool(
-            matches!(arg_ref(args, 0), Value::Number(n) if n.is_finite()),
-        ))
-    });
-    if let Value::Object(o) = &number {
-        let mut b = o.borrow_mut();
-        b.props.set_value(Rc::from("isFinite"), is_finite);
-        b.props.set_value(Rc::from("NaN"), Value::Number(f64::NAN));
-        b.props
-            .set_value(Rc::from("POSITIVE_INFINITY"), Value::Number(f64::INFINITY));
-        b.props.set_value(
-            Rc::from("NEGATIVE_INFINITY"),
-            Value::Number(f64::NEG_INFINITY),
-        );
-    }
+    set_props(
+        &number,
+        [
+            (
+                "isFinite",
+                native("isFinite", 1, |_vm, _this, args| {
+                    Ok(Value::Bool(
+                        matches!(arg_ref(args, 0), Value::Number(n) if n.is_finite()),
+                    ))
+                }),
+            ),
+            ("NaN", Value::Number(f64::NAN)),
+            ("POSITIVE_INFINITY", Value::Number(f64::INFINITY)),
+            ("NEGATIVE_INFINITY", Value::Number(f64::NEG_INFINITY)),
+        ],
+    );
     vm.define_global("Number", number);
     vm.define_global("NaN", Value::Number(f64::NAN));
     vm.define_global("Infinity", Value::Number(f64::INFINITY));
@@ -324,11 +335,7 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
             matches!(arg_ref(args, 0), Value::Object(o) if matches!(o.borrow().kind, ObjKind::Array(_))),
         ))
     });
-    if let Value::Object(o) = &array_global {
-        o.borrow_mut()
-            .props
-            .set_value(Rc::from("isArray"), array_is_array);
-    }
+    set_props(&array_global, [("isArray", array_is_array)]);
     vm.define_global("Array", array_global);
 
     // `new Function(...args, body)`: 実行時に自前パーサでコンパイルする。
@@ -382,34 +389,31 @@ pub(super) fn install_errors(vm: &mut Vm) {
 // Date（現在時刻はホスト注入。VM 自体は決定的に保つ）
 // =====================================================================
 
+fn date_time_ms(this: &Value) -> f64 {
+    if let Value::Object(o) = this {
+        if let Some(PropSlot::Value(Value::Number(n))) = o.borrow().props.get("%time") {
+            return *n;
+        }
+    }
+    0.0
+}
+
 pub(super) fn install_date(vm: &mut Vm) {
     let proto: ObjRef = Rc::new(RefCell::new(ObjData::new(ObjKind::Plain)));
     let get_time = native("getTime", 0, |_vm, this, _args| {
-        if let Value::Object(o) = &this {
-            if let Some(PropSlot::Value(v)) = o.borrow().props.get("%time") {
-                return Ok(v.clone());
-            }
-        }
-        Ok(Value::Number(0.0))
+        Ok(Value::Number(date_time_ms(&this)))
     });
     let to_locale_string = native("toLocaleString", 0, |_vm, this, _args| {
-        let t = if let Value::Object(o) = &this {
-            match o.borrow().props.get("%time") {
-                Some(PropSlot::Value(Value::Number(n))) => *n,
-                _ => 0.0,
-            }
-        } else {
-            0.0
-        };
-        Ok(Value::str(format_epoch_millis(t)))
+        Ok(Value::str(format_epoch_millis(date_time_ms(&this))))
     });
-    {
-        let mut b = proto.borrow_mut();
-        b.props.set_value(Rc::from("getTime"), get_time);
-        b.props
-            .set_value(Rc::from("toLocaleString"), to_locale_string.clone());
-        b.props.set_value(Rc::from("toString"), to_locale_string);
-    }
+    set_props(
+        &Value::Object(proto.clone()),
+        [
+            ("getTime", get_time),
+            ("toLocaleString", to_locale_string.clone()),
+            ("toString", to_locale_string),
+        ],
+    );
 
     let proto_for_ctor = proto.clone();
     vm.register_native(

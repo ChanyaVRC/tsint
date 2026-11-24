@@ -66,8 +66,9 @@ impl Vm {
     }
 
     pub fn new_pending_promise(&mut self) -> (Value, ObjRef) {
-        let obj: ObjRef =
-            self.alloc_obj_ref(ObjData::new(ObjKind::Promise(PromiseData::pending())));
+        let obj: ObjRef = self.alloc_obj_ref(ObjData::new(ObjKind::Promise(Box::new(
+            PromiseData::pending(),
+        ))));
         (Value::Object(obj.clone()), obj)
     }
 

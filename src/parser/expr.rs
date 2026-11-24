@@ -5,12 +5,12 @@
 //! > bitand > equality > relational > shift > additive > multiplicative
 //! > exponent(**) > unary > postfix(++/-- , as, !) > call/member > primary
 
-use super::{PResult, Parser};
+use super::{PResult, Parser, SmallStage};
 use crate::ast::*;
 use crate::lexer::{Punct, TokenKind};
 
 /// アロー関数本体: ブロック文本体か、単一の式本体か。
-type ArrowBody = (Option<Vec<Stmt>>, Option<Box<Expr>>);
+type ArrowBody = (Option<Box<[Stmt]>>, Option<Box<Expr>>);
 
 /// 関数構文で関数名が必須（宣言）か省略可能（式・default export・メソッド）か。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,17 +19,24 @@ pub(super) enum FnNameMode {
     Optional,
 }
 
+#[derive(Clone, Copy)]
+enum InfixOp {
+    Log(LogicalOp),
+    Bin(BinaryOp),
+}
+
 impl Parser {
     /// カンマ演算子を含む最上位の式。
     pub(super) fn parse_expr(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
         let first = self.parse_assign_expr()?;
         if self.is_punct(Punct::Comma) {
-            let mut seq = vec![first];
+            let mut seq = SmallStage::new();
+            seq.push(first);
             while self.eat_punct(Punct::Comma) {
                 seq.push(self.parse_assign_expr()?);
             }
-            return Ok(self.mk_expr(start, ExprKind::Sequence(seq)));
+            return Ok(self.mk_expr(start, ExprKind::Sequence(seq.into_boxed_slice())));
         }
         Ok(first)
     }
@@ -80,7 +87,7 @@ impl Parser {
 
     fn parse_conditional(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
-        let test = self.parse_nullish_or()?;
+        let test = self.parse_prec(1)?;
         if self.eat_punct(Punct::Question) {
             let cons = self.parse_assign_expr()?;
             self.expect_punct(Punct::Colon)?;
@@ -97,189 +104,72 @@ impl Parser {
         Ok(test)
     }
 
-    /// `||` と `??` は同じ優先順位段で扱う（本来は直接混在不可だが寛容にする）。
-    fn parse_nullish_or(&mut self) -> PResult<Expr> {
+    /// 現在トークンの中置演算子・優先順位（1..=11）・右結合フラグを返す。
+    /// `||` と `??` は同じ優先順位段（1）として寛容に扱う。
+    #[inline]
+    fn cur_infix_op(&self) -> Option<(InfixOp, u8, bool)> {
+        use BinaryOp::*;
+        use InfixOp::{Bin, Log};
+        use LogicalOp::*;
+        match &self.cur().kind {
+            TokenKind::Punct(p) => Some(match p {
+                Punct::PipePipe => (Log(Or), 1, false),
+                Punct::QuestionQuestion => (Log(Nullish), 1, false),
+                Punct::AmpAmp => (Log(And), 2, false),
+                Punct::Pipe => (Bin(BitOr), 3, false),
+                Punct::Caret => (Bin(BitXor), 4, false),
+                Punct::Amp => (Bin(BitAnd), 5, false),
+                Punct::EqEq => (Bin(Eq), 6, false),
+                Punct::NotEq => (Bin(NotEq), 6, false),
+                Punct::EqEqEq => (Bin(StrictEq), 6, false),
+                Punct::NotEqEq => (Bin(StrictNotEq), 6, false),
+                Punct::Lt => (Bin(Lt), 7, false),
+                Punct::Gt => (Bin(Gt), 7, false),
+                Punct::LtEq => (Bin(LtEq), 7, false),
+                Punct::GtEq => (Bin(GtEq), 7, false),
+                Punct::LtLt => (Bin(Shl), 8, false),
+                Punct::GtGt => (Bin(Shr), 8, false),
+                Punct::GtGtGt => (Bin(UShr), 8, false),
+                Punct::Plus => (Bin(Add), 9, false),
+                Punct::Minus => (Bin(Sub), 9, false),
+                Punct::Star => (Bin(Mul), 10, false),
+                Punct::Slash => (Bin(Div), 10, false),
+                Punct::Percent => (Bin(Mod), 10, false),
+                Punct::StarStar => (Bin(Pow), 11, true),
+                _ => return None,
+            }),
+            TokenKind::Ident(w) if w == "instanceof" => Some((Bin(Instanceof), 7, false)),
+            TokenKind::Ident(w) if w == "in" => Some((Bin(In), 7, false)),
+            _ => None,
+        }
+    }
+
+    /// Pratt 優先順位上昇法による論理/二項/べき乗式のパース。
+    fn parse_prec(&mut self, min_prec: u8) -> PResult<Expr> {
         let start = self.cur_span();
-        let mut left = self.parse_logical_and()?;
-        loop {
-            let op = if self.is_punct(Punct::PipePipe) {
-                LogicalOp::Or
-            } else if self.is_punct(Punct::QuestionQuestion) {
-                LogicalOp::Nullish
-            } else {
+        let mut left = self.parse_unary()?;
+        while let Some((op, prec, right_assoc)) = self.cur_infix_op() {
+            if prec < min_prec {
                 break;
-            };
+            }
             self.bump();
-            let right = self.parse_logical_and()?;
-            left = self.mk_expr(
-                start,
-                ExprKind::Logical {
+            let next_min = if right_assoc { prec } else { prec + 1 };
+            let right = self.parse_prec(next_min)?;
+            let kind = match op {
+                InfixOp::Log(op) => ExprKind::Logical {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
-            );
-        }
-        Ok(left)
-    }
-
-    fn parse_logical_and(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_bit_or()?;
-        while self.eat_punct(Punct::AmpAmp) {
-            let right = self.parse_bit_or()?;
-            left = self.mk_expr(
-                start,
-                ExprKind::Logical {
-                    op: LogicalOp::And,
+                InfixOp::Bin(op) => ExprKind::Binary {
+                    op,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
-            );
-        }
-        Ok(left)
-    }
-
-    fn parse_bit_or(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_bit_xor()?;
-        while self.is_punct(Punct::Pipe) {
-            self.bump();
-            let right = self.parse_bit_xor()?;
-            left = self.mk_bin(start, BinaryOp::BitOr, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_bit_xor(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_bit_and()?;
-        while self.is_punct(Punct::Caret) {
-            self.bump();
-            let right = self.parse_bit_and()?;
-            left = self.mk_bin(start, BinaryOp::BitXor, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_bit_and(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_equality()?;
-        while self.is_punct(Punct::Amp) {
-            self.bump();
-            let right = self.parse_equality()?;
-            left = self.mk_bin(start, BinaryOp::BitAnd, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_equality(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_relational()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::EqEq) => BinaryOp::Eq,
-                TokenKind::Punct(Punct::NotEq) => BinaryOp::NotEq,
-                TokenKind::Punct(Punct::EqEqEq) => BinaryOp::StrictEq,
-                TokenKind::Punct(Punct::NotEqEq) => BinaryOp::StrictNotEq,
-                _ => break,
             };
-            self.bump();
-            let right = self.parse_relational()?;
-            left = self.mk_bin(start, op, left, right);
+            left = self.mk_expr(start, kind);
         }
         Ok(left)
-    }
-
-    fn parse_relational(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_shift()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::Lt) => BinaryOp::Lt,
-                TokenKind::Punct(Punct::Gt) => BinaryOp::Gt,
-                TokenKind::Punct(Punct::LtEq) => BinaryOp::LtEq,
-                TokenKind::Punct(Punct::GtEq) => BinaryOp::GtEq,
-                TokenKind::Ident(w) if w == "instanceof" => BinaryOp::Instanceof,
-                TokenKind::Ident(w) if w == "in" => BinaryOp::In,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_shift()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_shift(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_additive()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::LtLt) => BinaryOp::Shl,
-                TokenKind::Punct(Punct::GtGt) => BinaryOp::Shr,
-                TokenKind::Punct(Punct::GtGtGt) => BinaryOp::UShr,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_additive()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_additive(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_multiplicative()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::Plus) => BinaryOp::Add,
-                TokenKind::Punct(Punct::Minus) => BinaryOp::Sub,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_multiplicative()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_multiplicative(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_exponent()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::Star) => BinaryOp::Mul,
-                TokenKind::Punct(Punct::Slash) => BinaryOp::Div,
-                TokenKind::Punct(Punct::Percent) => BinaryOp::Mod,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_exponent()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_exponent(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let base = self.parse_unary()?;
-        if self.eat_punct(Punct::StarStar) {
-            let right = self.parse_exponent()?; // 右結合
-            return Ok(self.mk_bin(start, BinaryOp::Pow, base, right));
-        }
-        Ok(base)
-    }
-
-    fn mk_bin(&mut self, start: crate::ast::Span, op: BinaryOp, left: Expr, right: Expr) -> Expr {
-        self.mk_expr(
-            start,
-            ExprKind::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            },
-        )
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
@@ -468,9 +358,10 @@ impl Parser {
             } else if self.is_punct(Punct::Lt) {
                 // `foo<T>(...)` 投機的パース。'<' が比較演算子の可能性もあるため、
                 // 型引数として読めて、かつ直後に '(' が続く場合のみ確定させる。
-                let mark = self.save();
+                let mark = self.begin_speculate();
                 let looks_like_call = self.skip_type_args().is_ok() && self.is_punct(Punct::LParen);
                 if looks_like_call {
+                    self.commit_speculate();
                     let args = self.parse_args()?;
                     expr = self.mk_expr(
                         start,
@@ -481,7 +372,7 @@ impl Parser {
                         },
                     );
                 } else {
-                    self.restore(mark);
+                    self.abort_speculate(mark);
                     break;
                 }
             } else if self.is_punct(Punct::Bang) {
@@ -502,13 +393,8 @@ impl Parser {
             let name = self.parse_binding_ident()?;
             return Ok(format!("#{name}"));
         }
-        match self.ident_name() {
-            Some(s) => {
-                self.bump();
-                Ok(s)
-            }
-            None => Err(self.err("プロパティ名が必要です")),
-        }
+        self.bump_ident()
+            .ok_or_else(|| self.err("プロパティ名が必要です"))
     }
 
     fn parse_new_expr(&mut self) -> PResult<Expr> {
@@ -525,15 +411,17 @@ impl Parser {
             self.parse_member_no_call()?
         };
         if self.is_punct(Punct::Lt) {
-            let mark = self.save();
-            if !(self.skip_type_args().is_ok() && self.is_punct(Punct::LParen)) {
-                self.restore(mark);
+            let mark = self.begin_speculate();
+            if self.skip_type_args().is_ok() && self.is_punct(Punct::LParen) {
+                self.commit_speculate();
+            } else {
+                self.abort_speculate(mark);
             }
         }
         let args = if self.is_punct(Punct::LParen) {
             self.parse_args()?
         } else {
-            Vec::new()
+            Box::new([])
         };
         Ok(self.mk_expr(
             start,
@@ -577,9 +465,9 @@ impl Parser {
         Ok(expr)
     }
 
-    pub(super) fn parse_args(&mut self) -> PResult<Vec<Expr>> {
+    pub(super) fn parse_args(&mut self) -> PResult<Box<[Expr]>> {
         self.expect_punct(Punct::LParen)?;
-        let mut args = Vec::new();
+        let mut args = SmallStage::new();
         while !self.is_punct(Punct::RParen) {
             let start = self.cur_span();
             if self.eat_punct(Punct::DotDotDot) {
@@ -593,7 +481,7 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RParen)?;
-        Ok(args)
+        Ok(args.into_boxed_slice())
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
@@ -604,48 +492,47 @@ impl Parser {
                 self.bump();
                 Ok(self.mk_expr(start, ExprKind::NumberLit(n)))
             }
-            TokenKind::Str(s) => {
-                let s = s.clone();
-                self.bump();
+            TokenKind::Str(_) => {
+                let s = self.bump_str().unwrap();
                 Ok(self.mk_expr(start, ExprKind::StringLit(s)))
             }
-            TokenKind::NoSubTemplate(s) => {
-                let s = s.clone();
-                self.bump();
+            TokenKind::NoSubTemplate(_) => {
+                let s = self.bump_template_str();
                 Ok(self.mk_expr(
                     start,
                     ExprKind::TemplateLit {
                         quasis: vec![s],
-                        exprs: vec![],
+                        exprs: Box::new([]),
                     },
                 ))
             }
-            TokenKind::TemplateHead(s) => {
-                let mut quasis = vec![s.clone()];
-                self.bump();
-                let mut exprs = Vec::new();
+            TokenKind::TemplateHead(_) => {
+                let mut quasis = vec![self.bump_template_str()];
+                let mut exprs = SmallStage::new();
                 loop {
                     let e = self.parse_expr()?;
                     exprs.push(e);
                     match &self.cur().kind {
-                        TokenKind::TemplateMiddle(s2) => {
-                            quasis.push(s2.clone());
-                            self.bump();
+                        TokenKind::TemplateMiddle(_) => {
+                            quasis.push(self.bump_template_str());
                         }
-                        TokenKind::TemplateTail(s2) => {
-                            quasis.push(s2.clone());
-                            self.bump();
+                        TokenKind::TemplateTail(_) => {
+                            quasis.push(self.bump_template_str());
                             break;
                         }
                         _ => return Err(self.err("テンプレートリテラルが不正です")),
                     }
                 }
-                Ok(self.mk_expr(start, ExprKind::TemplateLit { quasis, exprs }))
+                Ok(self.mk_expr(
+                    start,
+                    ExprKind::TemplateLit {
+                        quasis,
+                        exprs: exprs.into_boxed_slice(),
+                    },
+                ))
             }
-            TokenKind::Regex { pattern, flags } => {
-                let pattern = pattern.clone();
-                let flags = flags.clone();
-                self.bump();
+            TokenKind::Regex(_) => {
+                let (pattern, flags) = self.bump_regex();
                 Ok(self.mk_expr(start, ExprKind::RegexLit { pattern, flags }))
             }
             TokenKind::Punct(Punct::LParen) => {
@@ -703,8 +590,7 @@ impl Parser {
                 Ok(self.mk_expr(start, ExprKind::UndefinedLit))
             }
             _ => {
-                let name = word.to_owned();
-                self.bump();
+                let name = self.bump_ident().unwrap();
                 Ok(self.mk_expr(start, ExprKind::Ident(name)))
             }
         }
@@ -724,7 +610,7 @@ impl Parser {
     fn parse_array_lit(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
         self.expect_punct(Punct::LBracket)?;
-        let mut elements = Vec::new();
+        let mut elements = SmallStage::new();
         while !self.is_punct(Punct::RBracket) {
             if self.is_punct(Punct::Comma) {
                 elements.push(None);
@@ -743,13 +629,13 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RBracket)?;
-        Ok(self.mk_expr(start, ExprKind::ArrayLit(elements)))
+        Ok(self.mk_expr(start, ExprKind::ArrayLit(elements.into_boxed_slice())))
     }
 
     fn parse_object_lit(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
         self.expect_punct(Punct::LBrace)?;
-        let mut props = Vec::new();
+        let mut props = SmallStage::new();
         while !self.is_punct(Punct::RBrace) {
             props.push(self.parse_object_prop()?);
             if !self.eat_punct(Punct::Comma) {
@@ -757,7 +643,7 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RBrace)?;
-        Ok(self.mk_expr(start, ExprKind::ObjectLit(props)))
+        Ok(self.mk_expr(start, ExprKind::ObjectLit(props.into_boxed_slice())))
     }
 
     fn parse_object_prop(&mut self) -> PResult<ObjectProp> {
@@ -769,7 +655,7 @@ impl Parser {
         // get/set アクセサ shorthand の投機的判定。
         if self.is_word("get") || self.is_word("set") {
             let is_get = self.is_word("get");
-            let mark = self.save();
+            let mark = self.begin_speculate();
             self.bump();
             if !self.is_punct(Punct::Colon)
                 && !self.is_punct(Punct::Comma)
@@ -778,6 +664,7 @@ impl Parser {
             {
                 if let Ok(key) = self.parse_property_key() {
                     if self.is_punct(Punct::LParen) {
+                        self.commit_speculate();
                         let function = self.parse_method_function(false)?;
                         return Ok(ObjectProp::Method {
                             key,
@@ -791,7 +678,7 @@ impl Parser {
                     }
                 }
             }
-            self.restore(mark);
+            self.abort_speculate(mark);
         }
 
         let is_async = if self.is_word("async")
@@ -847,7 +734,7 @@ impl Parser {
         if !quick_possible {
             return Ok(None);
         }
-        let mark = self.save();
+        let mark = self.begin_speculate();
         let start = self.cur_span();
         let mut is_async = false;
         if self.is_word("async") && !self.peek_kind_newline(1) {
@@ -864,8 +751,8 @@ impl Parser {
         if self.peek_is_punct(1, Punct::Arrow) {
             if let Some(word) = self.cur_ident() {
                 if !is_keyword_like(word) {
-                    let name = word.to_owned();
-                    self.bump();
+                    self.commit_speculate();
+                    let name = self.bump_ident().unwrap();
                     self.bump(); // =>
                     let param = Param {
                         pattern: Pattern::Ident(name),
@@ -877,7 +764,7 @@ impl Parser {
                         id: self.fresh_id(),
                         span: Span::new(start.start, self.prev_end()),
                         name: None,
-                        params: vec![param],
+                        params: Box::new([param]),
                         body,
                         expr_body,
                         is_async,
@@ -895,6 +782,7 @@ impl Parser {
                     let _ = self.skip_type();
                 }
                 if self.is_punct(Punct::Arrow) {
+                    self.commit_speculate();
                     self.bump();
                     let (body, expr_body) = self.parse_arrow_body()?;
                     let func = Function {
@@ -912,7 +800,7 @@ impl Parser {
             }
         }
 
-        self.restore(mark);
+        self.abort_speculate(mark);
         Ok(None)
     }
 
@@ -928,9 +816,9 @@ impl Parser {
 
     /// 仮引数リスト `(a, b: T = 1, ...rest)` を読む。型注釈・デフォルト値・
     /// rest・分割代入パターンすべてに対応する。
-    pub(super) fn parse_param_list(&mut self) -> PResult<Vec<Param>> {
+    pub(super) fn parse_param_list(&mut self) -> PResult<Box<[Param]>> {
         self.expect_punct(Punct::LParen)?;
-        let mut params = Vec::new();
+        let mut params = SmallStage::new();
         while !self.is_punct(Punct::RParen) {
             // アクセス修飾子 (constructor 引数プロパティ) は読み飛ばす。
             loop {
@@ -965,7 +853,7 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RParen)?;
-        Ok(params)
+        Ok(params.into_boxed_slice())
     }
 
     /// `function` キーワードの後ろから読む関数式。
@@ -985,41 +873,14 @@ impl Parser {
         let start = self.cur_span();
         self.eat_punct(Punct::Star); // generator の '*' は読み飛ばす（非対応）
         let name = if !self.is_punct(Punct::LParen) && !self.is_punct(Punct::Lt) {
-            match self.ident_name() {
-                Some(n) => {
-                    self.bump();
-                    Some(n)
-                }
-                None => None,
-            }
+            self.bump_ident().map(String::into_boxed_str)
         } else {
             None
         };
         if name.is_none() && name_mode == FnNameMode::Required {
             return Err(self.err("関数名が必要です"));
         }
-        self.skip_type_params()?;
-        let params = self.parse_param_list()?;
-        if self.eat_punct(Punct::Colon) {
-            self.skip_type()?;
-        }
-        let body = if self.is_punct(Punct::LBrace) {
-            Some(self.parse_block_stmts()?)
-        } else {
-            // アンビエント宣言（本体なし）。ASI で `;` を読む。
-            self.consume_semi()?;
-            None
-        };
-        Ok(Function {
-            id: self.fresh_id(),
-            span: Span::new(start.start, self.prev_end()),
-            name,
-            params,
-            body,
-            expr_body: None,
-            is_async,
-            is_arrow: false,
-        })
+        self.parse_function_body_with_name(start, is_async, name)
     }
 
     fn parse_class_expr(&mut self) -> PResult<Expr> {
@@ -1037,6 +898,15 @@ impl Parser {
     /// 本体を読む。
     pub(super) fn parse_function_tail_no_name(&mut self, is_async: bool) -> PResult<Function> {
         let start = self.cur_span();
+        self.parse_function_body_with_name(start, is_async, None)
+    }
+
+    fn parse_function_body_with_name(
+        &mut self,
+        start: Span,
+        is_async: bool,
+        name: Option<Box<str>>,
+    ) -> PResult<Function> {
         self.skip_type_params()?;
         let params = self.parse_param_list()?;
         if self.eat_punct(Punct::Colon) {
@@ -1045,13 +915,14 @@ impl Parser {
         let body = if self.is_punct(Punct::LBrace) {
             Some(self.parse_block_stmts()?)
         } else {
+            // アンビエント宣言（本体なし）。ASI で `;` を読む。
             self.consume_semi()?;
             None
         };
         Ok(Function {
             id: self.fresh_id(),
             span: Span::new(start.start, self.prev_end()),
-            name: None,
+            name,
             params,
             body,
             expr_body: None,

@@ -134,34 +134,26 @@ impl Compiler {
                 self.emit(OpCode::LoadRegex(c), line);
             }
             ExprKind::ArrayLit(elements) => {
-                self.emit(OpCode::NewArray, line);
+                if elements.is_empty() {
+                    self.emit(OpCode::NewArray, line);
+                } else {
+                    let cap = elements.len().min(u16::MAX as usize) as u16;
+                    self.emit(OpCode::NewArrayWithCap(cap), line);
+                }
                 for el in elements {
                     match el {
                         None => {
                             self.emit(OpCode::LoadUndefined, line);
                             self.emit(OpCode::ArrayPush, line);
                         }
-                        Some(e) => {
-                            if let ExprKind::Spread(inner) = &e.kind {
-                                self.compile_expr(inner)?;
-                                self.emit(OpCode::SpreadAppendArray, line);
-                            } else {
-                                self.compile_expr(e)?;
-                                self.emit(OpCode::ArrayPush, line);
-                            }
-                        }
+                        Some(e) => self.compile_array_item(e, line)?,
                     }
                 }
             }
             ExprKind::ObjectLit(props) => self.compile_object_lit(props, line)?,
-            ExprKind::Function(f) => {
+            ExprKind::Function(f) | ExprKind::Arrow(f) => {
                 let name = f.name.as_deref().unwrap_or("");
                 let tpl = self.compile_function(f, name)?;
-                let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
-                self.emit(OpCode::MakeClosure(c), line);
-            }
-            ExprKind::Arrow(f) => {
-                let tpl = self.compile_function(f, "")?;
                 let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
                 self.emit(OpCode::MakeClosure(c), line);
             }
@@ -193,9 +185,7 @@ impl Compiler {
                 let mut patches = Vec::new();
                 self.compile_chain(e, &mut patches)?;
                 let end = self.cur_addr();
-                for p in patches {
-                    self.patch_jump(p, end);
-                }
+                self.patch_all(patches, end);
             }
             ExprKind::New { callee, args } => self.compile_new(callee, args, line)?,
             ExprKind::Sequence(list) => {
@@ -251,7 +241,12 @@ impl Compiler {
     }
 
     fn compile_object_lit(&mut self, props: &[ObjectProp], line: u32) -> CResult<()> {
-        self.emit(OpCode::NewObject, line);
+        if props.is_empty() || (props.len() >= 3 && props.len() <= 4) {
+            self.emit(OpCode::NewObject, line);
+        } else {
+            let cap = props.len().min(u16::MAX as usize) as u16;
+            self.emit(OpCode::NewObjectWithCap(cap), line);
+        }
         for p in props {
             match p {
                 ObjectProp::KeyValue { key, value, .. } => match key {
@@ -346,6 +341,73 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_array_item(&mut self, e: &Expr, line: u32) -> CResult<()> {
+        if let ExprKind::Spread(inner) = &e.kind {
+            self.compile_expr(inner)?;
+            self.emit(OpCode::SpreadAppendArray, line);
+        } else {
+            self.compile_expr(e)?;
+            self.emit(OpCode::ArrayPush, line);
+        }
+        Ok(())
+    }
+
+    fn prepare_member_target(
+        &mut self,
+        obj: &Expr,
+        prop: &PropertyKey,
+        line: u32,
+    ) -> CResult<MemberTarget> {
+        let tmp_obj = self.temp_slot();
+        self.compile_expr(obj)?;
+        self.emit(OpCode::BindLocal(tmp_obj), line);
+        let key = match prop {
+            PropertyKey::Computed(ke) => {
+                let t = self.temp_slot();
+                self.compile_expr(ke)?;
+                self.emit(OpCode::BindLocal(t), line);
+                MemberKey::Computed(t)
+            }
+            _ => {
+                let name = property_key_static_name(prop);
+                MemberKey::Static(self.add_const_str(&name))
+            }
+        };
+        Ok(MemberTarget { tmp_obj, key })
+    }
+
+    fn emit_member_get(&mut self, target: MemberTarget, line: u32) {
+        self.emit(OpCode::GetLocal(target.tmp_obj), line);
+        match target.key {
+            MemberKey::Static(c) => {
+                self.emit(OpCode::GetProp(c), line);
+            }
+            MemberKey::Computed(t) => {
+                self.emit(OpCode::GetLocal(t), line);
+                self.emit(OpCode::GetIndex, line);
+            }
+        }
+    }
+
+    /// スタック最上位の値を `target` に書き戻し、書き込んだ値をスタックに残す。
+    fn emit_member_set_top(&mut self, target: MemberTarget, line: u32) {
+        match target.key {
+            MemberKey::Static(c) => {
+                self.emit(OpCode::GetLocal(target.tmp_obj), line);
+                self.emit(OpCode::Swap, line);
+                self.emit(OpCode::SetProp(c), line);
+            }
+            MemberKey::Computed(t) => {
+                let tmp_val = self.temp_slot();
+                self.emit(OpCode::BindLocal(tmp_val), line);
+                self.emit(OpCode::GetLocal(target.tmp_obj), line);
+                self.emit(OpCode::GetLocal(t), line);
+                self.emit(OpCode::GetLocal(tmp_val), line);
+                self.emit(OpCode::SetIndex, line);
+            }
+        }
+    }
+
     fn compile_update(&mut self, op: UpdateOp, arg: &Expr, prefix: bool, line: u32) -> CResult<()> {
         let delta = match op {
             UpdateOp::Inc => 1i32,
@@ -366,35 +428,8 @@ impl Compiler {
                 }
             }
             ExprKind::Member { obj, prop, .. } => {
-                enum MemberKey {
-                    Static(ConstIdx),
-                    Computed(LocalIdx),
-                }
-                let tmp_obj = self.temp_slot();
-                self.compile_expr(obj)?;
-                self.emit(OpCode::BindLocal(tmp_obj), line);
-                let member_key = match prop {
-                    PropertyKey::Computed(ke) => {
-                        let t = self.temp_slot();
-                        self.compile_expr(ke)?;
-                        self.emit(OpCode::BindLocal(t), line);
-                        MemberKey::Computed(t)
-                    }
-                    _ => {
-                        let name = property_key_static_name(prop);
-                        MemberKey::Static(self.add_const_str(&name))
-                    }
-                };
-                self.emit(OpCode::GetLocal(tmp_obj), line);
-                match member_key {
-                    MemberKey::Static(c) => {
-                        self.emit(OpCode::GetProp(c), line);
-                    }
-                    MemberKey::Computed(t) => {
-                        self.emit(OpCode::GetLocal(t), line);
-                        self.emit(OpCode::GetIndex, line);
-                    }
-                }
+                let target = self.prepare_member_target(obj, prop, line)?;
+                self.emit_member_get(target, line);
                 self.emit(OpCode::Pos, line);
                 let tmp_old = if !prefix {
                     let t = self.temp_slot();
@@ -406,20 +441,7 @@ impl Compiler {
                 };
                 self.emit(OpCode::LoadSmallInt(delta), line);
                 self.emit(OpCode::Add, line);
-                let tmp_new = self.temp_slot();
-                self.emit(OpCode::BindLocal(tmp_new), line);
-                self.emit(OpCode::GetLocal(tmp_obj), line);
-                match member_key {
-                    MemberKey::Static(c) => {
-                        self.emit(OpCode::GetLocal(tmp_new), line);
-                        self.emit(OpCode::SetProp(c), line);
-                    }
-                    MemberKey::Computed(t) => {
-                        self.emit(OpCode::GetLocal(t), line);
-                        self.emit(OpCode::GetLocal(tmp_new), line);
-                        self.emit(OpCode::SetIndex, line);
-                    }
-                }
+                self.emit_member_set_top(target, line);
                 if let Some(t) = tmp_old {
                     self.emit(OpCode::Pop, line);
                     self.emit(OpCode::GetLocal(t), line);
@@ -510,70 +532,41 @@ impl Compiler {
                 }
             },
             ExprKind::Member { obj, prop, .. } => {
-                if let PropertyKey::Computed(ke) = prop {
-                    let tmp_obj = self.temp_slot();
-                    self.compile_expr(obj)?;
-                    self.emit(OpCode::BindLocal(tmp_obj), line);
-                    let tmp_key = self.temp_slot();
-                    self.compile_expr(ke)?;
-                    self.emit(OpCode::BindLocal(tmp_key), line);
-                    self.emit(OpCode::GetLocal(tmp_obj), line);
-                    self.emit(OpCode::GetLocal(tmp_key), line);
-                    self.emit(OpCode::GetIndex, line);
-                    match compound {
-                        CompoundAssignOp::Logical(jump_op) => {
-                            let j = self.emit_jump(jump_op, line);
-                            self.emit(OpCode::Pop, line);
-                            self.compile_expr(value)?;
-                            let tmp_new = self.temp_slot();
-                            self.emit(OpCode::BindLocal(tmp_new), line);
-                            self.emit(OpCode::GetLocal(tmp_obj), line);
-                            self.emit(OpCode::GetLocal(tmp_key), line);
-                            self.emit(OpCode::GetLocal(tmp_new), line);
-                            self.emit(OpCode::SetIndex, line);
-                            let end = self.cur_addr();
-                            self.patch_jump(j, end);
-                        }
-                        CompoundAssignOp::Binary(plain_op) => {
-                            self.compile_expr(value)?;
-                            self.emit(plain_op, line);
-                            let tmp_new = self.temp_slot();
-                            self.emit(OpCode::BindLocal(tmp_new), line);
-                            self.emit(OpCode::GetLocal(tmp_obj), line);
-                            self.emit(OpCode::GetLocal(tmp_key), line);
-                            self.emit(OpCode::GetLocal(tmp_new), line);
-                            self.emit(OpCode::SetIndex, line);
-                        }
-                    }
-                    return Ok(());
-                }
-                let name = property_key_static_name(prop);
-                let c = self.add_const_str(&name);
-                let tmp_obj = self.temp_slot();
-                self.compile_expr(obj)?;
-                self.emit(OpCode::BindLocal(tmp_obj), line);
-                self.emit(OpCode::GetLocal(tmp_obj), line);
-                self.emit(OpCode::GetProp(c), line);
+                let target = self.prepare_member_target(obj, prop, line)?;
+                self.emit_member_get(target, line);
                 match compound {
                     CompoundAssignOp::Logical(jump_op) => {
                         let j = self.emit_jump(jump_op, line);
                         self.emit(OpCode::Pop, line);
-                        self.emit(OpCode::GetLocal(tmp_obj), line);
                         self.compile_expr(value)?;
-                        self.emit(OpCode::SetProp(c), line);
+                        self.emit_member_set_top(target, line);
                         let end = self.cur_addr();
                         self.patch_jump(j, end);
                     }
                     CompoundAssignOp::Binary(plain_op) => {
                         self.compile_expr(value)?;
                         self.emit(plain_op, line);
-                        self.emit(OpCode::GetLocal(tmp_obj), line);
-                        self.emit(OpCode::Swap, line);
-                        self.emit(OpCode::SetProp(c), line);
+                        self.emit_member_set_top(target, line);
                     }
                 }
             }
             _ => return Err(err(line, "代入の左辺として使えない式です")),
+        }
+        Ok(())
+    }
+
+    /// スタック最上位のオブジェクトに対して `prop`（静的/計算プロパティ）の読み出し命令を発行する。
+    pub(super) fn emit_get_prop_key(&mut self, prop: &PropertyKey, line: u32) -> CResult<()> {
+        match prop {
+            PropertyKey::Computed(ke) => {
+                self.compile_expr(ke)?;
+                self.emit(OpCode::GetIndex, line);
+            }
+            _ => {
+                let name = property_key_static_name(prop);
+                let c = self.add_const_str(&name);
+                self.emit(OpCode::GetProp(c), line);
+            }
         }
         Ok(())
     }
@@ -591,17 +584,7 @@ impl Compiler {
                     let j = self.emit_jump(OpCode::JumpIfNullish, line);
                     patches.push(j);
                 }
-                match prop {
-                    PropertyKey::Computed(ke) => {
-                        self.compile_expr(ke)?;
-                        self.emit(OpCode::GetIndex, line);
-                    }
-                    _ => {
-                        let name = property_key_static_name(prop);
-                        let c = self.add_const_str(&name);
-                        self.emit(OpCode::GetProp(c), line);
-                    }
-                }
+                self.emit_get_prop_key(prop, line)?;
             }
             ExprKind::Call {
                 callee,
@@ -646,17 +629,7 @@ impl Compiler {
                         patches.push(j);
                     }
                     self.emit(OpCode::Dup, line);
-                    match prop {
-                        PropertyKey::Computed(ke) => {
-                            self.compile_expr(ke)?;
-                            self.emit(OpCode::GetIndex, line);
-                        }
-                        _ => {
-                            let name = property_key_static_name(prop);
-                            let c = self.add_const_str(&name);
-                            self.emit(OpCode::GetProp(c), line);
-                        }
-                    }
+                    self.emit_get_prop_key(prop, line)?;
                 } else if is_chain_callee {
                     self.emit(OpCode::LoadUndefined, line);
                     self.compile_chain_or_base(callee, patches)?;
@@ -693,13 +666,7 @@ impl Compiler {
         if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
             self.emit(OpCode::NewArray, line);
             for a in args {
-                if let ExprKind::Spread(inner) = &a.kind {
-                    self.compile_expr(inner)?;
-                    self.emit(OpCode::SpreadAppendArray, line);
-                } else {
-                    self.compile_expr(a)?;
-                    self.emit(OpCode::ArrayPush, line);
-                }
+                self.compile_array_item(a, line)?;
             }
             self.emit(spread_op, line);
         } else {
@@ -715,6 +682,18 @@ impl Compiler {
         self.compile_expr(callee)?;
         self.compile_call_args(args, OpCode::New, OpCode::NewSpread, line)
     }
+}
+
+#[derive(Clone, Copy)]
+enum MemberKey {
+    Static(ConstIdx),
+    Computed(LocalIdx),
+}
+
+#[derive(Clone, Copy)]
+struct MemberTarget {
+    tmp_obj: LocalIdx,
+    key: MemberKey,
 }
 
 /// 複合代入演算子の分類（論理短絡ジャンプか、二項演算命令か）。
@@ -782,29 +761,6 @@ pub(super) fn property_key_static_name(key: &PropertyKey) -> Cow<'_, str> {
 pub(super) fn expr_contains_closure(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Function(_) | ExprKind::Arrow(_) | ExprKind::Class(_) => true,
-        ExprKind::Unary { arg, .. }
-        | ExprKind::Update { arg, .. }
-        | ExprKind::Spread(arg)
-        | ExprKind::Await(arg)
-        | ExprKind::TsAs(arg)
-        | ExprKind::TsNonNull(arg) => expr_contains_closure(arg),
-        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
-            expr_contains_closure(left) || expr_contains_closure(right)
-        }
-        ExprKind::Assign { target, value, .. } => {
-            expr_contains_closure(target) || expr_contains_closure(value)
-        }
-        ExprKind::Conditional { test, cons, alt } => {
-            expr_contains_closure(test) || expr_contains_closure(cons) || expr_contains_closure(alt)
-        }
-        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args } => {
-            expr_contains_closure(callee) || args.iter().any(expr_contains_closure)
-        }
-        ExprKind::Member { obj, prop, .. } => {
-            expr_contains_closure(obj)
-                || matches!(prop, PropertyKey::Computed(k) if expr_contains_closure(k))
-        }
-        ExprKind::ArrayLit(els) => els.iter().flatten().any(expr_contains_closure),
         ExprKind::ObjectLit(props) => props.iter().any(|p| match p {
             ObjectProp::KeyValue { key, value, .. } => {
                 expr_contains_closure(value)
@@ -813,10 +769,15 @@ pub(super) fn expr_contains_closure(e: &Expr) -> bool {
             ObjectProp::Method { .. } => true,
             ObjectProp::Spread(s) => expr_contains_closure(s),
         }),
-        ExprKind::TemplateLit { exprs, .. } | ExprKind::Sequence(exprs) => {
-            exprs.iter().any(expr_contains_closure)
+        _ => {
+            let mut found = false;
+            e.for_each_child(&mut |c| {
+                if !found && expr_contains_closure(c) {
+                    found = true;
+                }
+            });
+            found
         }
-        _ => false,
     }
 }
 

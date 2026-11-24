@@ -139,7 +139,7 @@ impl Parser {
 
     /// `(` から始まる型: 関数型 `(a: T) => U` か、丸括弧で囲まれた型。
     fn skip_paren_type(&mut self) -> PResult<()> {
-        let mark = self.save();
+        let mark = self.begin_speculate();
         let ok = (|| -> PResult<()> {
             self.expect_punct(Punct::LParen)?;
             while !self.is_punct(Punct::RParen) {
@@ -162,9 +162,10 @@ impl Parser {
             }
         })();
         if ok.is_ok() {
+            self.commit_speculate();
             return Ok(());
         }
-        self.restore(mark);
+        self.abort_speculate(mark);
         self.skip_balanced_group()?;
         if self.eat_punct(Punct::Arrow) {
             self.skip_type()?;

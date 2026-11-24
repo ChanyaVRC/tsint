@@ -2,10 +2,12 @@
 
 use std::rc::Rc;
 
-use super::{chars_slice_to_val, native, value_as_cow_str, with_chars_buf, with_regex_scratch};
-use crate::regex::{RegexMatch, RegexScratch};
+use super::{lookup_method, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch};
+use crate::regex::RegexScratch;
 use crate::value::*;
-use crate::vm::{is_callable, to_number, Vm};
+use crate::vm::{is_callable, to_number, with_str_buf_rc, Vm};
+
+const REGEX_METHODS: &[(&str, usize)] = &[("test", 1), ("exec", 1), ("toString", 0)];
 
 thread_local! {
     static KEY_LAST_INDEX: Rc<str> = Rc::from("lastIndex");
@@ -33,7 +35,7 @@ pub(super) fn install_regexp(vm: &mut Vm) {
         Rc::new(|vm, _this, args| {
             let (pattern, default_flags) = match args.first() {
                 Some(v) => match as_regex(v) {
-                    Some(re) => (re.source.clone(), re.flags.clone()),
+                    Some(re) => (re.source.to_string(), re.flags.to_string()),
                     None => (vm.to_display_string(v), String::new()),
                 },
                 None => (String::new(), String::new()),
@@ -80,25 +82,35 @@ fn regex_last_index(o: &ObjRef) -> usize {
 }
 
 fn set_last_index(o: &ObjRef, n: usize) {
+    let mut b = o.borrow_mut();
+    if n == 0 && b.props.is_empty() {
+        return;
+    }
     let key = KEY_LAST_INDEX.with(|k| k.clone());
-    o.borrow_mut().props.set_value(key, Value::Number(n as f64));
+    b.props.set_value(key, Value::Number(n as f64));
 }
 
 /// `RegExp.prototype.exec` の戻り値の配列（`index`/`input`/`groups` プロパティ付き）を組み立てる。
-pub(super) fn build_match_array(vm: &Vm, chars: &[char], mat: &RegexMatch, input: &str) -> Value {
-    let mut items = Vec::with_capacity(1 + mat.groups.len());
-    items.push(chars_slice_to_val(&chars[mat.start..mat.end]));
-    for g in &mat.groups {
-        items.push(match g {
-            Some((a, b)) => chars_slice_to_val(&chars[*a..*b]),
+pub(super) fn build_match_array_from_scratch(
+    vm: &Vm,
+    input: &str,
+    chars: &[char],
+    start: usize,
+    end: usize,
+    ncaptures: usize,
+    scratch: &RegexScratch,
+) -> Value {
+    let mut items = Vec::with_capacity(1 + ncaptures);
+    items.push(slice_to_val(input, chars, start, end));
+    for gi in 1..=ncaptures {
+        items.push(match scratch.group(gi) {
+            Some((a, b)) => slice_to_val(input, chars, a, b),
             None => Value::Undefined,
         });
     }
-    let mut obj = ObjData::new(ObjKind::Array(items));
-    obj.props.set_value(
-        KEY_INDEX.with(|k| k.clone()),
-        Value::Number(mat.start as f64),
-    );
+    let mut obj = ObjData::with_props_cap(ObjKind::Array(items), 3);
+    obj.props
+        .set_value(KEY_INDEX.with(|k| k.clone()), Value::Number(start as f64));
     obj.props
         .set_value(KEY_INPUT.with(|k| k.clone()), Value::str(input));
     obj.props
@@ -112,35 +124,40 @@ fn exec_regex_stateful<R>(
     o: &ObjRef,
     re: &crate::regex::Regex,
     s: &str,
-    on_result: impl FnOnce(&[char], Option<RegexMatch>) -> R,
+    on_result: impl FnOnce(&[char], Option<(usize, usize)>, &RegexScratch) -> R,
 ) -> Result<R, Value> {
     with_chars_buf(s, |chars| {
         let from = if re.global { regex_last_index(o) } else { 0 };
-        if from > chars.len() {
-            if re.global {
-                set_last_index(o, 0);
+        with_regex_scratch(|scratch| {
+            if from > chars.len() {
+                if re.global {
+                    set_last_index(o, 0);
+                }
+                return Ok(on_result(chars, None, scratch));
             }
-            return Ok(on_result(chars, None));
-        }
-        let mat = with_regex_scratch(|scratch| re.search_with_scratch(chars, from, scratch))
-            .map_err(|e| regex_err(vm, e))?;
-        if re.global {
-            set_last_index(o, mat.as_ref().map_or(0, |m| m.end));
-        }
-        Ok(on_result(chars, mat))
+            let mat = re
+                .find_with_scratch(chars, from, scratch)
+                .map_err(|e| regex_err(vm, e))?;
+            if re.global {
+                set_last_index(o, mat.map_or(0, |(_, end)| end));
+            }
+            Ok(on_result(chars, mat, scratch))
+        })
     })
 }
 
 pub(super) fn regex_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "test" => ("test", 1),
-        "exec" => ("exec", 1),
-        "toString" => ("toString", 0),
-        _ => return None,
+    lookup_method(REGEX_METHODS, name, call_regex_method)
+}
+
+fn extract_regex_receiver(this: &Value) -> Option<(&ObjRef, Rc<crate::regex::Regex>)> {
+    let Value::Object(o) = this else {
+        return None;
     };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_regex_method(vm, this, static_name, args).unwrap()
-    }))
+    match &o.borrow().kind {
+        ObjKind::Regex(r) => Some((o, r.clone())),
+        _ => None,
+    }
 }
 
 pub(super) fn call_regex_method(
@@ -150,31 +167,31 @@ pub(super) fn call_regex_method(
     args: &[Value],
 ) -> Option<Result<Value, Value>> {
     Some(match name {
-        "test" => (|| {
+        "test" => {
             let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            let Value::Object(o) = &this else {
-                return Ok(Value::Bool(false));
+            let Some((o, re)) = extract_regex_receiver(&this) else {
+                return Some(Ok(Value::Bool(false)));
             };
-            let re = match &o.borrow().kind {
-                ObjKind::Regex(r) => r.clone(),
-                _ => return Ok(Value::Bool(false)),
-            };
-            exec_regex_stateful(vm, o, &re, &s, |_, mat| Value::Bool(mat.is_some()))
-        })(),
-        "exec" => (|| {
+            exec_regex_stateful(vm, o, &re, &s, |_, mat, _| Value::Bool(mat.is_some()))
+        }
+        "exec" => {
             let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            let Value::Object(o) = &this else {
-                return Err(vm.type_error("RegExp ではありません"));
+            let Some((o, re)) = extract_regex_receiver(&this) else {
+                return Some(Err(vm.type_error("RegExp ではありません")));
             };
-            let re = match &o.borrow().kind {
-                ObjKind::Regex(r) => r.clone(),
-                _ => return Err(vm.type_error("RegExp ではありません")),
-            };
-            exec_regex_stateful(vm, o, &re, &s, |chars, mat| match mat {
-                Some(m) => build_match_array(vm, chars, &m, &s),
+            exec_regex_stateful(vm, o, &re, &s, |chars, mat, scratch| match mat {
+                Some((start, end)) => build_match_array_from_scratch(
+                    vm,
+                    &s,
+                    chars,
+                    start,
+                    end,
+                    re.ncaptures(),
+                    scratch,
+                ),
                 None => Value::Null,
             })
-        })(),
+        }
         "toString" => Ok(Value::str(vm.to_display_string(&this))),
         _ => return None,
     })
@@ -182,8 +199,26 @@ pub(super) fn call_regex_method(
 
 // ---------------- String.prototype.replace(All) の置換テンプレート ----------------
 
-/// `$&` `` $` `` `$'` `$1`〜 `$$` を `&mut String` へ直接展開する（正規表現マッチ版）。
-fn expand_regex_template_into(template: &str, chars: &[char], mat: &RegexMatch, out: &mut String) {
+/// `src` の文字範囲 `[a..b]` を `out` へ追記する（ASCII は直接スライスコピー）。
+#[inline]
+fn push_char_range(out: &mut String, src: &str, chars: &[char], a: usize, b: usize) {
+    if src.is_ascii() {
+        out.push_str(&src[a..b]);
+    } else {
+        out.extend(&chars[a..b]);
+    }
+}
+
+/// 置換テンプレート中の `$&` `` $` `` `$'` `$1`〜 `$$` を `&mut String` へ直接展開する共通実装。
+fn expand_template_into(
+    template: &str,
+    ncaptures: usize,
+    mut write_matched: impl FnMut(&mut String),
+    mut write_before: impl FnMut(&mut String),
+    mut write_after: impl FnMut(&mut String),
+    mut write_group: impl FnMut(usize, &mut String),
+    out: &mut String,
+) {
     let bytes = template.as_bytes();
     let mut i = 0usize;
     let mut chunk_start = 0usize;
@@ -191,57 +226,36 @@ fn expand_regex_template_into(template: &str, chars: &[char], mat: &RegexMatch, 
         if bytes[i] == b'$' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             match next {
-                b'$' => {
+                b'$' | b'&' | b'`' | b'\'' => {
                     out.push_str(&template[chunk_start..i]);
-                    out.push('$');
+                    match next {
+                        b'$' => out.push('$'),
+                        b'&' => write_matched(out),
+                        b'`' => write_before(out),
+                        b'\'' => write_after(out),
+                        _ => unreachable!(),
+                    }
                     i += 2;
                     chunk_start = i;
                     continue;
                 }
-                b'&' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.extend(&chars[mat.start..mat.end]);
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                b'`' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.extend(&chars[..mat.start]);
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                b'\'' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.extend(&chars[mat.end..]);
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                b'0'..=b'9' => {
+                b'0'..=b'9' if ncaptures > 0 => {
                     let one = (next - b'0') as usize;
                     let two = if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
                         Some(one * 10 + (bytes[i + 2] - b'0') as usize)
                     } else {
                         None
                     };
-                    if let Some(n2) = two {
-                        if n2 >= 1 && n2 <= mat.groups.len() {
-                            out.push_str(&template[chunk_start..i]);
-                            if let Some((a, b)) = mat.groups[n2 - 1] {
-                                out.extend(&chars[a..b]);
-                            }
-                            i += 3;
-                            chunk_start = i;
-                            continue;
-                        }
-                    }
-                    if one >= 1 && one <= mat.groups.len() {
+                    if let Some(n2) = two.filter(|&n| n >= 1 && n <= ncaptures) {
                         out.push_str(&template[chunk_start..i]);
-                        if let Some((a, b)) = mat.groups[one - 1] {
-                            out.extend(&chars[a..b]);
-                        }
+                        write_group(n2, out);
+                        i += 3;
+                        chunk_start = i;
+                        continue;
+                    }
+                    if one >= 1 && one <= ncaptures {
+                        out.push_str(&template[chunk_start..i]);
+                        write_group(one, out);
                         i += 2;
                         chunk_start = i;
                         continue;
@@ -257,76 +271,28 @@ fn expand_regex_template_into(template: &str, chars: &[char], mat: &RegexMatch, 
     }
 }
 
-/// 文字列パターン用の `$&` `` $` `` `$'` `$$` 展開を直接 `out` へ書き込む。
-fn expand_str_template_into(
-    template: &str,
-    matched: &str,
-    before: &str,
-    after: &str,
-    out: &mut String,
-) {
-    let bytes = template.as_bytes();
-    let mut i = 0usize;
-    let mut chunk_start = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'$' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.push('$');
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                b'&' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.push_str(matched);
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                b'`' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.push_str(before);
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                b'\'' => {
-                    out.push_str(&template[chunk_start..i]);
-                    out.push_str(after);
-                    i += 2;
-                    chunk_start = i;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    if chunk_start < bytes.len() {
-        out.push_str(&template[chunk_start..]);
-    }
-}
-
 /// 正規表現マッチ 1 件分のコールバック置換を実行して `out` へ追記する。
+#[allow(clippy::too_many_arguments)]
 fn call_regex_replace_cb_into(
     vm: &mut Vm,
     replacement: &Value,
-    chars: &[char],
-    mat: &RegexMatch,
     whole_input: &str,
+    chars: &[char],
+    start: usize,
+    end: usize,
+    ncaptures: usize,
+    scratch: &RegexScratch,
     out: &mut String,
 ) -> Result<(), Value> {
-    let mut cb_args = Vec::with_capacity(3 + mat.groups.len());
-    cb_args.push(chars_slice_to_val(&chars[mat.start..mat.end]));
-    for g in &mat.groups {
-        cb_args.push(match g {
-            Some((a, b)) => chars_slice_to_val(&chars[*a..*b]),
+    let mut cb_args = Vec::with_capacity(3 + ncaptures);
+    cb_args.push(slice_to_val(whole_input, chars, start, end));
+    for gi in 1..=ncaptures {
+        cb_args.push(match scratch.group(gi) {
+            Some((a, b)) => slice_to_val(whole_input, chars, a, b),
             None => Value::Undefined,
         });
     }
-    cb_args.push(Value::Number(mat.start as f64));
+    cb_args.push(Value::Number(start as f64));
     cb_args.push(Value::str(whole_input));
     let r = vm.call_value(replacement.clone(), Value::Undefined, &cb_args)?;
     crate::vm::to_string_into(&r, out);
@@ -363,7 +329,15 @@ fn append_replacement_str(
     } else {
         let template = value_as_cow_str(replacement);
         if template.contains('$') {
-            expand_str_template_into(&template, matched, before, after, out);
+            expand_template_into(
+                &template,
+                0,
+                |dst| dst.push_str(matched),
+                |dst| dst.push_str(before),
+                |dst| dst.push_str(after),
+                |_, _| {},
+                out,
+            );
         } else {
             out.push_str(&template);
         }
@@ -379,55 +353,51 @@ pub(super) fn string_replace(
     replacement: &Value,
     force_all: bool,
 ) -> Result<Value, Value> {
-    if let Value::Object(o) = pattern {
-        let maybe_re = match &o.borrow().kind {
-            ObjKind::Regex(r) => Some(r.clone()),
-            _ => None,
-        };
-        if let Some(re) = maybe_re {
-            return string_replace_regex(vm, s, &re, replacement, force_all || re.global);
-        }
+    if let Some(re) = as_regex(pattern) {
+        return string_replace_regex(vm, s, &re, replacement, force_all || re.global);
     }
     string_replace_literal(vm, s, pattern, replacement, force_all)
 }
 
 /// ゼロ幅一致時に無限ループを避けつつ次の検索開始位置を返す。
 #[inline]
-pub(super) fn next_search_pos(mat: &RegexMatch) -> usize {
-    if mat.end == mat.start {
-        mat.end + 1
+pub(super) fn next_search_pos(start: usize, end: usize) -> usize {
+    if end == start {
+        end + 1
     } else {
-        mat.end
+        end
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_regex_replace_loop(
     vm: &mut Vm,
     re: &crate::regex::Regex,
+    src: &str,
     chars: &[char],
     scratch: &mut RegexScratch,
     global: bool,
     out: &mut String,
-    mut on_match: impl FnMut(&mut Vm, &RegexMatch, &mut String) -> Result<(), Value>,
+    mut on_match: impl FnMut(&mut Vm, usize, usize, &RegexScratch, &mut String) -> Result<(), Value>,
 ) -> Result<(), Value> {
     let mut pos = 0usize;
     let mut search_from = 0usize;
     while search_from <= chars.len() {
-        let Some(mat) = re
-            .search_with_scratch(chars, search_from, scratch)
+        let Some((start, end)) = re
+            .find_with_scratch(chars, search_from, scratch)
             .map_err(|e| regex_err(vm, e))?
         else {
             break;
         };
-        out.extend(&chars[pos..mat.start]);
-        on_match(vm, &mat, out)?;
-        pos = mat.end;
-        search_from = next_search_pos(&mat);
+        push_char_range(out, src, chars, pos, start);
+        on_match(vm, start, end, scratch, out)?;
+        pos = end;
+        search_from = next_search_pos(start, end);
         if !global {
             break;
         }
     }
-    out.extend(&chars[pos..]);
+    push_char_range(out, src, chars, pos, chars.len());
     Ok(())
 }
 
@@ -438,22 +408,48 @@ fn string_replace_regex(
     replacement: &Value,
     global: bool,
 ) -> Result<Value, Value> {
+    let ncap = re.ncaptures();
     if !is_callable(replacement) {
         let template = value_as_cow_str(replacement);
         let has_dollar = template.contains('$');
         return with_chars_buf(s, |chars| {
-            let mut out = String::with_capacity(s.len());
-            with_regex_scratch(|scratch| {
-                run_regex_replace_loop(vm, re, chars, scratch, global, &mut out, |_, mat, dst| {
-                    if has_dollar {
-                        expand_regex_template_into(&template, chars, mat, dst);
-                    } else {
-                        dst.push_str(&template);
-                    }
-                    Ok(())
-                })
-            })?;
-            Ok(Value::str(out))
+            let mut err_res: Result<(), Value> = Ok(());
+            let rc = with_str_buf_rc(|out| {
+                out.reserve(s.len());
+                err_res = with_regex_scratch(|scratch| {
+                    run_regex_replace_loop(
+                        vm,
+                        re,
+                        s,
+                        chars,
+                        scratch,
+                        global,
+                        out,
+                        |_, start, end, sc, dst| {
+                            if has_dollar {
+                                expand_template_into(
+                                    &template,
+                                    ncap,
+                                    |d| push_char_range(d, s, chars, start, end),
+                                    |d| push_char_range(d, s, chars, 0, start),
+                                    |d| push_char_range(d, s, chars, end, chars.len()),
+                                    |gi, d| {
+                                        if let Some((a, b)) = sc.group(gi) {
+                                            push_char_range(d, s, chars, a, b);
+                                        }
+                                    },
+                                    dst,
+                                );
+                            } else {
+                                dst.push_str(&template);
+                            }
+                            Ok(())
+                        },
+                    )
+                });
+            });
+            err_res?;
+            Ok(Value::Str(rc))
         });
     }
     // コールバック関数は再入し得るためローカル `Vec<char>` と `RegexScratch` を使う
@@ -463,13 +459,56 @@ fn string_replace_regex(
     run_regex_replace_loop(
         vm,
         re,
+        s,
         &chars,
         &mut scratch,
         global,
         &mut out,
-        |vm, mat, dst| call_regex_replace_cb_into(vm, replacement, &chars, mat, s, dst),
+        |vm, start, end, sc, dst| {
+            call_regex_replace_cb_into(vm, replacement, s, &chars, start, end, ncap, sc, dst)
+        },
     )?;
     Ok(Value::str(out))
+}
+
+/// リテラル文字列一致を走査し、各一致箇所で `on_match(before, after, out)` を呼ぶ共通ループ。
+fn run_literal_replace<E>(
+    s: &str,
+    needle: &str,
+    force_all: bool,
+    out: &mut String,
+    mut on_match: impl FnMut(&str, &str, &mut String) -> Result<(), E>,
+) -> Result<bool, E> {
+    if !force_all {
+        let Some(idx) = s.find(needle) else {
+            return Ok(false);
+        };
+        let (before, after) = (&s[..idx], &s[idx + needle.len()..]);
+        out.reserve(s.len());
+        out.push_str(before);
+        on_match(before, after, out)?;
+        out.push_str(after);
+        return Ok(true);
+    }
+    if needle.is_empty() {
+        out.reserve(s.len() * 2);
+        for (byte_i, c) in s.char_indices() {
+            on_match(&s[..byte_i], &s[byte_i..], out)?;
+            out.push(c);
+        }
+        on_match(s, "", out)?;
+        return Ok(true);
+    }
+    out.reserve(s.len());
+    let mut pos = 0usize;
+    while let Some(rel) = s[pos..].find(needle) {
+        let abs = pos + rel;
+        out.push_str(&s[pos..abs]);
+        on_match(&s[..abs], &s[abs + needle.len()..], out)?;
+        pos = abs + needle.len();
+    }
+    out.push_str(&s[pos..]);
+    Ok(true)
 }
 
 fn string_replace_literal(
@@ -484,80 +523,26 @@ fn string_replace_literal(
     if !is_callable(replacement) {
         let template = value_as_cow_str(replacement);
         if !template.contains('$') {
-            if force_all {
-                if needle.is_empty() {
-                    let mut out = String::with_capacity(s.len() + template.len() * (s.len() + 1));
-                    for c in s.chars() {
-                        out.push_str(&template);
-                        out.push(c);
-                    }
-                    out.push_str(&template);
-                    return Ok(Value::str(out));
-                }
-                return Ok(Value::str(s.replace(needle.as_ref(), template.as_ref())));
+            if !force_all && !s.contains(needle.as_ref()) {
+                return Ok(Value::str(s));
             }
-            return match s.find(needle.as_ref()) {
-                Some(idx) => {
-                    let mut out = String::with_capacity(s.len() - needle.len() + template.len());
-                    out.push_str(&s[..idx]);
-                    out.push_str(&template);
-                    out.push_str(&s[idx + needle.len()..]);
-                    Ok(Value::str(out))
-                }
-                None => Ok(Value::str(s)),
-            };
+            return Ok(Value::Str(with_str_buf_rc(|out| {
+                let _ = run_literal_replace::<()>(s, &needle, force_all, out, |_, _, dst| {
+                    dst.push_str(&template);
+                    Ok(())
+                });
+            })));
         }
     }
-    if force_all {
-        if needle.is_empty() {
-            let mut out = String::with_capacity(s.len() * 2);
-            for (byte_i, c) in s.char_indices() {
-                append_replacement_str(
-                    vm,
-                    replacement,
-                    "",
-                    &s[..byte_i],
-                    &s[byte_i..],
-                    s,
-                    &mut out,
-                )?;
-                out.push(c);
-            }
-            append_replacement_str(vm, replacement, "", s, "", s, &mut out)?;
-            return Ok(Value::str(out));
-        }
-        let mut out = String::with_capacity(s.len());
-        let mut pos = 0usize;
-        while let Some(rel) = s[pos..].find(needle.as_ref()) {
-            let abs = pos + rel;
-            out.push_str(&s[pos..abs]);
-            append_replacement_str(
-                vm,
-                replacement,
-                &needle,
-                &s[..abs],
-                &s[abs + needle.len()..],
-                s,
-                &mut out,
-            )?;
-            pos = abs + needle.len();
-        }
-        out.push_str(&s[pos..]);
-        Ok(Value::str(out))
+    let mut out = String::new();
+    let matched = run_literal_replace(s, &needle, force_all, &mut out, |before, after, dst| {
+        append_replacement_str(vm, replacement, &needle, before, after, s, dst)
+    })?;
+    Ok(if matched {
+        Value::str(out)
     } else {
-        match s.find(needle.as_ref()) {
-            Some(idx) => {
-                let before = &s[..idx];
-                let after = &s[idx + needle.len()..];
-                let mut out = String::with_capacity(s.len());
-                out.push_str(before);
-                append_replacement_str(vm, replacement, &needle, before, after, s, &mut out)?;
-                out.push_str(after);
-                Ok(Value::str(out))
-            }
-            None => Ok(Value::str(s)),
-        }
-    }
+        Value::str(s)
+    })
 }
 
 /// `String.prototype.split(regex, limit)` 本体。
@@ -567,10 +552,11 @@ pub(super) fn regex_split(
     s: &str,
     limit: usize,
 ) -> Result<Vec<Value>, Value> {
+    let ncap = re.ncaptures();
     with_chars_buf(s, |chars| {
         if chars.is_empty() {
             let mut out = vec![];
-            if with_regex_scratch(|scratch| re.search_with_scratch(chars, 0, scratch))
+            if with_regex_scratch(|scratch| re.find_with_scratch(chars, 0, scratch))
                 .map_err(|e| regex_err(vm, e))?
                 .is_none()
             {
@@ -584,36 +570,36 @@ pub(super) fn regex_split(
         let mut search_from = 0usize;
         with_regex_scratch(|scratch| -> Result<(), Value> {
             while out.len() < limit && search_from <= chars.len() {
-                let Some(mat) = re
-                    .search_with_scratch(chars, search_from, scratch)
+                let Some((start, end)) = re
+                    .find_with_scratch(chars, search_from, scratch)
                     .map_err(|e| regex_err(vm, e))?
                 else {
                     break;
                 };
-                if mat.start >= chars.len() {
+                if start >= chars.len() {
                     break;
                 }
-                if mat.end == mat.start && mat.start == p {
-                    search_from = mat.start + 1;
+                if end == start && start == p {
+                    search_from = start + 1;
                     continue;
                 }
-                out.push(chars_slice_to_val(&chars[p..mat.start]));
-                for g in &mat.groups {
+                out.push(slice_to_val(s, chars, p, start));
+                for gi in 1..=ncap {
                     if out.len() >= limit {
                         break;
                     }
-                    out.push(match g {
-                        Some((a, b)) => chars_slice_to_val(&chars[*a..*b]),
+                    out.push(match scratch.group(gi) {
+                        Some((a, b)) => slice_to_val(s, chars, a, b),
                         None => Value::Undefined,
                     });
                 }
-                p = mat.end;
-                search_from = next_search_pos(&mat);
+                p = end;
+                search_from = next_search_pos(start, end);
             }
             Ok(())
         })?;
         if out.len() < limit {
-            out.push(chars_slice_to_val(&chars[p..]));
+            out.push(slice_to_val(s, chars, p, chars.len()));
         }
         out.truncate(limit);
         Ok(out)
