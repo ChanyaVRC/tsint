@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use crate::ast::{self, *};
 use crate::bytecode::*;
+use crate::hash::FastHashMap;
 
 #[derive(Debug, Clone)]
 pub struct CompileError {
@@ -78,6 +79,9 @@ struct FuncCtx {
     control: Vec<Ctrl>,
     /// 例外の再送出に使う一時ローカルスロット（finally を含む関数のみ確保）。
     exc_slot: Option<LocalIdx>,
+    /// 定数表の重複排除キャッシュ（文字列・数値）。
+    str_consts: FastHashMap<Rc<str>, ConstIdx>,
+    num_consts: FastHashMap<u64, ConstIdx>,
 }
 
 impl FuncCtx {
@@ -90,6 +94,8 @@ impl FuncCtx {
             upvalue_names: Vec::new(),
             control: vec![Ctrl::FuncBoundary],
             exc_slot: None,
+            str_consts: FastHashMap::default(),
+            num_consts: FastHashMap::default(),
         }
     }
 
@@ -183,7 +189,8 @@ pub fn compile_module(module: &Module) -> CResult<Rc<Chunk>> {
     c.emit(OpCode::LoadUndefined, 0);
     c.emit(OpCode::Return, 0);
 
-    let f = c.funcs.pop().unwrap();
+    let mut f = c.funcs.pop().unwrap();
+    f.chunk.finalize();
     Ok(Rc::new(f.chunk))
 }
 
@@ -281,7 +288,15 @@ impl Compiler {
     }
 
     fn add_const_str(&mut self, s: &str) -> ConstIdx {
-        self.add_const(Const::Str(Rc::from(s)))
+        let f = self.cur();
+        if let Some(&idx) = f.str_consts.get(s) {
+            return idx;
+        }
+        let rc: Rc<str> = Rc::from(s);
+        let idx = f.chunk.consts.len() as ConstIdx;
+        f.chunk.consts.push(Const::Str(rc.clone()));
+        f.str_consts.insert(rc, idx);
+        idx
     }
 
     fn patch_jump(&mut self, idx: usize, target: u32) {
@@ -290,6 +305,12 @@ impl Compiler {
             OpCode::Jump(_) => OpCode::Jump(target),
             OpCode::JumpIfFalse(_) => OpCode::JumpIfFalse(target),
             OpCode::JumpIfTrue(_) => OpCode::JumpIfTrue(target),
+            OpCode::LtJumpIfFalse(_) => OpCode::LtJumpIfFalse(target),
+            OpCode::LtEqJumpIfFalse(_) => OpCode::LtEqJumpIfFalse(target),
+            OpCode::GtJumpIfFalse(_) => OpCode::GtJumpIfFalse(target),
+            OpCode::GtEqJumpIfFalse(_) => OpCode::GtEqJumpIfFalse(target),
+            OpCode::StrictEqJumpIfFalse(_) => OpCode::StrictEqJumpIfFalse(target),
+            OpCode::StrictNotEqJumpIfFalse(_) => OpCode::StrictNotEqJumpIfFalse(target),
             OpCode::JumpIfNullish(_) => OpCode::JumpIfNullish(target),
             OpCode::JumpIfNullishCall(_) => OpCode::JumpIfNullishCall(target),
             OpCode::JumpIfFalsyKeep(_) => OpCode::JumpIfFalsyKeep(target),
@@ -298,6 +319,78 @@ impl Compiler {
             OpCode::JumpIfNotUndefinedKeep(_) => OpCode::JumpIfNotUndefinedKeep(target),
             other => panic!("patch_jump: ジャンプ命令ではありません: {other:?}"),
         };
+    }
+
+    /// 条件式 `cond` を評価し、偽ならジャンプする命令を発行してパッチ位置を返す。
+    /// `<` `<=` `>` `>=` `===` `!==` は融合比較ジャンプ命令に落とす。
+    fn compile_cond_jump_false(&mut self, cond: &Expr, line: u32) -> CResult<usize> {
+        if let ExprKind::Binary { op, left, right } = &cond.kind {
+            let fused = match op {
+                BinaryOp::Lt => Some(OpCode::LtJumpIfFalse(0)),
+                BinaryOp::LtEq => Some(OpCode::LtEqJumpIfFalse(0)),
+                BinaryOp::Gt => Some(OpCode::GtJumpIfFalse(0)),
+                BinaryOp::GtEq => Some(OpCode::GtEqJumpIfFalse(0)),
+                BinaryOp::StrictEq => Some(OpCode::StrictEqJumpIfFalse(0)),
+                BinaryOp::StrictNotEq => Some(OpCode::StrictNotEqJumpIfFalse(0)),
+                _ => None,
+            };
+            if let Some(op) = fused {
+                self.compile_expr(left)?;
+                self.compile_expr(right)?;
+                return Ok(self.emit(op, line));
+            }
+        }
+        self.compile_expr(cond)?;
+        Ok(self.emit_jump(OpCode::JumpIfFalse, line))
+    }
+
+    /// 式を評価して結果値を捨てる文脈（式文・`for` の init/update）用。
+    /// `i++`/`i--` やローカル代入を専用命令に落とし、不要な `Dup`/`SetLocal`/`Pop` を省く。
+    fn compile_expr_discard(&mut self, e: &Expr) -> CResult<()> {
+        let line = e.span.start.line;
+        match &e.kind {
+            ExprKind::Update { op, arg, .. } => {
+                if let ExprKind::Ident(name) = &arg.kind {
+                    if let VarLoc::Local(slot) = self.resolve(name) {
+                        let code = match op {
+                            UpdateOp::Inc => OpCode::IncLocal(slot),
+                            UpdateOp::Dec => OpCode::DecLocal(slot),
+                        };
+                        self.emit(code, line);
+                        return Ok(());
+                    }
+                }
+            }
+            ExprKind::Assign { op, target, value } => {
+                if let ExprKind::Ident(name) = &target.kind {
+                    if let VarLoc::Local(slot) = self.resolve(name) {
+                        if *op == AssignOp::Assign {
+                            self.compile_expr(value)?;
+                            self.emit(OpCode::BindLocal(slot), line);
+                            return Ok(());
+                        }
+                        let (is_logical, plain_op) = assign_op_kind(*op);
+                        if !is_logical {
+                            self.emit(OpCode::GetLocal(slot), line);
+                            self.compile_expr(value)?;
+                            self.emit(plain_op.unwrap(), line);
+                            self.emit(OpCode::BindLocal(slot), line);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            ExprKind::Sequence(list) => {
+                for item in list {
+                    self.compile_expr_discard(item)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.compile_expr(e)?;
+        self.emit(OpCode::Pop, line);
+        Ok(())
     }
 
     fn emit_jump(&mut self, mk: impl Fn(JumpAddr) -> OpCode, line: u32) -> usize {
@@ -477,8 +570,7 @@ impl Compiler {
         match &s.kind {
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::Expr(e) => {
-                self.compile_expr(e)?;
-                self.emit(OpCode::Pop, line);
+                self.compile_expr_discard(e)?;
             }
             StmtKind::Block(b) => self.compile_block_new_scope(b)?,
             StmtKind::VarDecl { decls, .. } => {
@@ -501,8 +593,7 @@ impl Compiler {
                 }
             }
             StmtKind::If { test, cons, alt } => {
-                self.compile_expr(test)?;
-                let jf = self.emit_jump(OpCode::JumpIfFalse, line);
+                let jf = self.compile_cond_jump_false(test, line)?;
                 self.compile_stmt(cons)?;
                 if let Some(alt) = alt {
                     let jend = self.emit_jump(OpCode::Jump, line);
@@ -592,8 +683,7 @@ impl Compiler {
     fn compile_while(&mut self, label: Option<Rc<str>>, test: &Expr, body: &Stmt) -> CResult<()> {
         let line = test.span.start.line;
         let test_addr = self.cur_addr();
-        self.compile_expr(test)?;
-        let jf = self.emit_jump(OpCode::JumpIfFalse, line);
+        let jf = self.compile_cond_jump_false(test, line)?;
         self.cur().control.push(Ctrl::Loop {
             label,
             break_patches: Vec::new(),
@@ -667,8 +757,7 @@ impl Compiler {
                     }
                 }
                 ForInit::Expr(e) => {
-                    self.compile_expr(e)?;
-                    self.emit(OpCode::Pop, line);
+                    self.compile_expr_discard(e)?;
                 }
             }
         }
@@ -677,8 +766,7 @@ impl Compiler {
         }
         let test_addr = self.cur_addr();
         let jf = if let Some(test) = test {
-            self.compile_expr(test)?;
-            Some(self.emit_jump(OpCode::JumpIfFalse, line))
+            Some(self.compile_cond_jump_false(test, line)?)
         } else {
             None
         };
@@ -690,12 +778,16 @@ impl Compiler {
         self.compile_stmt(body)?;
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
+        let update_has_closure = update.is_some_and(expr_contains_closure);
         for &slot in &per_iter_slots {
-            self.emit(OpCode::RebindLocal(slot), line);
+            // body / test のコンパイル完了後に captured_locals が確定しているため、
+            // 実際にクロージャに捕捉されたループ変数だけ RebindLocal を発行する。
+            if self.cur().chunk.captured_locals[slot as usize] || update_has_closure {
+                self.emit(OpCode::RebindLocal(slot), line);
+            }
         }
         if let Some(u) = update {
-            self.compile_expr(u)?;
-            self.emit(OpCode::Pop, line);
+            self.compile_expr_discard(u)?;
         }
         self.emit(OpCode::Jump(test_addr), line);
         let end = self.cur_addr();
@@ -739,8 +831,7 @@ impl Compiler {
         self.emit(OpCode::GetLocal(arr_slot), line);
         let len_c = self.add_const_str("length");
         self.emit(OpCode::GetProp(len_c), line);
-        self.emit(OpCode::Lt, line);
-        let jf = self.emit_jump(OpCode::JumpIfFalse, line);
+        let jf = self.emit_jump(OpCode::LtJumpIfFalse, line);
 
         self.cur().control.push(Ctrl::Loop {
             label,
@@ -765,11 +856,7 @@ impl Compiler {
         self.cur().locals.truncate(body_saved_len);
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
-        self.emit(OpCode::GetLocal(idx_slot), line);
-        let c1 = self.const_num(1.0);
-        self.emit(OpCode::LoadConst(c1), line);
-        self.emit(OpCode::Add, line);
-        self.emit(OpCode::BindLocal(idx_slot), line);
+        self.emit(OpCode::IncLocal(idx_slot), line);
         self.emit(OpCode::Jump(test_addr), line);
 
         let end = self.cur_addr();
@@ -780,7 +867,15 @@ impl Compiler {
     }
 
     fn const_num(&mut self, n: f64) -> ConstIdx {
-        self.add_const(Const::Number(n))
+        let bits = n.to_bits();
+        let f = self.cur();
+        if let Some(&idx) = f.num_consts.get(&bits) {
+            return idx;
+        }
+        let idx = f.chunk.consts.len() as ConstIdx;
+        f.chunk.consts.push(Const::Number(n));
+        f.num_consts.insert(bits, idx);
+        idx
     }
 
     fn resolve_loop_continue(&mut self, addr: u32) {
@@ -1332,7 +1427,27 @@ impl Compiler {
         let _ = is_method;
 
         let mut has_rest = false;
-        for (i, p) in f.params.iter().enumerate() {
+        // 先頭から連続する「デフォルト値なし・rest なし・単純識別子（重複名なし）」パラメータは
+        // フレーム作成時に直接ローカルスロットへ束縛する（GetArg + BindLocal プロローグと
+        // raw_args 確保を完全に省略する高速パス）。
+        let mut simple_prefix = 0usize;
+        for p in &f.params {
+            if !p.rest && p.default.is_none() {
+                if let Pattern::Ident(pname) = &p.pattern {
+                    if self.cur().find_local(pname).is_none() {
+                        self.declare_local(pname);
+                        simple_prefix += 1;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        self.cur().chunk.simple_param_count = simple_prefix as u16;
+        let needs_raw_args = simple_prefix < f.params.len();
+        self.cur().chunk.needs_raw_args = needs_raw_args;
+
+        for (i, p) in f.params.iter().enumerate().skip(simple_prefix) {
             let line = f.span.start.line;
             if p.rest {
                 has_rest = true;
@@ -1369,7 +1484,8 @@ impl Compiler {
             self.emit(OpCode::Return, f.span.start.line);
         }
 
-        let fctx = self.funcs.pop().unwrap();
+        let mut fctx = self.funcs.pop().unwrap();
+        fctx.chunk.finalize();
         Ok(FunctionTemplate {
             name: Rc::from(name),
             chunk: Rc::new(fctx.chunk),
@@ -1470,7 +1586,8 @@ impl Compiler {
         });
         self.compile_expr(e)?;
         self.emit(OpCode::Return, e.span.start.line);
-        let fctx = self.funcs.pop().unwrap();
+        let mut fctx = self.funcs.pop().unwrap();
+        fctx.chunk.finalize();
         Ok(Rc::new(FunctionTemplate {
             name: Rc::from("<field-init>"),
             chunk: Rc::new(fctx.chunk),
@@ -1488,8 +1605,17 @@ impl Compiler {
         let line = e.span.start.line;
         match &e.kind {
             ExprKind::NumberLit(n) => {
-                let c = self.const_num(*n);
-                self.emit(OpCode::LoadConst(c), line);
+                if n.fract() == 0.0
+                    && n.is_finite()
+                    && !(*n == 0.0 && n.is_sign_negative())
+                    && *n >= (i32::MIN as f64)
+                    && *n <= (i32::MAX as f64)
+                {
+                    self.emit(OpCode::LoadSmallInt(*n as i32), line);
+                } else {
+                    let c = self.const_num(*n);
+                    self.emit(OpCode::LoadConst(c), line);
+                }
             }
             ExprKind::StringLit(s) => {
                 let c = self.add_const_str(s);
@@ -1579,8 +1705,7 @@ impl Compiler {
                 self.compile_assign(*op, target, value, line)?
             }
             ExprKind::Conditional { test, cons, alt } => {
-                self.compile_expr(test)?;
-                let jf = self.emit_jump(OpCode::JumpIfFalse, line);
+                let jf = self.compile_cond_jump_false(test, line)?;
                 self.compile_expr(cons)?;
                 let jend = self.emit_jump(OpCode::Jump, line);
                 let alt_addr = self.cur_addr();
@@ -1617,15 +1742,36 @@ impl Compiler {
     }
 
     fn compile_template(&mut self, quasis: &[String], exprs: &[Expr], line: u32) -> CResult<()> {
-        let c0 = self.add_const_str(&quasis[0]);
-        self.emit(OpCode::LoadConst(c0), line);
+        if exprs.is_empty() {
+            let c0 = self.add_const_str(&quasis[0]);
+            self.emit(OpCode::LoadConst(c0), line);
+            return Ok(());
+        }
+        let mut count = 0usize;
+        if !quasis[0].is_empty() {
+            let c0 = self.add_const_str(&quasis[0]);
+            self.emit(OpCode::LoadConst(c0), line);
+            count += 1;
+        }
         for (i, e) in exprs.iter().enumerate() {
             self.compile_expr(e)?;
-            self.emit(OpCode::ToStringOp, line);
-            self.emit(OpCode::Add, line);
-            let cq = self.add_const_str(&quasis[i + 1]);
-            self.emit(OpCode::LoadConst(cq), line);
-            self.emit(OpCode::Add, line);
+            count += 1;
+            if !quasis[i + 1].is_empty() {
+                let cq = self.add_const_str(&quasis[i + 1]);
+                self.emit(OpCode::LoadConst(cq), line);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            let c0 = self.add_const_str("");
+            self.emit(OpCode::LoadConst(c0), line);
+        } else if count <= u16::MAX as usize {
+            self.emit(OpCode::ConcatStrings(count as u16), line);
+        } else {
+            // 極めて巨大なテンプレートのフォールバック（連結を順次畳み込む）。
+            for _ in 1..count {
+                self.emit(OpCode::ConcatStrings(2), line);
+            }
         }
         Ok(())
     }
@@ -2022,6 +2168,33 @@ impl Compiler {
                 args,
                 optional,
             } => {
+                // 非オプショナル・非スプレッド・副作用のない引数のみの `obj.method(args)` は
+                // 直接 `CallMethod` 命令に落とし、ビルトインメソッドの `NativeObj` 確保や
+                // `Dup`+`GetProp` のオーバーヘッドを省く。
+                if !*optional && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+                    if let ExprKind::Member {
+                        obj,
+                        prop,
+                        optional: false,
+                    } = &callee.kind
+                    {
+                        if !matches!(prop, PropertyKey::Computed(_))
+                            && args.len() <= u16::MAX as usize
+                            && args.iter().all(is_pure_call_arg)
+                        {
+                            let name = property_key_static_name(prop);
+                            let c = self.add_const_str(&name);
+                            if c <= u16::MAX as u32 {
+                                self.compile_chain_or_base(obj, patches)?;
+                                for a in args {
+                                    self.compile_expr(a)?;
+                                }
+                                self.emit(OpCode::CallMethod(c as u16, args.len() as u16), line);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let is_chain_callee =
                     matches!(callee.kind, ExprKind::Member { .. } | ExprKind::Call { .. });
                 if let ExprKind::Member {
@@ -2200,6 +2373,75 @@ fn collect_pattern_names(pat: &Pattern, out: &mut Vec<String>) {
                 collect_pattern_names(r, out);
             }
         }
+    }
+}
+
+fn expr_contains_closure(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Function(_) | ExprKind::Arrow(_) | ExprKind::Class(_) => true,
+        ExprKind::Unary { arg, .. }
+        | ExprKind::Update { arg, .. }
+        | ExprKind::Spread(arg)
+        | ExprKind::Await(arg)
+        | ExprKind::TsAs(arg)
+        | ExprKind::TsNonNull(arg) => expr_contains_closure(arg),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            expr_contains_closure(left) || expr_contains_closure(right)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            expr_contains_closure(target) || expr_contains_closure(value)
+        }
+        ExprKind::Conditional { test, cons, alt } => {
+            expr_contains_closure(test) || expr_contains_closure(cons) || expr_contains_closure(alt)
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args } => {
+            expr_contains_closure(callee) || args.iter().any(expr_contains_closure)
+        }
+        ExprKind::Member { obj, prop, .. } => {
+            expr_contains_closure(obj)
+                || matches!(prop, PropertyKey::Computed(k) if expr_contains_closure(k))
+        }
+        ExprKind::ArrayLit(els) => els.iter().flatten().any(expr_contains_closure),
+        ExprKind::ObjectLit(props) => props.iter().any(|p| match p {
+            ObjectProp::KeyValue { key, value, .. } => {
+                expr_contains_closure(value)
+                    || matches!(key, PropertyKey::Computed(k) if expr_contains_closure(k))
+            }
+            ObjectProp::Method { .. } => true,
+            ObjectProp::Spread(s) => expr_contains_closure(s),
+        }),
+        ExprKind::TemplateLit { exprs, .. } | ExprKind::Sequence(exprs) => {
+            exprs.iter().any(expr_contains_closure)
+        }
+        _ => false,
+    }
+}
+
+/// `CallMethod` の引数として安全（レシーバやプロパティを変更せず、`obj` 評価後に
+/// `obj.method` の取得より先に評価しても副作用の観測順序が変わらない）かどうか。
+fn is_pure_call_arg(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::NumberLit(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::NullLit
+        | ExprKind::UndefinedLit
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::RegexLit { .. } => true,
+        ExprKind::Unary { op, arg } => !matches!(op, UnaryOp::Delete) && is_pure_call_arg(arg),
+        ExprKind::Binary { op, left, right } => {
+            !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
+                && is_pure_call_arg(left)
+                && is_pure_call_arg(right)
+        }
+        ExprKind::Logical { left, right, .. } => is_pure_call_arg(left) && is_pure_call_arg(right),
+        ExprKind::Conditional { test, cons, alt } => {
+            is_pure_call_arg(test) && is_pure_call_arg(cons) && is_pure_call_arg(alt)
+        }
+        ExprKind::TemplateLit { exprs, .. } => exprs.iter().all(is_pure_call_arg),
+        ExprKind::TsAs(inner) | ExprKind::TsNonNull(inner) => is_pure_call_arg(inner),
+        _ => false,
     }
 }
 

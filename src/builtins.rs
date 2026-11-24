@@ -1009,8 +1009,25 @@ fn settle_forward_fn(vm: &Vm, target: ObjRef, is_reject: bool) -> Value {
 }
 
 fn promise_method(name: &str) -> Option<Value> {
+    let (static_name, arity): (&'static str, usize) = match name {
+        "then" => ("then", 2),
+        "catch" => ("catch", 1),
+        "finally" => ("finally", 1),
+        _ => return None,
+    };
+    Some(native(static_name, arity, move |vm, this, args| {
+        call_promise_method(vm, this, static_name, args).unwrap()
+    }))
+}
+
+fn call_promise_method(
+    vm: &mut Vm,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
     Some(match name {
-        "then" => native("then", 2, |vm, this, args| {
+        "then" => (|| {
             let Value::Object(p) = &this else {
                 return Err(vm.type_error("Promise ではありません"));
             };
@@ -1032,8 +1049,8 @@ fn promise_method(name: &str) -> Option<Value> {
                 },
             );
             Ok(result_val)
-        }),
-        "catch" => native("catch", 1, |vm, this, args| {
+        })(),
+        "catch" => (|| {
             let Value::Object(p) = &this else {
                 return Err(vm.type_error("Promise ではありません"));
             };
@@ -1051,8 +1068,8 @@ fn promise_method(name: &str) -> Option<Value> {
                 },
             );
             Ok(result_val)
-        }),
-        "finally" => native("finally", 1, |vm, this, args| {
+        })(),
+        "finally" => (|| {
             let Value::Object(p) = &this else {
                 return Err(vm.type_error("Promise ではありません"));
             };
@@ -1112,7 +1129,7 @@ fn promise_method(name: &str) -> Option<Value> {
                 },
             );
             Ok(result_val)
-        }),
+        })(),
         _ => return None,
     })
 }
@@ -1132,6 +1149,24 @@ pub fn method_for(tag: KindTag, name: &str) -> Option<Value> {
     }
 }
 
+/// `CallMethod` 命令用の直接ディスパッチ。`NativeObj` を確保せず即座に実行する。
+pub(crate) fn call_builtin_method(
+    vm: &mut Vm,
+    tag: KindTag,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
+    match tag {
+        KindTag::Array => call_array_method(vm, this, name, args),
+        KindTag::Str => call_string_method(vm, this, name, args),
+        KindTag::Map => call_map_method(vm, this, name, args),
+        KindTag::Set => call_set_method(vm, this, name, args),
+        KindTag::Regex => call_regex_method(vm, this, name, args),
+        KindTag::Promise => call_promise_method(vm, this, name, args),
+    }
+}
+
 fn with_array<T>(this: &Value, f: impl FnOnce(&mut Vec<Value>) -> T) -> Option<T> {
     if let Value::Object(o) = this {
         if let ObjKind::Array(items) = &mut o.borrow_mut().kind {
@@ -1142,32 +1177,59 @@ fn with_array<T>(this: &Value, f: impl FnOnce(&mut Vec<Value>) -> T) -> Option<T
 }
 
 fn array_method(name: &str) -> Option<Value> {
+    let (static_name, arity): (&'static str, usize) = match name {
+        "push" => ("push", 1),
+        "pop" => ("pop", 0),
+        "shift" => ("shift", 0),
+        "unshift" => ("unshift", 1),
+        "slice" => ("slice", 2),
+        "splice" => ("splice", 2),
+        "join" => ("join", 1),
+        "indexOf" => ("indexOf", 1),
+        "includes" => ("includes", 1),
+        "concat" => ("concat", 1),
+        "map" => ("map", 1),
+        "filter" => ("filter", 1),
+        "forEach" => ("forEach", 1),
+        "find" => ("find", 1),
+        "flatMap" => ("flatMap", 1),
+        "some" => ("some", 1),
+        "every" => ("every", 1),
+        _ => return None,
+    };
+    Some(native(static_name, arity, move |vm, this, args| {
+        call_array_method(vm, this, static_name, args).unwrap()
+    }))
+}
+
+fn call_array_method(
+    vm: &mut Vm,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
     Some(match name {
-        "push" => native("push", 1, |_vm, this, args| {
+        "push" => {
             let len = with_array(&this, |items| {
                 items.extend_from_slice(args);
                 items.len()
             })
             .unwrap_or(0);
             Ok(Value::Number(len as f64))
-        }),
-        "pop" => native("pop", 0, |_vm, this, _args| {
-            Ok(with_array(&this, |items| items.pop())
-                .flatten()
-                .unwrap_or(Value::Undefined))
-        }),
-        "shift" => native("shift", 0, |_vm, this, _args| {
-            Ok(with_array(&this, |items| {
-                if items.is_empty() {
-                    None
-                } else {
-                    Some(items.remove(0))
-                }
-            })
+        }
+        "pop" => Ok(with_array(&this, |items| items.pop())
             .flatten()
-            .unwrap_or(Value::Undefined))
-        }),
-        "unshift" => native("unshift", 1, |_vm, this, args| {
+            .unwrap_or(Value::Undefined)),
+        "shift" => Ok(with_array(&this, |items| {
+            if items.is_empty() {
+                None
+            } else {
+                Some(items.remove(0))
+            }
+        })
+        .flatten()
+        .unwrap_or(Value::Undefined)),
+        "unshift" => {
             let len = with_array(&this, |items| {
                 for (i, a) in args.iter().enumerate() {
                     items.insert(i, a.clone());
@@ -1176,20 +1238,27 @@ fn array_method(name: &str) -> Option<Value> {
             })
             .unwrap_or(0);
             Ok(Value::Number(len as f64))
-        }),
-        "slice" => native("slice", 2, |_vm, this, args| {
-            let items = array_values(&this);
-            let len = items.len() as i64;
-            let start = norm_index(args.first(), 0, len);
-            let end = norm_index(args.get(1), len, len);
-            let out = if start < end {
-                items[start as usize..end as usize].to_vec()
+        }
+        "slice" => {
+            let out = if let Value::Object(o) = &this {
+                if let ObjKind::Array(items) = &o.borrow().kind {
+                    let len = items.len() as i64;
+                    let start = norm_index(args.first(), 0, len);
+                    let end = norm_index(args.get(1), len, len);
+                    if start < end {
+                        items[start as usize..end as usize].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             };
-            Ok(Value::new_array(out))
-        }),
-        "splice" => native("splice", 2, |_vm, this, args| {
+            Ok(vm.alloc_array(out))
+        }
+        "splice" => {
             let removed = with_array(&this, |items| {
                 let len = items.len() as i64;
                 let start = norm_index(args.first(), 0, len).clamp(0, len) as usize;
@@ -1210,52 +1279,71 @@ fn array_method(name: &str) -> Option<Value> {
                 removed
             })
             .unwrap_or_default();
-            Ok(Value::new_array(removed))
-        }),
-        "join" => native("join", 1, |vm, this, args| {
+            Ok(vm.alloc_array(removed))
+        }
+        "join" => {
             let sep = match args.first() {
-                Some(Value::Undefined) | None => ",".to_string(),
-                Some(v) => vm.to_display_string(v),
+                Some(Value::Undefined) | None => std::borrow::Cow::Borrowed(","),
+                Some(Value::Str(s)) => std::borrow::Cow::Borrowed(&**s),
+                Some(v) => std::borrow::Cow::Owned(vm.to_display_string(v)),
             };
-            let items = array_values(&this);
-            let parts: Vec<String> = items
-                .iter()
-                .map(|it| match it {
-                    Value::Undefined | Value::Null => String::new(),
-                    other => vm.to_display_string(other),
-                })
-                .collect();
-            Ok(Value::str(parts.join(&sep)))
-        }),
-        "indexOf" => native("indexOf", 1, |_vm, this, args| {
-            let items = array_values(&this);
-            let target = arg(args, 0);
-            let idx = items
-                .iter()
-                .position(|v| crate::value::strict_eq(v, &target));
+            let mut out = String::new();
+            if let Value::Object(o) = &this {
+                if let ObjKind::Array(items) = &o.borrow().kind {
+                    for (i, it) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(&sep);
+                        }
+                        if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
+                            crate::vm::to_string_into(it, &mut out);
+                        }
+                    }
+                }
+            }
+            Ok(Value::str(out))
+        }
+        "indexOf" => {
+            let target = args.first().unwrap_or(&Value::Undefined);
+            let idx = if let Value::Object(o) = &this {
+                if let ObjKind::Array(items) = &o.borrow().kind {
+                    items
+                        .iter()
+                        .position(|v| crate::value::strict_eq(v, target))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(Value::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
-        }),
-        "includes" => native("includes", 1, |_vm, this, args| {
-            let items = array_values(&this);
-            let target = arg(args, 0);
-            Ok(Value::Bool(
-                items.iter().any(|v| same_value_zero(v, &target)),
-            ))
-        }),
-        "concat" => native("concat", 1, |_vm, this, args| {
+        }
+        "includes" => {
+            let target = args.first().unwrap_or(&Value::Undefined);
+            let found = if let Value::Object(o) = &this {
+                if let ObjKind::Array(items) = &o.borrow().kind {
+                    items.iter().any(|v| same_value_zero(v, target))
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            Ok(Value::Bool(found))
+        }
+        "concat" => {
             let mut out = array_values(&this);
             for a in args {
                 if let Value::Object(o) = a {
-                    if matches!(o.borrow().kind, ObjKind::Array(_)) {
-                        out.extend(array_values(a));
+                    if let ObjKind::Array(items) = &o.borrow().kind {
+                        out.extend_from_slice(items);
                         continue;
                     }
                 }
                 out.push(a.clone());
             }
-            Ok(Value::new_array(out))
-        }),
-        "map" => native("map", 1, |vm, this, args| {
+            Ok(vm.alloc_array(out))
+        }
+        "map" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             let mut out = Vec::with_capacity(items.len());
@@ -1266,9 +1354,9 @@ fn array_method(name: &str) -> Option<Value> {
                     &[it.clone(), Value::Number(i as f64), this.clone()],
                 )?);
             }
-            Ok(Value::new_array(out))
-        }),
-        "filter" => native("filter", 1, |vm, this, args| {
+            Ok(vm.alloc_array(out))
+        })(),
+        "filter" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             let mut out = Vec::new();
@@ -1282,9 +1370,9 @@ fn array_method(name: &str) -> Option<Value> {
                     out.push(it.clone());
                 }
             }
-            Ok(Value::new_array(out))
-        }),
-        "forEach" => native("forEach", 1, |vm, this, args| {
+            Ok(vm.alloc_array(out))
+        })(),
+        "forEach" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             for (i, it) in items.iter().enumerate() {
@@ -1295,8 +1383,8 @@ fn array_method(name: &str) -> Option<Value> {
                 )?;
             }
             Ok(Value::Undefined)
-        }),
-        "find" => native("find", 1, |vm, this, args| {
+        })(),
+        "find" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             for (i, it) in items.iter().enumerate() {
@@ -1310,8 +1398,8 @@ fn array_method(name: &str) -> Option<Value> {
                 }
             }
             Ok(Value::Undefined)
-        }),
-        "flatMap" => native("flatMap", 1, |vm, this, args| {
+        })(),
+        "flatMap" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             let mut out = Vec::new();
@@ -1322,16 +1410,16 @@ fn array_method(name: &str) -> Option<Value> {
                     &[it.clone(), Value::Number(i as f64), this.clone()],
                 )?;
                 if let Value::Object(o) = &r {
-                    if matches!(o.borrow().kind, ObjKind::Array(_)) {
-                        out.extend(array_values(&r));
+                    if let ObjKind::Array(sub) = &o.borrow().kind {
+                        out.extend_from_slice(sub);
                         continue;
                     }
                 }
                 out.push(r);
             }
-            Ok(Value::new_array(out))
-        }),
-        "some" => native("some", 1, |vm, this, args| {
+            Ok(vm.alloc_array(out))
+        })(),
+        "some" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             for (i, it) in items.iter().enumerate() {
@@ -1345,8 +1433,8 @@ fn array_method(name: &str) -> Option<Value> {
                 }
             }
             Ok(Value::Bool(false))
-        }),
-        "every" => native("every", 1, |vm, this, args| {
+        })(),
+        "every" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
             for (i, it) in items.iter().enumerate() {
@@ -1360,7 +1448,7 @@ fn array_method(name: &str) -> Option<Value> {
                 }
             }
             Ok(Value::Bool(true))
-        }),
+        })(),
         _ => return None,
     })
 }
@@ -1398,8 +1486,39 @@ pub fn string_get_prop(vm: &mut Vm, s: &Rc<str>, name: &str) -> Result<Value, Va
 }
 
 fn string_method(name: &str) -> Option<Value> {
+    let (static_name, arity): (&'static str, usize) = match name {
+        "slice" => ("slice", 2),
+        "split" => ("split", 2),
+        "trim" => ("trim", 0),
+        "startsWith" => ("startsWith", 1),
+        "endsWith" => ("endsWith", 1),
+        "includes" => ("includes", 1),
+        "indexOf" => ("indexOf", 1),
+        "replace" => ("replace", 2),
+        "replaceAll" => ("replaceAll", 2),
+        "match" => ("match", 1),
+        "search" => ("search", 1),
+        "toLowerCase" => ("toLowerCase", 0),
+        "toUpperCase" => ("toUpperCase", 0),
+        "charCodeAt" => ("charCodeAt", 1),
+        "codePointAt" => ("codePointAt", 1),
+        "repeat" => ("repeat", 1),
+        "padStart" => ("padStart", 2),
+        _ => return None,
+    };
+    Some(native(static_name, arity, move |vm, this, args| {
+        call_string_method(vm, this, static_name, args).unwrap()
+    }))
+}
+
+fn call_string_method(
+    vm: &mut Vm,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
     Some(match name {
-        "slice" => native("slice", 2, |vm, this, args| {
+        "slice" => {
             let s = vm.to_display_string(&this);
             let chars: Vec<char> = s.chars().collect();
             let len = chars.len() as i64;
@@ -1411,8 +1530,8 @@ fn string_method(name: &str) -> Option<Value> {
                 String::new()
             };
             Ok(Value::str(out))
-        }),
-        "split" => native("split", 2, |vm, this, args| {
+        }
+        "split" => (|| {
             let s = vm.to_display_string(&this);
             let limit = match args.get(1) {
                 None | Some(Value::Undefined) => usize::MAX,
@@ -1429,85 +1548,87 @@ fn string_method(name: &str) -> Option<Value> {
                 None | Some(Value::Undefined) => {
                     let mut out = vec![Value::str(s)];
                     out.truncate(limit);
-                    Ok(Value::new_array(out))
+                    Ok(vm.alloc_array(out))
                 }
                 Some(Value::Object(o)) if matches!(o.borrow().kind, ObjKind::Regex(_)) => {
                     let re = match &o.borrow().kind {
                         ObjKind::Regex(r) => r.clone(),
                         _ => unreachable!(),
                     };
-                    Ok(Value::new_array(regex_split(vm, &re, &s, limit)?))
+                    let items = regex_split(vm, &re, &s, limit)?;
+                    Ok(vm.alloc_array(items))
                 }
                 Some(sep) => {
                     let sep_s = vm.to_display_string(sep);
-                    let mut out: Vec<Value> = if sep_s.is_empty() {
-                        s.chars().map(|c| Value::str(c.to_string())).collect()
+                    let out: Vec<Value> = if sep_s.is_empty() {
+                        s.chars()
+                            .take(limit)
+                            .map(|c| Value::str(c.to_string()))
+                            .collect()
                     } else {
-                        s.split(sep_s.as_str()).map(Value::str).collect()
+                        s.split(sep_s.as_str())
+                            .take(limit)
+                            .map(Value::str)
+                            .collect()
                     };
-                    out.truncate(limit);
-                    Ok(Value::new_array(out))
+                    Ok(vm.alloc_array(out))
                 }
             }
-        }),
-        "trim" => native("trim", 0, |vm, this, _args| {
-            Ok(Value::str(vm.to_display_string(&this).trim().to_string()))
-        }),
-        "startsWith" => native("startsWith", 1, |vm, this, args| {
+        })(),
+        "trim" => Ok(Value::str(vm.to_display_string(&this).trim().to_string())),
+        "startsWith" => {
             let s = vm.to_display_string(&this);
             let p = vm.to_display_string(&arg(args, 0));
             Ok(Value::Bool(s.starts_with(&p)))
-        }),
-        "endsWith" => native("endsWith", 1, |vm, this, args| {
+        }
+        "endsWith" => {
             let s = vm.to_display_string(&this);
             let p = vm.to_display_string(&arg(args, 0));
             Ok(Value::Bool(s.ends_with(&p)))
-        }),
-        "includes" => native("includes", 1, |vm, this, args| {
+        }
+        "includes" => {
             let s = vm.to_display_string(&this);
             let p = vm.to_display_string(&arg(args, 0));
             Ok(Value::Bool(s.contains(&p)))
-        }),
-        "indexOf" => native("indexOf", 1, |vm, this, args| {
+        }
+        "indexOf" => {
             let s = vm.to_display_string(&this);
             let p = vm.to_display_string(&arg(args, 0));
-            let chars: Vec<char> = s.chars().collect();
-            let needle: Vec<char> = p.chars().collect();
-            if needle.is_empty() {
-                return Ok(Value::Number(0.0));
+            if p.is_empty() {
+                Ok(Value::Number(0.0))
+            } else if let Some(byte_idx) = s.find(&p) {
+                let char_idx = if s.is_ascii() {
+                    byte_idx
+                } else {
+                    s[..byte_idx].chars().count()
+                };
+                Ok(Value::Number(char_idx as f64))
+            } else {
+                Ok(Value::Number(-1.0))
             }
-            if needle.len() > chars.len() {
-                return Ok(Value::Number(-1.0));
-            }
-            for i in 0..=chars.len() - needle.len() {
-                if chars[i..i + needle.len()] == needle[..] {
-                    return Ok(Value::Number(i as f64));
-                }
-            }
-            Ok(Value::Number(-1.0))
-        }),
-        "replace" => native("replace", 2, |vm, this, args| {
+        }
+        "replace" => {
             let s = vm.to_display_string(&this);
             let pattern = arg(args, 0);
             let replacement = arg(args, 1);
             string_replace(vm, &s, &pattern, &replacement, false)
-        }),
-        "replaceAll" => native("replaceAll", 2, |vm, this, args| {
+        }
+        "replaceAll" => {
             let s = vm.to_display_string(&this);
             let pattern = arg(args, 0);
             let replacement = arg(args, 1);
             if let Value::Object(o) = &pattern {
                 if let ObjKind::Regex(re) = &o.borrow().kind {
                     if !re.global {
-                        return Err(vm.type_error(
+                        return Some(Err(vm.type_error(
                             "String.prototype.replaceAll に渡す正規表現には g フラグが必要です",
-                        ));
+                        )));
                     }
                 }
             }
             string_replace(vm, &s, &pattern, &replacement, true)
-        }),
-        "match" => native("match", 1, |vm, this, args| {
+        }
+        "match" => (|| {
             let s = vm.to_display_string(&this);
             let re = coerce_to_regex(vm, &arg(args, 0))?;
             let chars: Vec<char> = s.chars().collect();
@@ -1535,7 +1656,7 @@ fn string_method(name: &str) -> Option<Value> {
                 if out.is_empty() {
                     Ok(Value::Null)
                 } else {
-                    Ok(Value::new_array(out))
+                    Ok(vm.alloc_array(out))
                 }
             } else {
                 match re.search(&chars, 0).map_err(|e| regex_err(vm, e))? {
@@ -1543,8 +1664,8 @@ fn string_method(name: &str) -> Option<Value> {
                     None => Ok(Value::Null),
                 }
             }
-        }),
-        "search" => native("search", 1, |vm, this, args| {
+        })(),
+        "search" => (|| {
             let s = vm.to_display_string(&this);
             let re = coerce_to_regex(vm, &arg(args, 0))?;
             let chars: Vec<char> = s.chars().collect();
@@ -1552,38 +1673,35 @@ fn string_method(name: &str) -> Option<Value> {
                 Some(mat) => Ok(Value::Number(mat.start as f64)),
                 None => Ok(Value::Number(-1.0)),
             }
-        }),
-        "toLowerCase" => native("toLowerCase", 0, |vm, this, _args| {
-            Ok(Value::str(vm.to_display_string(&this).to_lowercase()))
-        }),
-        "toUpperCase" => native("toUpperCase", 0, |vm, this, _args| {
-            Ok(Value::str(vm.to_display_string(&this).to_uppercase()))
-        }),
-        "charCodeAt" => native("charCodeAt", 1, |vm, this, args| {
+        })(),
+        "toLowerCase" => Ok(Value::str(vm.to_display_string(&this).to_lowercase())),
+        "toUpperCase" => Ok(Value::str(vm.to_display_string(&this).to_uppercase())),
+        "charCodeAt" => {
             let s = vm.to_display_string(&this);
             let idx = to_number(&arg(args, 0)) as usize;
             Ok(s.chars()
                 .nth(idx)
                 .map(|c| Value::Number(c as u32 as f64))
                 .unwrap_or(Value::Number(f64::NAN)))
-        }),
-        "codePointAt" => native("codePointAt", 1, |vm, this, args| {
+        }
+        "codePointAt" => {
             let s = vm.to_display_string(&this);
             let idx = to_number(&arg(args, 0)) as usize;
             Ok(s.chars()
                 .nth(idx)
                 .map(|c| Value::Number(c as u32 as f64))
                 .unwrap_or(Value::Undefined))
-        }),
-        "repeat" => native("repeat", 1, |vm, this, args| {
+        }
+        "repeat" => {
             let s = vm.to_display_string(&this);
             let n = to_number(&arg(args, 0));
             if n < 0.0 || !n.is_finite() {
-                return Err(vm.range_error("repeat count は非負の有限数である必要があります"));
+                Err(vm.range_error("repeat count は非負の有限数である必要があります"))
+            } else {
+                Ok(Value::str(s.repeat(n as usize)))
             }
-            Ok(Value::str(s.repeat(n as usize)))
-        }),
-        "padStart" => native("padStart", 2, |vm, this, args| {
+        }
+        "padStart" => {
             let s = vm.to_display_string(&this);
             let target_len = to_number(&arg(args, 0)) as usize;
             let pad = match args.get(1) {
@@ -1592,16 +1710,17 @@ fn string_method(name: &str) -> Option<Value> {
             };
             let cur_len = s.chars().count();
             if cur_len >= target_len || pad.is_empty() {
-                return Ok(Value::str(s));
+                Ok(Value::str(s))
+            } else {
+                let mut prefix = String::new();
+                let pad_chars: Vec<char> = pad.chars().collect();
+                while prefix.chars().count() < target_len - cur_len {
+                    prefix.extend(pad_chars.iter());
+                }
+                let prefix: String = prefix.chars().take(target_len - cur_len).collect();
+                Ok(Value::str(format!("{prefix}{s}")))
             }
-            let mut prefix = String::new();
-            let pad_chars: Vec<char> = pad.chars().collect();
-            while prefix.chars().count() < target_len - cur_len {
-                prefix.extend(pad_chars.iter());
-            }
-            let prefix: String = prefix.chars().take(target_len - cur_len).collect();
-            Ok(Value::str(format!("{prefix}{s}")))
-        }),
+        }
         _ => return None,
     })
 }
@@ -1609,19 +1728,42 @@ fn string_method(name: &str) -> Option<Value> {
 // ---------------- Map ----------------
 
 fn map_method(name: &str) -> Option<Value> {
+    let (static_name, arity): (&'static str, usize) = match name {
+        "get" => ("get", 1),
+        "set" => ("set", 2),
+        "has" => ("has", 1),
+        "delete" => ("delete", 1),
+        "keys" => ("keys", 0),
+        "values" => ("values", 0),
+        "entries" => ("entries", 0),
+        "forEach" => ("forEach", 1),
+        "clear" => ("clear", 0),
+        _ => return None,
+    };
+    Some(native(static_name, arity, move |vm, this, args| {
+        call_map_method(vm, this, static_name, args).unwrap()
+    }))
+}
+
+fn call_map_method(
+    vm: &mut Vm,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
     Some(match name {
-        "get" => native("get", 1, |_vm, this, args| {
-            let key = arg(args, 0);
+        "get" => {
+            let key = args.first().unwrap_or(&Value::Undefined);
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &o.borrow().kind {
-                    if let Some(i) = m.find(&key) {
-                        return Ok(m.entries[i].1.clone());
+                    if let Some(i) = m.find(key) {
+                        return Some(Ok(m.entries[i].1.clone()));
                     }
                 }
             }
             Ok(Value::Undefined)
-        }),
-        "set" => native("set", 2, |_vm, this, args| {
+        }
+        "set" => {
             let key = arg(args, 0);
             let val = arg(args, 1);
             if let Value::Object(o) = &this {
@@ -1630,59 +1772,57 @@ fn map_method(name: &str) -> Option<Value> {
                 }
             }
             Ok(this)
-        }),
-        "has" => native("has", 1, |_vm, this, args| {
-            let key = arg(args, 0);
+        }
+        "has" => {
+            let key = args.first().unwrap_or(&Value::Undefined);
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &o.borrow().kind {
-                    return Ok(Value::Bool(m.find(&key).is_some()));
+                    return Some(Ok(Value::Bool(m.find(key).is_some())));
                 }
             }
             Ok(Value::Bool(false))
-        }),
-        "delete" => native("delete", 1, |_vm, this, args| {
-            let key = arg(args, 0);
+        }
+        "delete" => {
+            let key = args.first().unwrap_or(&Value::Undefined);
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &mut o.borrow_mut().kind {
-                    return Ok(Value::Bool(m.delete(&key)));
+                    return Some(Ok(Value::Bool(m.delete(key))));
                 }
             }
             Ok(Value::Bool(false))
-        }),
-        "keys" => native("keys", 0, |_vm, this, _args| {
+        }
+        "keys" => {
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &o.borrow().kind {
-                    return Ok(Value::new_array(
-                        m.entries.iter().map(|(k, _)| k.clone()).collect(),
-                    ));
+                    let ks = m.entries.iter().map(|(k, _)| k.clone()).collect();
+                    return Some(Ok(vm.alloc_array(ks)));
                 }
             }
-            Ok(Value::new_array(Vec::new()))
-        }),
-        "values" => native("values", 0, |_vm, this, _args| {
+            Ok(vm.alloc_array(Vec::new()))
+        }
+        "values" => {
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &o.borrow().kind {
-                    return Ok(Value::new_array(
-                        m.entries.iter().map(|(_, v)| v.clone()).collect(),
-                    ));
+                    let vs = m.entries.iter().map(|(_, v)| v.clone()).collect();
+                    return Some(Ok(vm.alloc_array(vs)));
                 }
             }
-            Ok(Value::new_array(Vec::new()))
-        }),
-        "entries" => native("entries", 0, |_vm, this, _args| {
+            Ok(vm.alloc_array(Vec::new()))
+        }
+        "entries" => {
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &o.borrow().kind {
-                    return Ok(Value::new_array(
-                        m.entries
-                            .iter()
-                            .map(|(k, v)| Value::new_array(vec![k.clone(), v.clone()]))
-                            .collect(),
-                    ));
+                    let pairs: Vec<Value> = m
+                        .entries
+                        .iter()
+                        .map(|(k, v)| vm.alloc_array(vec![k.clone(), v.clone()]))
+                        .collect();
+                    return Some(Ok(vm.alloc_array(pairs)));
                 }
             }
-            Ok(Value::new_array(Vec::new()))
-        }),
-        "forEach" => native("forEach", 1, |vm, this, args| {
+            Ok(vm.alloc_array(Vec::new()))
+        }
+        "forEach" => (|| {
             let cb = arg(args, 0);
             let entries = if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &o.borrow().kind {
@@ -1697,15 +1837,15 @@ fn map_method(name: &str) -> Option<Value> {
                 vm.call_value(cb.clone(), Value::Undefined, &[v, k, this.clone()])?;
             }
             Ok(Value::Undefined)
-        }),
-        "clear" => native("clear", 0, |_vm, this, _args| {
+        })(),
+        "clear" => {
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &mut o.borrow_mut().kind {
                     m.clear();
                 }
             }
             Ok(Value::Undefined)
-        }),
+        }
         _ => return None,
     })
 }
@@ -1713,8 +1853,28 @@ fn map_method(name: &str) -> Option<Value> {
 // ---------------- Set ----------------
 
 fn set_method(name: &str) -> Option<Value> {
+    let (static_name, arity): (&'static str, usize) = match name {
+        "add" => ("add", 1),
+        "has" => ("has", 1),
+        "delete" => ("delete", 1),
+        "keys" | "values" => ("values", 0),
+        "forEach" => ("forEach", 1),
+        "clear" => ("clear", 0),
+        _ => return None,
+    };
+    Some(native(static_name, arity, move |vm, this, args| {
+        call_set_method(vm, this, static_name, args).unwrap()
+    }))
+}
+
+fn call_set_method(
+    vm: &mut Vm,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
     Some(match name {
-        "add" => native("add", 1, |_vm, this, args| {
+        "add" => {
             let v = arg(args, 0);
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &mut o.borrow_mut().kind {
@@ -1722,34 +1882,34 @@ fn set_method(name: &str) -> Option<Value> {
                 }
             }
             Ok(this)
-        }),
-        "has" => native("has", 1, |_vm, this, args| {
-            let v = arg(args, 0);
+        }
+        "has" => {
+            let v = args.first().unwrap_or(&Value::Undefined);
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &o.borrow().kind {
-                    return Ok(Value::Bool(s.find(&v).is_some()));
+                    return Some(Ok(Value::Bool(s.find(v).is_some())));
                 }
             }
             Ok(Value::Bool(false))
-        }),
-        "delete" => native("delete", 1, |_vm, this, args| {
-            let v = arg(args, 0);
+        }
+        "delete" => {
+            let v = args.first().unwrap_or(&Value::Undefined);
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &mut o.borrow_mut().kind {
-                    return Ok(Value::Bool(s.delete(&v)));
+                    return Some(Ok(Value::Bool(s.delete(v))));
                 }
             }
             Ok(Value::Bool(false))
-        }),
-        "keys" | "values" => native("values", 0, |_vm, this, _args| {
+        }
+        "keys" | "values" => {
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &o.borrow().kind {
-                    return Ok(Value::new_array(s.values.clone()));
+                    return Some(Ok(vm.alloc_array(s.values.clone())));
                 }
             }
-            Ok(Value::new_array(Vec::new()))
-        }),
-        "forEach" => native("forEach", 1, |vm, this, args| {
+            Ok(vm.alloc_array(Vec::new()))
+        }
+        "forEach" => (|| {
             let cb = arg(args, 0);
             let values = if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &o.borrow().kind {
@@ -1764,15 +1924,15 @@ fn set_method(name: &str) -> Option<Value> {
                 vm.call_value(cb.clone(), Value::Undefined, &[v.clone(), v, this.clone()])?;
             }
             Ok(Value::Undefined)
-        }),
-        "clear" => native("clear", 0, |_vm, this, _args| {
+        })(),
+        "clear" => {
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &mut o.borrow_mut().kind {
                     s.clear();
                 }
             }
             Ok(Value::Undefined)
-        }),
+        }
         _ => return None,
     })
 }
@@ -1875,8 +2035,25 @@ fn build_match_array(chars: &[char], mat: &crate::regex::RegexMatch, input: &str
 }
 
 fn regex_method(name: &str) -> Option<Value> {
+    let (static_name, arity): (&'static str, usize) = match name {
+        "test" => ("test", 1),
+        "exec" => ("exec", 1),
+        "toString" => ("toString", 0),
+        _ => return None,
+    };
+    Some(native(static_name, arity, move |vm, this, args| {
+        call_regex_method(vm, this, static_name, args).unwrap()
+    }))
+}
+
+fn call_regex_method(
+    vm: &mut Vm,
+    this: Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, Value>> {
     Some(match name {
-        "test" => native("test", 1, |vm, this, args| {
+        "test" => (|| {
             let s = vm.to_display_string(&arg(args, 0));
             let Value::Object(o) = &this else {
                 return Ok(Value::Bool(false));
@@ -1907,8 +2084,8 @@ fn regex_method(name: &str) -> Option<Value> {
                     Ok(Value::Bool(false))
                 }
             }
-        }),
-        "exec" => native("exec", 1, |vm, this, args| {
+        })(),
+        "exec" => (|| {
             let s = vm.to_display_string(&arg(args, 0));
             let Value::Object(o) = &this else {
                 return Err(vm.type_error("RegExp ではありません"));
@@ -1939,10 +2116,8 @@ fn regex_method(name: &str) -> Option<Value> {
                     Ok(Value::Null)
                 }
             }
-        }),
-        "toString" => native("toString", 0, |vm, this, _args| {
-            Ok(Value::str(vm.to_display_string(&this)))
-        }),
+        })(),
+        "toString" => Ok(Value::str(vm.to_display_string(&this))),
         _ => return None,
     })
 }

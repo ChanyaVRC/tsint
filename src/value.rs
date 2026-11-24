@@ -177,6 +177,44 @@ impl PropMap {
         }
     }
 
+    #[inline]
+    pub(crate) fn get_with_hint(&self, key: &Rc<str>, hint: usize) -> Option<(usize, &PropSlot)> {
+        if let Some(Some((k, slot))) = self.entries.get(hint) {
+            if Rc::ptr_eq(k, key) || **k == **key {
+                return Some((hint, slot));
+            }
+        }
+        let idx = self.find_index_rc(key)?;
+        self.entries[idx].as_ref().map(|(_, v)| (idx, v))
+    }
+
+    #[inline]
+    pub(crate) fn get_mut_with_hint(
+        &mut self,
+        key: &Rc<str>,
+        hint: usize,
+    ) -> Option<(usize, &mut PropSlot)> {
+        if let Some(Some((k, _))) = self.entries.get(hint) {
+            if Rc::ptr_eq(k, key) || **k == **key {
+                return self.entries[hint].as_mut().map(|(_, v)| (hint, v));
+            }
+        }
+        let idx = self.find_index_rc(key)?;
+        self.entries[idx].as_mut().map(|(_, v)| (idx, v))
+    }
+
+    #[inline]
+    pub(crate) fn set_value_returning_idx(&mut self, key: Rc<str>, value: Value) -> usize {
+        if let Some(idx) = self.find_index_rc(&key) {
+            if let Some((_, slot)) = &mut self.entries[idx] {
+                *slot = PropSlot::Value(value);
+            }
+            idx
+        } else {
+            self.push_new(key, PropSlot::Value(value))
+        }
+    }
+
     fn build_index(&mut self) {
         let mut map = FastHashMap::with_capacity_and_hasher(self.live_len * 2, Default::default());
         for (i, entry) in self.entries.iter().enumerate() {

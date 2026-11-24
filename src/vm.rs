@@ -20,6 +20,23 @@ use crate::value::*;
 
 /// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。
 const GC_MIN_THRESHOLD: usize = 2048;
+/// フレームプールの最大保持数。
+const MAX_FRAME_POOL: usize = 64;
+/// 引数バッファプールの最大保持数。
+const MAX_ARGS_POOL: usize = 32;
+
+thread_local! {
+    /// ASCII 単一文字の `Rc<str>` キャッシュ（`str[i]` のゼロ確保高速パス用）。
+    static ASCII_CHARS: [Rc<str>; 128] = std::array::from_fn(|b| {
+        let ch = [b as u8];
+        Rc::from(std::str::from_utf8(&ch).unwrap())
+    });
+}
+
+#[inline]
+pub(crate) fn ascii_char_rc(b: u8) -> Rc<str> {
+    ASCII_CHARS.with(|tbl| tbl[b as usize].clone())
+}
 
 /// ローカル変数スロットの表現。
 ///
@@ -87,15 +104,19 @@ impl Frame {
         raw_args: Rc<Vec<Value>>,
     ) -> Self {
         let num_locals = chunk.num_locals;
-        let locals = (0..num_locals)
-            .map(|i| {
-                if chunk.captured_locals.get(i).copied().unwrap_or(false) {
-                    LocalSlot::Boxed(Rc::new(RefCell::new(Value::Uninit)))
-                } else {
-                    LocalSlot::Direct(Value::Uninit)
-                }
-            })
-            .collect();
+        let locals = if !chunk.has_captured_locals {
+            vec![LocalSlot::Direct(Value::Uninit); num_locals]
+        } else {
+            (0..num_locals)
+                .map(|i| {
+                    if chunk.captured_locals.get(i).copied().unwrap_or(false) {
+                        LocalSlot::Boxed(Rc::new(RefCell::new(Value::Uninit)))
+                    } else {
+                        LocalSlot::Direct(Value::Uninit)
+                    }
+                })
+                .collect()
+        };
         Frame {
             chunk,
             ip: 0,
@@ -105,16 +126,26 @@ impl Frame {
             raw_args,
         }
     }
-}
 
-/// `Vm::step` の結果。
-enum StepSignal {
-    /// 通常の 1 命令実行（フレームはまだ継続中）。
-    None,
-    /// 現在のフレームが `Return` で完全に戻った。
-    Returned(Value),
-    /// `await` によりタスク全体（`self.frames`）が中断された。
-    Suspended,
+    #[inline]
+    fn reinit_locals(&mut self) {
+        let num_locals = self.chunk.num_locals;
+        self.locals.clear();
+        if !self.chunk.has_captured_locals {
+            self.locals
+                .resize(num_locals, LocalSlot::Direct(Value::Uninit));
+        } else {
+            self.locals.reserve(num_locals);
+            for i in 0..num_locals {
+                if self.chunk.captured_locals.get(i).copied().unwrap_or(false) {
+                    self.locals
+                        .push(LocalSlot::Boxed(Rc::new(RefCell::new(Value::Uninit))));
+                } else {
+                    self.locals.push(LocalSlot::Direct(Value::Uninit));
+                }
+            }
+        }
+    }
 }
 
 /// `Vm::run_until` の結果。
@@ -234,6 +265,12 @@ pub struct Vm {
     gc_allocs_since_last: Cell<usize>,
     /// 次回自動 GC を発火する確保数閾値（生存数に応じて成長する）。
     gc_threshold: usize,
+
+    // ---------------- フレーム / 引数プール ----------------
+    frame_pool: Vec<Frame>,
+    args_pool: Vec<Vec<Value>>,
+    empty_upvalues: Rc<Vec<Rc<RefCell<Value>>>>,
+    empty_args: Rc<Vec<Value>>,
 }
 
 impl Vm {
@@ -253,9 +290,175 @@ impl Vm {
             gc_objects: RefCell::new(Vec::new()),
             gc_allocs_since_last: Cell::new(0),
             gc_threshold: GC_MIN_THRESHOLD,
+            frame_pool: Vec::new(),
+            args_pool: Vec::new(),
+            empty_upvalues: Rc::new(Vec::new()),
+            empty_args: Rc::new(Vec::new()),
         };
         crate::builtins::install(&mut vm);
         vm
+    }
+
+    #[inline]
+    fn take_args_buf(&mut self) -> Vec<Value> {
+        self.args_pool.pop().unwrap_or_default()
+    }
+
+    #[inline]
+    fn put_args_buf(&mut self, mut buf: Vec<Value>) {
+        buf.clear();
+        if self.args_pool.len() < MAX_ARGS_POOL {
+            self.args_pool.push(buf);
+        }
+    }
+
+    #[inline]
+    fn release_frame(&mut self, mut frame: Frame) {
+        frame.stack.clear();
+        frame.locals.clear();
+        if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+            v.clear();
+        } else {
+            frame.raw_args = self.empty_args.clone();
+        }
+        frame.upvalues = self.empty_upvalues.clone();
+        if self.frame_pool.len() < MAX_FRAME_POOL {
+            self.frame_pool.push(frame);
+        }
+    }
+
+    /// プールからフレームを再利用し、単純パラメータを直接 `locals` へ束縛、
+    /// 必要な場合のみ `raw_args` を埋める。
+    #[inline]
+    fn acquire_frame_from_slice(
+        &mut self,
+        f: &Rc<FunctionObj>,
+        this: Value,
+        args: &[Value],
+    ) -> Frame {
+        let needs_raw = f.chunk.needs_raw_args && !args.is_empty();
+        let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
+            frame.chunk = f.chunk.clone();
+            frame.ip = 0;
+            frame.upvalues = f.upvalues.clone();
+            frame.stack.clear();
+            if needs_raw {
+                if Rc::ptr_eq(&frame.raw_args, &self.empty_args)
+                    || Rc::strong_count(&frame.raw_args) != 1
+                {
+                    let mut v = self.take_args_buf();
+                    v.extend_from_slice(args);
+                    frame.raw_args = Rc::new(v);
+                } else {
+                    let v = Rc::get_mut(&mut frame.raw_args).unwrap();
+                    v.clear();
+                    v.extend_from_slice(args);
+                }
+            } else if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                v.clear();
+            } else {
+                frame.raw_args = self.empty_args.clone();
+            }
+            frame.reinit_locals();
+            frame
+        } else {
+            let raw_args = if needs_raw {
+                let mut v = self.take_args_buf();
+                v.extend_from_slice(args);
+                Rc::new(v)
+            } else {
+                self.empty_args.clone()
+            };
+            Frame::new(f.chunk.clone(), f.upvalues.clone(), raw_args)
+        };
+        let param_base = if !f.is_arrow && !frame.locals.is_empty() {
+            frame.locals[0].set(this);
+            1usize
+        } else {
+            0usize
+        };
+        let sp = f.chunk.simple_param_count as usize;
+        for i in 0..sp {
+            let val = args.get(i).cloned().unwrap_or(Value::Undefined);
+            frame.locals[param_base + i].set(val);
+        }
+        frame
+    }
+
+    /// 呼び出し元フレームのオペランドスタック末尾にある `argc` 個の引数を直接消費して
+    /// 新フレームを `self.frames` へ push する（`has_callee_slot` は `Call` なら true、`CallMethod` なら false）。
+    #[inline]
+    fn push_frame_from_caller_stack(
+        &mut self,
+        fo: &Rc<FunctionObj>,
+        argc: usize,
+        has_callee_slot: bool,
+    ) {
+        let needs_raw = fo.chunk.needs_raw_args && argc > 0;
+        let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
+            frame.chunk = fo.chunk.clone();
+            frame.ip = 0;
+            frame.upvalues = fo.upvalues.clone();
+            frame.stack.clear();
+            frame.reinit_locals();
+            frame
+        } else {
+            Frame::new(
+                fo.chunk.clone(),
+                fo.upvalues.clone(),
+                self.empty_args.clone(),
+            )
+        };
+        let sp = fo.chunk.simple_param_count as usize;
+        let param_base = usize::from(!fo.is_arrow && !frame.locals.is_empty());
+
+        let this = {
+            let caller = self.frames.last_mut().unwrap();
+            let n = caller.stack.len();
+            let arg_start = n - argc;
+            if needs_raw {
+                if Rc::ptr_eq(&frame.raw_args, &self.empty_args)
+                    || Rc::strong_count(&frame.raw_args) != 1
+                {
+                    let mut v = self.args_pool.pop().unwrap_or_default();
+                    v.extend(caller.stack.drain(arg_start..));
+                    frame.raw_args = Rc::new(v);
+                } else {
+                    let v = Rc::get_mut(&mut frame.raw_args).unwrap();
+                    v.clear();
+                    v.extend(caller.stack.drain(arg_start..));
+                }
+                for i in 0..sp {
+                    let val = frame.raw_args.get(i).cloned().unwrap_or(Value::Undefined);
+                    frame.locals[param_base + i].set(val);
+                }
+            } else {
+                if !frame.raw_args.is_empty() {
+                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                        v.clear();
+                    } else {
+                        frame.raw_args = self.empty_args.clone();
+                    }
+                }
+                let direct_copy = argc.min(sp);
+                for (i, val) in caller.stack.drain(arg_start..).enumerate() {
+                    if i < direct_copy {
+                        frame.locals[param_base + i].set(val);
+                    }
+                }
+                for i in direct_copy..sp {
+                    frame.locals[param_base + i].set(Value::Undefined);
+                }
+            }
+            if has_callee_slot {
+                caller.stack.pop(); // callee
+            }
+            caller.stack.pop().unwrap() // this
+        };
+        if param_base == 1 {
+            frame.locals[0].set(this);
+        }
+        self.frames.push(frame);
     }
 
     /// オブジェクトを GC 追跡リストに登録する。
@@ -267,6 +470,7 @@ impl Vm {
 
     /// 未追跡（`Rc::weak_count == 0`）のオブジェクトとその配下の未追跡オブジェクトを
     /// GC 追跡リストへ登録する。既に追跡済みのノードは O(1) でスキップする。
+    #[inline]
     pub fn track_value_tree(&self, v: &Value) {
         let Value::Object(root) = v else {
             return;
@@ -274,6 +478,10 @@ impl Vm {
         if Rc::weak_count(root) > 0 {
             return;
         }
+        self.track_value_tree_slow(root);
+    }
+
+    fn track_value_tree_slow(&self, root: &ObjRef) {
         let mut stack = vec![root.clone()];
         while let Some(obj) = stack.pop() {
             if Rc::weak_count(&obj) > 0 {
@@ -704,33 +912,1157 @@ impl Vm {
             if self.frames.len() <= stop_depth {
                 return Ok(RunOutcome::Value(last_value));
             }
-            if self.native_call_depth == 0 {
-                self.maybe_collect_garbage();
-            }
-            match self.step() {
-                Ok(StepSignal::Returned(v)) => {
-                    // 関数が 1 つ完了した。まだこの run_until の管轄内
-                    // （stop_depth より深い位置）にフレームが残っているなら、
-                    // それは通常のバイトコード `Call`/`New` から戻ってきた
-                    // ケースなので、呼び出し元フレームのオペランドスタックへ
-                    // 戻り値を積む（`Call` 命令が期待している場所）。
-                    // ここで frames が stop_depth まで縮んでいた場合は、
-                    // ネイティブ関数からの `call_value`/`call_function_obj`
-                    // 呼び出しが完了したケースであり、その「呼び出し元」は
-                    // バイトコードではなく Rust 側で待っているので、
-                    // スタックには積まず `last_value` として run_until の
-                    // 戻り値にする。
+            // ホットパス内ループ: `self.frames.last_mut()` を毎回引き直さず、
+            // アクティブフレームのローカル/スタック/IP を直接操作する。
+            let slow_op: Option<(OpCode, usize)> = {
+                let frame = self.frames.last_mut().unwrap();
+                let code: &[OpCode] = &frame.chunk.code;
+                let mut ip = frame.ip;
+                let mut slow: Option<(OpCode, usize)> = None;
+                let gc_due_ptr = &self.gc_allocs_since_last;
+                let gc_thresh = self.gc_threshold;
+                let native_depth = self.native_call_depth;
+
+                loop {
+                    let op_ip = ip;
+                    let op = code[op_ip];
+                    ip = op_ip + 1;
+
+                    match op {
+                        OpCode::Pop => {
+                            frame.stack.pop().expect("オペランドスタックが空です");
+                        }
+                        OpCode::Dup => {
+                            let v = frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .clone();
+                            frame.stack.push(v);
+                        }
+                        OpCode::Swap => {
+                            let n = frame.stack.len();
+                            frame.stack.swap(n - 1, n - 2);
+                        }
+                        OpCode::LoadSmallInt(n) => {
+                            frame.stack.push(Value::Number(n as f64));
+                        }
+                        OpCode::LoadConst(idx) => {
+                            let v = frame.chunk.const_value(idx);
+                            frame.stack.push(v);
+                        }
+                        OpCode::LoadUndefined => frame.stack.push(Value::Undefined),
+                        OpCode::LoadNull => frame.stack.push(Value::Null),
+                        OpCode::LoadTrue => frame.stack.push(Value::Bool(true)),
+                        OpCode::LoadFalse => frame.stack.push(Value::Bool(false)),
+                        OpCode::LoadThis => {
+                            unreachable!("This は Ident 解決経由でコンパイルされます")
+                        }
+
+                        OpCode::GetLocal(slot) => match &frame.locals[slot as usize] {
+                            LocalSlot::Direct(Value::Number(n)) => {
+                                frame.stack.push(Value::Number(*n));
+                            }
+                            LocalSlot::Direct(Value::Bool(b)) => {
+                                frame.stack.push(Value::Bool(*b));
+                            }
+                            LocalSlot::Direct(Value::Undefined) => {
+                                frame.stack.push(Value::Undefined);
+                            }
+                            LocalSlot::Direct(Value::Null) => {
+                                frame.stack.push(Value::Null);
+                            }
+                            LocalSlot::Direct(Value::Uninit) => {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                            LocalSlot::Direct(v) => {
+                                frame.stack.push(v.clone());
+                            }
+                            LocalSlot::Boxed(cell) => {
+                                let v = cell.borrow().clone();
+                                if matches!(v, Value::Uninit) {
+                                    frame.ip = ip;
+                                    slow = Some((op, op_ip));
+                                    break;
+                                }
+                                frame.stack.push(v);
+                            }
+                        },
+                        OpCode::SetLocal(slot) => {
+                            let v = frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .clone();
+                            frame.locals[slot as usize].set(v);
+                        }
+                        OpCode::BindLocal(slot) => {
+                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            frame.locals[slot as usize].set(v);
+                        }
+                        OpCode::IncLocal(slot) => match &mut frame.locals[slot as usize] {
+                            LocalSlot::Direct(Value::Number(n)) => {
+                                *n += 1.0;
+                            }
+                            LocalSlot::Direct(Value::Uninit) => {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                            LocalSlot::Direct(v) => {
+                                *v = Value::Number(to_number(v) + 1.0);
+                            }
+                            LocalSlot::Boxed(cell) => {
+                                let mut b = cell.borrow_mut();
+                                match &mut *b {
+                                    Value::Number(n) => *n += 1.0,
+                                    Value::Uninit => {
+                                        drop(b);
+                                        frame.ip = ip;
+                                        slow = Some((op, op_ip));
+                                        break;
+                                    }
+                                    other => *other = Value::Number(to_number(other) + 1.0),
+                                }
+                            }
+                        },
+                        OpCode::DecLocal(slot) => match &mut frame.locals[slot as usize] {
+                            LocalSlot::Direct(Value::Number(n)) => {
+                                *n -= 1.0;
+                            }
+                            LocalSlot::Direct(Value::Uninit) => {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                            LocalSlot::Direct(v) => {
+                                *v = Value::Number(to_number(v) - 1.0);
+                            }
+                            LocalSlot::Boxed(cell) => {
+                                let mut b = cell.borrow_mut();
+                                match &mut *b {
+                                    Value::Number(n) => *n -= 1.0,
+                                    Value::Uninit => {
+                                        drop(b);
+                                        frame.ip = ip;
+                                        slow = Some((op, op_ip));
+                                        break;
+                                    }
+                                    other => *other = Value::Number(to_number(other) - 1.0),
+                                }
+                            }
+                        },
+                        OpCode::RebindLocal(slot) => {
+                            if let LocalSlot::Boxed(cell) = &mut frame.locals[slot as usize] {
+                                let cur = cell.borrow().clone();
+                                *cell = Rc::new(RefCell::new(cur));
+                            }
+                        }
+                        OpCode::GetUpvalue(idx) => {
+                            let v = frame.upvalues[idx as usize].borrow().clone();
+                            if matches!(v, Value::Uninit) {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                            frame.stack.push(v);
+                        }
+                        OpCode::SetUpvalue(idx) => {
+                            let v = frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .clone();
+                            *frame.upvalues[idx as usize].borrow_mut() = v;
+                        }
+                        OpCode::GetArg(idx) => {
+                            let v = frame
+                                .raw_args
+                                .get(idx as usize)
+                                .cloned()
+                                .unwrap_or(Value::Undefined);
+                            frame.stack.push(v);
+                        }
+
+                        // --- プロパティ/添字の高速インラインパス ---
+                        OpCode::GetProp(cidx) => {
+                            let key = frame.chunk.const_str_ref(cidx);
+                            let mut hit: Option<Value> = None;
+                            match frame.stack.last().expect("オペランドスタックが空です")
+                            {
+                                Value::Object(o) => {
+                                    let hint = frame.chunk.ic_slots[op_ip].get() as usize;
+                                    let b = o.borrow();
+                                    if let Some((idx, slot)) = b.props.get_with_hint(key, hint) {
+                                        if idx != hint && idx < u16::MAX as usize {
+                                            frame.chunk.ic_slots[op_ip].set(idx as u16);
+                                        }
+                                        if let PropSlot::Value(v) = slot {
+                                            hit = Some(v.clone());
+                                        }
+                                    } else {
+                                        match &b.kind {
+                                            ObjKind::Array(items) if &**key == "length" => {
+                                                hit = Some(Value::Number(items.len() as f64));
+                                            }
+                                            ObjKind::Map(m) if &**key == "size" => {
+                                                hit = Some(Value::Number(m.entries.len() as f64));
+                                            }
+                                            ObjKind::Set(s) if &**key == "size" => {
+                                                hit = Some(Value::Number(s.values.len() as f64));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Value::Str(s) if &**key == "length" => {
+                                    let len = if s.is_ascii() {
+                                        s.len()
+                                    } else {
+                                        s.chars().count()
+                                    };
+                                    hit = Some(Value::Number(len as f64));
+                                }
+                                Value::Number(_) | Value::Bool(_) => {
+                                    hit = Some(Value::Undefined);
+                                }
+                                _ => {}
+                            }
+                            if let Some(v) = hit {
+                                *frame.stack.last_mut().unwrap() = v;
+                            } else {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                        }
+                        OpCode::SetProp(cidx) => {
+                            let key = frame.chunk.const_str_ref(cidx);
+                            let n = frame.stack.len();
+                            let mut done = false;
+                            if let Value::Object(o) = &frame.stack[n - 2] {
+                                let hint = frame.chunk.ic_slots[op_ip].get() as usize;
+                                let mut b = o.borrow_mut();
+                                if let Some((idx, slot)) = b.props.get_mut_with_hint(key, hint) {
+                                    if idx != hint && idx < u16::MAX as usize {
+                                        frame.chunk.ic_slots[op_ip].set(idx as u16);
+                                    }
+                                    if let PropSlot::Value(slot_v) = slot {
+                                        *slot_v = frame.stack[n - 1].clone();
+                                        done = true;
+                                    }
+                                } else if b.proto.is_none() && !matches!(b.kind, ObjKind::Array(_))
+                                {
+                                    let idx = b.props.set_value_returning_idx(
+                                        key.clone(),
+                                        frame.stack[n - 1].clone(),
+                                    );
+                                    if idx < u16::MAX as usize {
+                                        frame.chunk.ic_slots[op_ip].set(idx as u16);
+                                    }
+                                    done = true;
+                                }
+                            }
+                            if done {
+                                let val = frame.stack.pop().unwrap();
+                                *frame.stack.last_mut().unwrap() = val;
+                            } else {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                        }
+                        OpCode::GetIndex => {
+                            let n = frame.stack.len();
+                            let mut hit: Option<Value> = None;
+                            match (&frame.stack[n - 2], &frame.stack[n - 1]) {
+                                (Value::Object(o), Value::Number(num))
+                                    if *num >= 0.0
+                                        && num.fract() == 0.0
+                                        && *num < (usize::MAX as f64) =>
+                                {
+                                    let b = o.borrow();
+                                    if b.props.is_empty() {
+                                        if let ObjKind::Array(items) = &b.kind {
+                                            hit = Some(
+                                                items
+                                                    .get(*num as usize)
+                                                    .cloned()
+                                                    .unwrap_or(Value::Undefined),
+                                            );
+                                        }
+                                    }
+                                }
+                                (Value::Str(s), Value::Number(num))
+                                    if *num >= 0.0
+                                        && num.fract() == 0.0
+                                        && *num < (usize::MAX as f64) =>
+                                {
+                                    let idx = *num as usize;
+                                    let v = if s.is_ascii() {
+                                        s.as_bytes()
+                                            .get(idx)
+                                            .map(|&b| Value::Str(ascii_char_rc(b)))
+                                            .unwrap_or(Value::Undefined)
+                                    } else {
+                                        s.chars()
+                                            .nth(idx)
+                                            .map(|c| Value::str(c.to_string()))
+                                            .unwrap_or(Value::Undefined)
+                                    };
+                                    hit = Some(v);
+                                }
+                                (Value::Object(o), Value::Str(k)) => {
+                                    let b = o.borrow();
+                                    if let Some((_, PropSlot::Value(v))) =
+                                        b.props.get_with_hint(k, 0)
+                                    {
+                                        hit = Some(v.clone());
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if let Some(v) = hit {
+                                frame.stack.pop();
+                                *frame.stack.last_mut().unwrap() = v;
+                            } else {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                        }
+                        OpCode::SetIndex => {
+                            let n = frame.stack.len();
+                            let mut done = false;
+                            match (&frame.stack[n - 3], &frame.stack[n - 2]) {
+                                (Value::Object(o), Value::Number(num))
+                                    if *num >= 0.0
+                                        && num.fract() == 0.0
+                                        && *num < (usize::MAX as f64) =>
+                                {
+                                    let mut b = o.borrow_mut();
+                                    if b.props.is_empty() {
+                                        if let ObjKind::Array(items) = &mut b.kind {
+                                            let idx = *num as usize;
+                                            if idx >= items.len() {
+                                                items.resize(idx + 1, Value::Undefined);
+                                            }
+                                            items[idx] = frame.stack[n - 1].clone();
+                                            done = true;
+                                        }
+                                    }
+                                }
+                                (Value::Object(o), Value::Str(k)) => {
+                                    let mut b = o.borrow_mut();
+                                    if let Some((_, slot)) = b.props.get_mut_with_hint(k, 0) {
+                                        if let PropSlot::Value(slot_v) = slot {
+                                            *slot_v = frame.stack[n - 1].clone();
+                                            done = true;
+                                        }
+                                    } else if b.proto.is_none()
+                                        && !matches!(b.kind, ObjKind::Array(_))
+                                    {
+                                        b.props.set_value(k.clone(), frame.stack[n - 1].clone());
+                                        done = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if done {
+                                let val = frame.stack.pop().unwrap();
+                                frame.stack.pop();
+                                *frame.stack.last_mut().unwrap() = val;
+                            } else {
+                                frame.ip = ip;
+                                slow = Some((op, op_ip));
+                                break;
+                            }
+                        }
+
+                        // --- 算術・比較・ビット演算の高速パス ---
+                        OpCode::Add => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *a = Value::Number(*x + *y),
+                                _ => *a = js_add(a, &b),
+                            }
+                        }
+                        OpCode::Sub => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x - *y,
+                                _ => to_number(a) - to_number(&b),
+                            };
+                            *a = Value::Number(r);
+                        }
+                        OpCode::Mul => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x * *y,
+                                _ => to_number(a) * to_number(&b),
+                            };
+                            *a = Value::Number(r);
+                        }
+                        OpCode::Div => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x / *y,
+                                _ => to_number(a) / to_number(&b),
+                            };
+                            *a = Value::Number(r);
+                        }
+                        OpCode::Mod => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x % *y,
+                                _ => to_number(a) % to_number(&b),
+                            };
+                            *a = Value::Number(r);
+                        }
+                        OpCode::Pow => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => x.powf(*y),
+                                _ => to_number(a).powf(to_number(&b)),
+                            };
+                            *a = Value::Number(r);
+                        }
+                        OpCode::Eq => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Bool(loose_eq(a, &b));
+                        }
+                        OpCode::NotEq => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Bool(!loose_eq(a, &b));
+                        }
+                        OpCode::StrictEq => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Bool(strict_eq(a, &b));
+                        }
+                        OpCode::StrictNotEq => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Bool(!strict_eq(a, &b));
+                        }
+                        OpCode::Lt => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x < *y,
+                                _ => js_compare(a, &b) == Some(std::cmp::Ordering::Less),
+                            };
+                            *a = Value::Bool(r);
+                        }
+                        OpCode::Gt => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x > *y,
+                                _ => js_compare(a, &b) == Some(std::cmp::Ordering::Greater),
+                            };
+                            *a = Value::Bool(r);
+                        }
+                        OpCode::LtEq => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x <= *y,
+                                _ => js_compare(a, &b)
+                                    .is_some_and(|o| o != std::cmp::Ordering::Greater),
+                            };
+                            *a = Value::Bool(r);
+                        }
+                        OpCode::GtEq => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = match (&*a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x >= *y,
+                                _ => {
+                                    js_compare(a, &b).is_some_and(|o| o != std::cmp::Ordering::Less)
+                                }
+                            };
+                            *a = Value::Bool(r);
+                        }
+                        OpCode::Shl => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = to_int32(a).wrapping_shl(to_int32(&b) as u32 & 31);
+                            *a = Value::Number(r as f64);
+                        }
+                        OpCode::Shr => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = to_int32(a).wrapping_shr(to_int32(&b) as u32 & 31);
+                            *a = Value::Number(r as f64);
+                        }
+                        OpCode::UShr => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            let r = to_uint32(a).wrapping_shr(to_int32(&b) as u32 & 31);
+                            *a = Value::Number(r as f64);
+                        }
+                        OpCode::BitAnd => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Number((to_int32(a) & to_int32(&b)) as f64);
+                        }
+                        OpCode::BitOr => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Number((to_int32(a) | to_int32(&b)) as f64);
+                        }
+                        OpCode::BitXor => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Number((to_int32(a) ^ to_int32(&b)) as f64);
+                        }
+                        OpCode::Neg => {
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Number(-to_number(a));
+                        }
+                        OpCode::Pos => {
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Number(to_number(a));
+                        }
+                        OpCode::Not => {
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Bool(!a.to_bool());
+                        }
+                        OpCode::BitNot => {
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::Number(!to_int32(a) as f64);
+                        }
+                        OpCode::TypeOf => {
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            *a = Value::str(a.type_of());
+                        }
+                        OpCode::ToStringOp => {
+                            let a = frame.stack.last_mut().expect("オペランドスタックが空です");
+                            if !matches!(a, Value::Str(_)) {
+                                *a = Value::Str(to_string_basic(a).into());
+                            }
+                        }
+                        OpCode::ConcatStrings(count) => {
+                            let cnt = count as usize;
+                            let start = frame.stack.len() - cnt;
+                            let mut buf = String::new();
+                            for v in &frame.stack[start..] {
+                                to_string_into(v, &mut buf);
+                            }
+                            frame.stack.truncate(start);
+                            frame.stack.push(Value::Str(buf.into()));
+                        }
+
+                        // --- 制御フロー・融合比較ジャンプ ---
+                        OpCode::Jump(addr) => {
+                            let target = addr as usize;
+                            ip = target;
+                            if target <= op_ip && native_depth == 0 && gc_due_ptr.get() >= gc_thresh
+                            {
+                                frame.ip = ip;
+                                break;
+                            }
+                        }
+                        OpCode::JumpIfFalse(addr) => {
+                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            if !v.to_bool() {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfTrue(addr) => {
+                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            if v.to_bool() {
+                                let target = addr as usize;
+                                ip = target;
+                                if target <= op_ip
+                                    && native_depth == 0
+                                    && gc_due_ptr.get() >= gc_thresh
+                                {
+                                    frame.ip = ip;
+                                    break;
+                                }
+                            }
+                        }
+                        OpCode::LtJumpIfFalse(addr) => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            let cond = match (&a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x < *y,
+                                _ => js_compare(&a, &b) == Some(std::cmp::Ordering::Less),
+                            };
+                            if !cond {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::LtEqJumpIfFalse(addr) => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            let cond = match (&a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x <= *y,
+                                _ => js_compare(&a, &b)
+                                    .is_some_and(|o| o != std::cmp::Ordering::Greater),
+                            };
+                            if !cond {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::GtJumpIfFalse(addr) => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            let cond = match (&a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x > *y,
+                                _ => js_compare(&a, &b) == Some(std::cmp::Ordering::Greater),
+                            };
+                            if !cond {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::GtEqJumpIfFalse(addr) => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            let cond = match (&a, &b) {
+                                (Value::Number(x), Value::Number(y)) => *x >= *y,
+                                _ => js_compare(&a, &b)
+                                    .is_some_and(|o| o != std::cmp::Ordering::Less),
+                            };
+                            if !cond {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::StrictEqJumpIfFalse(addr) => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            if !strict_eq(&a, &b) {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::StrictNotEqJumpIfFalse(addr) => {
+                            let b = frame.stack.pop().expect("オペランドスタックが空です");
+                            let a = frame.stack.pop().expect("オペランドスタックが空です");
+                            if strict_eq(&a, &b) {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfNullish(addr) => {
+                            if frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .is_nullish()
+                            {
+                                *frame.stack.last_mut().unwrap() = Value::Undefined;
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfNullishCall(addr) => {
+                            if frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .is_nullish()
+                            {
+                                frame.stack.pop(); // callee
+                                *frame.stack.last_mut().unwrap() = Value::Undefined; // replace this
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfFalsyKeep(addr) => {
+                            if !frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .to_bool()
+                            {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfTruthyKeep(addr) => {
+                            if frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .to_bool()
+                            {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfNotNullishKeep(addr) => {
+                            if !frame
+                                .stack
+                                .last()
+                                .expect("オペランドスタックが空です")
+                                .is_nullish()
+                            {
+                                ip = addr as usize;
+                            }
+                        }
+                        OpCode::JumpIfNotUndefinedKeep(addr) => {
+                            if !matches!(
+                                frame.stack.last().expect("オペランドスタックが空です"),
+                                Value::Undefined
+                            ) {
+                                ip = addr as usize;
+                            } else {
+                                frame.stack.pop();
+                            }
+                        }
+                        OpCode::ArrayPush => {
+                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                if let ObjKind::Array(items) = &mut o.borrow_mut().kind {
+                                    items.push(v);
+                                }
+                            }
+                        }
+                        OpCode::ObjectSetProp(cidx) => {
+                            let name = frame.chunk.const_str(cidx);
+                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                o.borrow_mut().props.set_value(name, v);
+                            }
+                        }
+                        OpCode::ObjectSetComputed => {
+                            let v = frame.stack.pop().expect("オペランドスタックが空です");
+                            let key = frame.stack.pop().expect("オペランドスタックが空です");
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                let name: Rc<str> = match &key {
+                                    Value::Str(s) => s.clone(),
+                                    other => Rc::from(to_property_key_string(other).as_str()),
+                                };
+                                o.borrow_mut().props.set_value(name, v);
+                            }
+                        }
+                        OpCode::ObjectSetMethod(cidx) => {
+                            let name = frame.chunk.const_str(cidx);
+                            let f = frame.stack.pop().expect("オペランドスタックが空です");
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                o.borrow_mut().props.set_value(name, f);
+                            }
+                        }
+                        OpCode::ObjectDefineGetter(cidx) => {
+                            let name = frame.chunk.const_str(cidx);
+                            let f = frame.stack.pop().expect("オペランドスタックが空です");
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                o.borrow_mut().props.define_accessor(name, true, f);
+                            }
+                        }
+                        OpCode::ObjectDefineSetter(cidx) => {
+                            let name = frame.chunk.const_str(cidx);
+                            let f = frame.stack.pop().expect("オペランドスタックが空です");
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                o.borrow_mut().props.define_accessor(name, false, f);
+                            }
+                        }
+
+                        // フレーム変更・VM 状態アクセスが必要な命令は外側ループへ委譲
+                        other => {
+                            frame.ip = ip;
+                            slow = Some((other, op_ip));
+                            break;
+                        }
+                    }
+                }
+                slow
+            };
+
+            let Some((op, op_ip)) = slow_op else {
+                // 後方ジャンプで GC トリガーに達したケース
+                if self.native_call_depth == 0 {
+                    self.maybe_collect_garbage();
+                }
+                continue;
+            };
+
+            let res: Result<Option<RunOutcome>, Value> = match op {
+                OpCode::Return => {
+                    let mut popped = self.frames.pop().unwrap();
+                    let v = popped.stack.pop().expect("オペランドスタックが空です");
+                    if self.frames.is_empty() && popped.chunk.is_module {
+                        let exports = popped
+                            .chunk
+                            .exports
+                            .iter()
+                            .map(|(name, slot)| (name.clone(), popped.locals[*slot as usize].get()))
+                            .collect();
+                        self.pending_module_exports = Some(exports);
+                    }
+                    self.release_frame(popped);
                     if self.frames.len() > stop_depth {
                         self.frames.last_mut().unwrap().stack.push(v);
                     } else {
                         last_value = v;
                     }
+                    if self.native_call_depth == 0 {
+                        self.maybe_collect_garbage();
+                    }
+                    Ok(None)
                 }
-                Ok(StepSignal::None) => {}
-                Ok(StepSignal::Suspended) => return Ok(RunOutcome::Suspended),
-                Err(thrown) => {
-                    self.unwind(thrown, stop_depth)?;
+                OpCode::Call(argc) => self.exec_call(argc as usize).map(|()| None),
+                OpCode::CallMethod(cidx, argc) => self
+                    .exec_call_method(cidx as ConstIdx, argc as usize, op_ip)
+                    .map(|()| None),
+                OpCode::GetProp(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    let obj = self.pop();
+                    self.get_prop_ic(&obj, &name, op_ip).map(|v| {
+                        self.push(v);
+                        None
+                    })
                 }
+                OpCode::SetProp(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    let value = self.pop();
+                    let obj = self.pop();
+                    self.set_prop_rc(&obj, &name, value.clone()).map(|()| {
+                        self.push(value);
+                        None
+                    })
+                }
+                OpCode::GetIndex => {
+                    let key = self.pop();
+                    let obj = self.pop();
+                    self.exec_get_index(&obj, &key).map(|v| {
+                        self.push(v);
+                        None
+                    })
+                }
+                OpCode::SetIndex => {
+                    let value = self.pop();
+                    let key = self.pop();
+                    let obj = self.pop();
+                    self.exec_set_index(&obj, &key, value.clone()).map(|()| {
+                        self.push(value);
+                        None
+                    })
+                }
+                OpCode::GetLocal(_)
+                | OpCode::IncLocal(_)
+                | OpCode::DecLocal(_)
+                | OpCode::GetUpvalue(_) => {
+                    Err(self.reference_error("変数が初期化される前にアクセスされました（TDZ）"))
+                }
+                OpCode::GetGlobal(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    match self.globals.get(&name) {
+                        Some(cell) => {
+                            let v = cell.borrow().clone();
+                            if matches!(v, Value::Uninit) {
+                                Err(self.reference_error(format!(
+                                    "'{name}' は初期化される前に参照されました"
+                                )))
+                            } else {
+                                self.push(v);
+                                Ok(None)
+                            }
+                        }
+                        None => Err(self.reference_error(format!("'{name}' は定義されていません"))),
+                    }
+                }
+                OpCode::SetGlobal(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    let v = self.top().clone();
+                    match self.globals.get(&name) {
+                        Some(cell) => {
+                            *cell.borrow_mut() = v;
+                            Ok(None)
+                        }
+                        None => Err(self.reference_error(format!("'{name}' は定義されていません"))),
+                    }
+                }
+                OpCode::BindGlobal(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    let v = self.pop();
+                    self.globals.insert(name, Rc::new(RefCell::new(v)));
+                    Ok(None)
+                }
+                OpCode::GetRestArgs(from) => {
+                    let args = &self.frames.last().unwrap().raw_args;
+                    let rest = if (from as usize) < args.len() {
+                        args[from as usize..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let arr = self.alloc_array(rest);
+                    self.push(arr);
+                    Ok(None)
+                }
+                OpCode::DeleteProp(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    let obj = self.pop();
+                    let ok = self.delete_prop(&obj, &name);
+                    self.push(Value::Bool(ok));
+                    Ok(None)
+                }
+                OpCode::DeleteIndex => {
+                    let key = self.pop();
+                    let obj = self.pop();
+                    let ok = match &key {
+                        Value::Str(s) => self.delete_prop(&obj, s),
+                        other => {
+                            let name = to_property_key_string(other);
+                            self.delete_prop(&obj, &name)
+                        }
+                    };
+                    self.push(Value::Bool(ok));
+                    Ok(None)
+                }
+                OpCode::Instanceof => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    self.op_instanceof(&a, &b).map(|r| {
+                        self.push(r);
+                        None
+                    })
+                }
+                OpCode::In => {
+                    let obj = self.pop();
+                    let key = self.pop();
+                    if let Value::Object(o) = &obj {
+                        let has = match &key {
+                            Value::Str(s) => self.has_prop(o, s),
+                            other => {
+                                let name = to_property_key_string(other);
+                                self.has_prop(o, &name)
+                            }
+                        };
+                        self.push(Value::Bool(has));
+                        Ok(None)
+                    } else {
+                        Err(self.type_error("in 演算子の右辺はオブジェクトである必要があります"))
+                    }
+                }
+                OpCode::TypeOfGlobal(cidx) => {
+                    let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                    let s = match self.globals.get(&name) {
+                        Some(cell) => {
+                            let v = cell.borrow().clone();
+                            if matches!(v, Value::Uninit) {
+                                "undefined"
+                            } else {
+                                v.type_of()
+                            }
+                        }
+                        None => "undefined",
+                    };
+                    self.push(Value::str(s));
+                    Ok(None)
+                }
+                OpCode::Throw => {
+                    let v = self.pop();
+                    Err(v)
+                }
+                OpCode::MakeClosure(cidx) => {
+                    let tpl = {
+                        let f = self.frames.last().unwrap();
+                        match &f.chunk.consts[cidx as usize] {
+                            Const::FunctionTemplate(t) => t.clone(),
+                            _ => panic!("MakeClosure: 定数がFunctionTemplateではありません"),
+                        }
+                    };
+                    let fo = self.build_closure(&tpl);
+                    let v = self.wrap_function(fo);
+                    self.push(v);
+                    if self.native_call_depth == 0 {
+                        self.maybe_collect_garbage();
+                    }
+                    Ok(None)
+                }
+                OpCode::CallSpread => {
+                    let args_arr = self.pop();
+                    let callee = self.pop();
+                    let this = self.pop();
+                    let args = array_values(&args_arr);
+                    self.call_value(callee, this, &args).map(|r| {
+                        self.push(r);
+                        None
+                    })
+                }
+                OpCode::New(argc) => self.exec_new(argc as usize).map(|()| {
+                    if self.native_call_depth == 0 {
+                        self.maybe_collect_garbage();
+                    }
+                    None
+                }),
+                OpCode::NewSpread => {
+                    let args_arr = self.pop();
+                    let callee = self.pop();
+                    let args = array_values(&args_arr);
+                    self.dispatch_new(callee, args).map(|r| {
+                        self.push(r);
+                        None
+                    })
+                }
+                OpCode::NewObject => {
+                    let o = self.alloc_plain_object();
+                    self.push(o);
+                    if self.native_call_depth == 0 {
+                        self.maybe_collect_garbage();
+                    }
+                    Ok(None)
+                }
+                OpCode::NewArray => {
+                    let a = self.alloc_array(Vec::new());
+                    self.push(a);
+                    if self.native_call_depth == 0 {
+                        self.maybe_collect_garbage();
+                    }
+                    Ok(None)
+                }
+                OpCode::SpreadAppendArray => {
+                    let src = self.pop();
+                    self.materialize_iter_array(&src).map(|items| {
+                        let arr = self.top().clone();
+                        if let Value::Object(o) = &arr {
+                            if let ObjKind::Array(dst) = &mut o.borrow_mut().kind {
+                                dst.extend(items);
+                            }
+                        }
+                        None
+                    })
+                }
+                OpCode::ObjectSpread => {
+                    let src = self.pop();
+                    let obj = self.top().clone();
+                    if let (Value::Object(dst), Value::Object(src_o)) = (&obj, &src) {
+                        let entries: Vec<(Rc<str>, Value)> = src_o
+                            .borrow()
+                            .props
+                            .iter()
+                            .filter_map(|(k, s)| match s {
+                                PropSlot::Value(v) => Some((k.clone(), v.clone())),
+                                PropSlot::Accessor { .. } => None,
+                            })
+                            .collect();
+                        for (k, v) in entries {
+                            dst.borrow_mut().props.set_value(k, v);
+                        }
+                        if let ObjKind::Array(items) = &src_o.borrow().kind {
+                            for (i, it) in items.iter().enumerate() {
+                                dst.borrow_mut()
+                                    .props
+                                    .set_value(Rc::from(i.to_string().as_str()), it.clone());
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
+                OpCode::MakeIterArray => {
+                    let v = self.pop();
+                    self.materialize_iter_array(&v).map(|items| {
+                        let arr = self.alloc_array(items);
+                        self.push(arr);
+                        None
+                    })
+                }
+                OpCode::ObjectKeysArray => {
+                    let v = self.pop();
+                    let keys = self.own_keys_array(&v);
+                    let arr = self.alloc_array(keys);
+                    self.push(arr);
+                    Ok(None)
+                }
+                OpCode::ObjectRestExclude(n) => {
+                    let mut exclude = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        exclude.push(to_property_key_string(&self.pop()));
+                    }
+                    let src = self.pop();
+                    let mut out = ObjData::new(ObjKind::Plain);
+                    if let Value::Object(o) = &src {
+                        for (k, s) in o.borrow().props.iter() {
+                            if exclude.iter().any(|e| e == &**k) {
+                                continue;
+                            }
+                            if let PropSlot::Value(v) = s {
+                                out.props.set_value(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    let val = self.alloc_obj(out);
+                    self.push(val);
+                    Ok(None)
+                }
+                OpCode::ArraySliceFrom => {
+                    let start = self.pop();
+                    let arr = self.pop();
+                    let start_idx = to_number(&start) as usize;
+                    let items = array_values(&arr);
+                    let sliced = if start_idx < items.len() {
+                        items[start_idx..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let val = self.alloc_array(sliced);
+                    self.push(val);
+                    Ok(None)
+                }
+                OpCode::MakeClass(cidx) => {
+                    let tpl = {
+                        let f = self.frames.last().unwrap();
+                        match &f.chunk.consts[cidx as usize] {
+                            Const::ClassTemplate(t) => t.clone(),
+                            _ => panic!("MakeClass: 定数が ClassTemplate ではありません"),
+                        }
+                    };
+                    self.build_class(&tpl).map(|v| {
+                        self.push(v);
+                        None
+                    })
+                }
+                OpCode::LoadRegex(cidx) => {
+                    let re = {
+                        let f = self.frames.last().unwrap();
+                        match &f.chunk.consts[cidx as usize] {
+                            Const::Regex(r) => r.clone(),
+                            _ => panic!("LoadRegex: 定数が Regex ではありません"),
+                        }
+                    };
+                    let v = self.alloc_regex_value(re);
+                    self.push(v);
+                    if self.native_call_depth == 0 {
+                        self.maybe_collect_garbage();
+                    }
+                    Ok(None)
+                }
+                OpCode::Await => {
+                    if self.native_call_depth > 0 {
+                        Err(self.type_error(
+                            "await はネイティブコールバックの内側では中断できません（T3 の既知の制約）",
+                        ))
+                    } else {
+                        let v = self.pop();
+                        let promise = self.coerce_to_promise(v);
+                        let owner = self
+                            .current_owner_promise
+                            .clone()
+                            .expect("await はタスク駆動ループの外では実行されないはず");
+                        let frames = std::mem::take(&mut self.frames);
+                        let cont = AwaitContinuation {
+                            frames,
+                            owner_promise: owner,
+                        };
+                        self.add_reaction(&promise, PromiseReaction::Await(cont));
+                        Ok(Some(RunOutcome::Suspended))
+                    }
+                }
+                _ => unreachable!("ホットパスで処理済みの命令が外側へ到達しました"),
+            };
+
+            match res {
+                Ok(Some(outcome)) => return Ok(outcome),
+                Ok(None) => {}
+                Err(thrown) => self.unwind(thrown, stop_depth)?,
             }
         }
     }
@@ -756,607 +2088,10 @@ impl Vm {
                 frame.ip = addr as usize;
                 return Ok(());
             }
-            self.frames.pop();
-        }
-    }
-
-    /// 1 命令だけ実行する。`Return` でフレームが完全に返った場合のみ
-    /// その戻り値を `StepSignal::Returned(v)` で伝える（呼び出し元 `run_until` の
-    /// トップレベル戻り値を組み立てるため）。`await` によるタスク全体の中断は
-    /// `StepSignal::Suspended` で伝える（この時点で `self.frames` は既に
-    /// 空になっている — 継続はどこかの Promise の reaction として登録済み）。
-    fn step(&mut self) -> Result<StepSignal, Value> {
-        let frame = self.frames.last_mut().unwrap();
-        let ip = frame.ip;
-        let op = frame.chunk.code[ip];
-        frame.ip = ip + 1;
-
-        macro_rules! bin_num {
-            ($f:expr) => {{
-                let b = self.pop();
-                let a = self.pop();
-                let r = $f(to_number(&a), to_number(&b));
-                self.push(Value::Number(r));
-            }};
-        }
-        macro_rules! bin_cmp {
-            ($f:expr) => {{
-                let b = self.pop();
-                let a = self.pop();
-                let r = js_compare(&a, &b);
-                self.push(Value::Bool(r.map($f).unwrap_or(false)));
-            }};
-        }
-        macro_rules! bin_int {
-            ($f:expr) => {{
-                let b = self.pop();
-                let a = self.pop();
-                let ai = to_int32(&a);
-                let bi = to_int32(&b);
-                self.push(Value::Number($f(ai, bi) as f64));
-            }};
-        }
-
-        match op {
-            OpCode::Pop => {
-                self.pop();
-            }
-            OpCode::Dup => {
-                let v = self.top().clone();
-                self.push(v);
-            }
-            OpCode::Swap => {
-                let f = self.frames.last_mut().unwrap();
-                let n = f.stack.len();
-                f.stack.swap(n - 1, n - 2);
-            }
-            OpCode::LoadConst(idx) => {
-                let v = self.frames.last().unwrap().chunk.const_value(idx);
-                self.push(v);
-            }
-            OpCode::LoadUndefined => self.push(Value::Undefined),
-            OpCode::LoadNull => self.push(Value::Null),
-            OpCode::LoadTrue => self.push(Value::Bool(true)),
-            OpCode::LoadFalse => self.push(Value::Bool(false)),
-            OpCode::LoadThis => unreachable!("This は Ident 解決経由でコンパイルされます"),
-
-            OpCode::GetLocal(slot) => {
-                let v = self.frames.last().unwrap().locals[slot as usize].get();
-                if matches!(v, Value::Uninit) {
-                    return Err(
-                        self.reference_error("変数が初期化される前にアクセスされました（TDZ）")
-                    );
-                }
-                self.push(v);
-            }
-            OpCode::SetLocal(slot) => {
-                let v = self.top().clone();
-                self.frames.last_mut().unwrap().locals[slot as usize].set(v);
-            }
-            OpCode::BindLocal(slot) => {
-                let v = self.pop();
-                self.frames.last_mut().unwrap().locals[slot as usize].set(v);
-            }
-            OpCode::RebindLocal(slot) => {
-                let f = self.frames.last_mut().unwrap();
-                if let LocalSlot::Boxed(cell) = &mut f.locals[slot as usize] {
-                    let cur = cell.borrow().clone();
-                    *cell = Rc::new(RefCell::new(cur));
-                }
-            }
-            OpCode::GetUpvalue(idx) => {
-                let cell = self.frames.last().unwrap().upvalues[idx as usize].clone();
-                let v = cell.borrow().clone();
-                if matches!(v, Value::Uninit) {
-                    return Err(
-                        self.reference_error("変数が初期化される前にアクセスされました（TDZ）")
-                    );
-                }
-                self.push(v);
-            }
-            OpCode::SetUpvalue(idx) => {
-                let v = self.top().clone();
-                *self.frames.last().unwrap().upvalues[idx as usize].borrow_mut() = v;
-            }
-            OpCode::GetGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                match self.globals.get(&name) {
-                    Some(cell) => {
-                        let v = cell.borrow().clone();
-                        if matches!(v, Value::Uninit) {
-                            return Err(self.reference_error(format!(
-                                "'{name}' は初期化される前に参照されました"
-                            )));
-                        }
-                        self.push(v);
-                    }
-                    None => {
-                        return Err(self.reference_error(format!("'{name}' は定義されていません")))
-                    }
-                }
-            }
-            OpCode::SetGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let v = self.top().clone();
-                match self.globals.get(&name) {
-                    Some(cell) => *cell.borrow_mut() = v,
-                    None => {
-                        return Err(self.reference_error(format!("'{name}' は定義されていません")))
-                    }
-                }
-            }
-            OpCode::BindGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let v = self.pop();
-                self.globals.insert(name, Rc::new(RefCell::new(v)));
-            }
-
-            OpCode::GetArg(idx) => {
-                let v = self
-                    .frames
-                    .last()
-                    .unwrap()
-                    .raw_args
-                    .get(idx as usize)
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
-                self.push(v);
-            }
-            OpCode::GetRestArgs(from) => {
-                let args = &self.frames.last().unwrap().raw_args;
-                let rest = if (from as usize) < args.len() {
-                    args[from as usize..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                let arr = self.alloc_array(rest);
-                self.push(arr);
-            }
-
-            OpCode::GetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let obj = self.pop();
-                let v = self.get_prop(&obj, &name)?;
-                self.push(v);
-            }
-            OpCode::SetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let value = self.pop();
-                let obj = self.pop();
-                self.set_prop(&obj, &name, value.clone())?;
-                self.push(value);
-            }
-            OpCode::GetIndex => {
-                let key = self.pop();
-                let obj = self.pop();
-                let name = to_property_key_string(&key);
-                let v = self.get_prop(&obj, &name)?;
-                self.push(v);
-            }
-            OpCode::SetIndex => {
-                let value = self.pop();
-                let key = self.pop();
-                let obj = self.pop();
-                let name = to_property_key_string(&key);
-                self.set_prop(&obj, &name, value.clone())?;
-                self.push(value);
-            }
-            OpCode::DeleteProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let obj = self.pop();
-                let ok = self.delete_prop(&obj, &name);
-                self.push(Value::Bool(ok));
-            }
-            OpCode::DeleteIndex => {
-                let key = self.pop();
-                let obj = self.pop();
-                let name = to_property_key_string(&key);
-                let ok = self.delete_prop(&obj, &name);
-                self.push(Value::Bool(ok));
-            }
-            OpCode::JumpIfNullish(addr) => {
-                if self.top().is_nullish() {
-                    self.pop();
-                    self.push(Value::Undefined);
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-            OpCode::JumpIfNullishCall(addr) => {
-                if self.top().is_nullish() {
-                    self.pop(); // callee
-                    self.pop(); // this
-                    self.push(Value::Undefined);
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-
-            OpCode::Add => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(js_add(&a, &b));
-            }
-            OpCode::Sub => bin_num!(|a: f64, b: f64| a - b),
-            OpCode::Mul => bin_num!(|a: f64, b: f64| a * b),
-            OpCode::Div => bin_num!(|a: f64, b: f64| a / b),
-            OpCode::Mod => bin_num!(|a: f64, b: f64| a % b),
-            OpCode::Pow => bin_num!(|a: f64, b: f64| a.powf(b)),
-            OpCode::Eq => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(Value::Bool(loose_eq(&a, &b)));
-            }
-            OpCode::NotEq => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(Value::Bool(!loose_eq(&a, &b)));
-            }
-            OpCode::StrictEq => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(Value::Bool(strict_eq(&a, &b)));
-            }
-            OpCode::StrictNotEq => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(Value::Bool(!strict_eq(&a, &b)));
-            }
-            OpCode::Lt => bin_cmp!(|o: std::cmp::Ordering| o == std::cmp::Ordering::Less),
-            OpCode::Gt => bin_cmp!(|o: std::cmp::Ordering| o == std::cmp::Ordering::Greater),
-            OpCode::LtEq => bin_cmp!(|o: std::cmp::Ordering| o != std::cmp::Ordering::Greater),
-            OpCode::GtEq => bin_cmp!(|o: std::cmp::Ordering| o != std::cmp::Ordering::Less),
-            OpCode::Shl => bin_int!(|a: i32, b: i32| a.wrapping_shl(b as u32 & 31)),
-            OpCode::Shr => bin_int!(|a: i32, b: i32| a.wrapping_shr(b as u32 & 31)),
-            OpCode::UShr => {
-                let b = self.pop();
-                let a = self.pop();
-                let au = to_uint32(&a);
-                let bu = to_int32(&b) as u32 & 31;
-                self.push(Value::Number((au.wrapping_shr(bu)) as f64));
-            }
-            OpCode::BitAnd => bin_int!(|a: i32, b: i32| a & b),
-            OpCode::BitOr => bin_int!(|a: i32, b: i32| a | b),
-            OpCode::BitXor => bin_int!(|a: i32, b: i32| a ^ b),
-            OpCode::Instanceof => {
-                let b = self.pop();
-                let a = self.pop();
-                let r = self.op_instanceof(&a, &b)?;
-                self.push(r);
-            }
-            OpCode::In => {
-                let obj = self.pop();
-                let key = self.pop();
-                let Value::Object(o) = &obj else {
-                    return Err(
-                        self.type_error("in 演算子の右辺はオブジェクトである必要があります")
-                    );
-                };
-                let name = to_property_key_string(&key);
-                self.push(Value::Bool(self.has_prop(o, &name)));
-            }
-            OpCode::Neg => {
-                let v = self.pop();
-                self.push(Value::Number(-to_number(&v)));
-            }
-            OpCode::Pos => {
-                let v = self.pop();
-                self.push(Value::Number(to_number(&v)));
-            }
-            OpCode::Not => {
-                let v = self.pop();
-                self.push(Value::Bool(!v.to_bool()));
-            }
-            OpCode::BitNot => {
-                let v = self.pop();
-                self.push(Value::Number(!to_int32(&v) as f64));
-            }
-            OpCode::TypeOf => {
-                let v = self.pop();
-                self.push(Value::str(v.type_of()));
-            }
-            OpCode::TypeOfGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let s = match self.globals.get(&name) {
-                    Some(cell) => {
-                        let v = cell.borrow().clone();
-                        if matches!(v, Value::Uninit) {
-                            "undefined"
-                        } else {
-                            v.type_of()
-                        }
-                    }
-                    None => "undefined",
-                };
-                self.push(Value::str(s));
-            }
-            OpCode::ToStringOp => {
-                let v = self.pop();
-                let s = self.to_display_string(&v);
-                self.push(Value::Str(s.into()));
-            }
-
-            // 以下 3 命令は「条件を満たせば値を保持したままジャンプ、
-            // 満たさなければ pop せずフォールスルーする」。フォールスルー後に
-            // 値を捨てるかどうかはコンパイラ側が明示的な `Pop` を発行して
-            // 決める（`compile_logical`/`compile_assign` 参照）。
-            OpCode::JumpIfFalsyKeep(addr) => {
-                if !self.top().to_bool() {
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-            OpCode::JumpIfTruthyKeep(addr) => {
-                if self.top().to_bool() {
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-            OpCode::JumpIfNotNullishKeep(addr) => {
-                if !self.top().is_nullish() {
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-            // これは唯一「フォールスルー時は自身で pop する」命令
-            // （デフォルト値/デフォルト引数の評価に使われ、呼び出し側は
-            // 明示的な Pop を発行しない設計のため）。
-            OpCode::JumpIfNotUndefinedKeep(addr) => {
-                if !matches!(self.top(), Value::Undefined) {
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                } else {
-                    self.pop();
-                }
-            }
-
-            OpCode::Jump(addr) => self.frames.last_mut().unwrap().ip = addr as usize,
-            OpCode::JumpIfFalse(addr) => {
-                let v = self.pop();
-                if !v.to_bool() {
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-            OpCode::JumpIfTrue(addr) => {
-                let v = self.pop();
-                if v.to_bool() {
-                    self.frames.last_mut().unwrap().ip = addr as usize;
-                }
-            }
-            OpCode::Return => {
-                let v = self.pop();
-                if self.frames.len() == 1 && self.frames.last().unwrap().chunk.is_module {
-                    // モジュールのトップレベルフレームが終了する。export 値を
-                    // pop してしまう前にここで確定させておく（`run_module` 参照）。
-                    // 深さだけでなく `chunk.is_module` も見る理由: T3 では
-                    // async 関数呼び出しも専用の（深さ 1 から始まる）フレーム列で
-                    // 駆動されるため、深さだけではモジュール本体と区別できない。
-                    let frame = self.frames.last().unwrap();
-                    let exports = frame
-                        .chunk
-                        .exports
-                        .iter()
-                        .map(|(name, slot)| (name.clone(), frame.locals[*slot as usize].get()))
-                        .collect();
-                    self.pending_module_exports = Some(exports);
-                }
-                self.frames.pop();
-                return Ok(StepSignal::Returned(v));
-            }
-            OpCode::Throw => {
-                let v = self.pop();
-                return Err(v);
-            }
-
-            OpCode::MakeClosure(cidx) => {
-                let tpl = {
-                    let f = self.frames.last().unwrap();
-                    match &f.chunk.consts[cidx as usize] {
-                        Const::FunctionTemplate(t) => t.clone(),
-                        _ => panic!("MakeClosure: 定数がFunctionTemplateではありません"),
-                    }
-                };
-                let fo = self.build_closure(&tpl);
-                let v = self.wrap_function(fo);
-                self.push(v);
-            }
-            OpCode::Call(argc) => self.exec_call(argc as usize)?,
-            OpCode::CallSpread => {
-                let args_arr = self.pop();
-                let callee = self.pop();
-                let this = self.pop();
-                let args = array_values(&args_arr);
-                let r = self.call_value(callee, this, &args)?;
-                self.push(r);
-            }
-            OpCode::New(argc) => self.exec_new(argc as usize)?,
-            OpCode::NewSpread => {
-                let args_arr = self.pop();
-                let callee = self.pop();
-                let args = array_values(&args_arr);
-                let r = self.dispatch_new(callee, args)?;
-                self.push(r);
-            }
-            OpCode::NewObject => {
-                let o = self.alloc_plain_object();
-                self.push(o);
-            }
-            OpCode::NewArray => {
-                let a = self.alloc_array(Vec::new());
-                self.push(a);
-            }
-            OpCode::ArrayPush => {
-                let v = self.pop();
-                let arr = self.top().clone();
-                if let Value::Object(o) = &arr {
-                    if let ObjKind::Array(items) = &mut o.borrow_mut().kind {
-                        items.push(v);
-                    }
-                }
-            }
-            OpCode::SpreadAppendArray => {
-                let src = self.pop();
-                let items = self.materialize_iter_array(&src)?;
-                let arr = self.top().clone();
-                if let Value::Object(o) = &arr {
-                    if let ObjKind::Array(dst) = &mut o.borrow_mut().kind {
-                        dst.extend(items);
-                    }
-                }
-            }
-            OpCode::ObjectSetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let v = self.pop();
-                let obj = self.top().clone();
-                if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.set_value(name, v);
-                }
-            }
-            OpCode::ObjectSetComputed => {
-                let v = self.pop();
-                let key = self.pop();
-                let obj = self.top().clone();
-                if let Value::Object(o) = &obj {
-                    let name = to_property_key_string(&key);
-                    o.borrow_mut().props.set_value(Rc::from(name.as_str()), v);
-                }
-            }
-            OpCode::ObjectSetMethod(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let f = self.pop();
-                let obj = self.top().clone();
-                if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.set_value(name, f);
-                }
-            }
-            OpCode::ObjectDefineGetter(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let f = self.pop();
-                let obj = self.top().clone();
-                if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.define_accessor(name, true, f);
-                }
-            }
-            OpCode::ObjectDefineSetter(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
-                let f = self.pop();
-                let obj = self.top().clone();
-                if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.define_accessor(name, false, f);
-                }
-            }
-            OpCode::ObjectSpread => {
-                let src = self.pop();
-                let obj = self.top().clone();
-                if let (Value::Object(dst), Value::Object(src_o)) = (&obj, &src) {
-                    let entries: Vec<(Rc<str>, Value)> = src_o
-                        .borrow()
-                        .props
-                        .iter()
-                        .filter_map(|(k, s)| match s {
-                            PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                            PropSlot::Accessor { .. } => None,
-                        })
-                        .collect();
-                    for (k, v) in entries {
-                        dst.borrow_mut().props.set_value(k, v);
-                    }
-                    if let ObjKind::Array(items) = &src_o.borrow().kind {
-                        for (i, it) in items.iter().enumerate() {
-                            dst.borrow_mut()
-                                .props
-                                .set_value(Rc::from(i.to_string().as_str()), it.clone());
-                        }
-                    }
-                }
-            }
-            OpCode::MakeIterArray => {
-                let v = self.pop();
-                let items = self.materialize_iter_array(&v)?;
-                let arr = self.alloc_array(items);
-                self.push(arr);
-            }
-            OpCode::ObjectKeysArray => {
-                let v = self.pop();
-                let keys = self.own_keys_array(&v);
-                let arr = self.alloc_array(keys);
-                self.push(arr);
-            }
-            OpCode::ObjectRestExclude(n) => {
-                let mut exclude = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    exclude.push(to_property_key_string(&self.pop()));
-                }
-                let src = self.pop();
-                let mut out = ObjData::new(ObjKind::Plain);
-                if let Value::Object(o) = &src {
-                    for (k, s) in o.borrow().props.iter() {
-                        if exclude.iter().any(|e| e == &**k) {
-                            continue;
-                        }
-                        if let PropSlot::Value(v) = s {
-                            out.props.set_value(k.clone(), v.clone());
-                        }
-                    }
-                }
-                let val = self.alloc_obj(out);
-                self.push(val);
-            }
-            OpCode::ArraySliceFrom => {
-                let start = self.pop();
-                let arr = self.pop();
-                let start_idx = to_number(&start) as usize;
-                let items = array_values(&arr);
-                let sliced = if start_idx < items.len() {
-                    items[start_idx..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                let val = self.alloc_array(sliced);
-                self.push(val);
-            }
-
-            OpCode::MakeClass(cidx) => {
-                let tpl = {
-                    let f = self.frames.last().unwrap();
-                    match &f.chunk.consts[cidx as usize] {
-                        Const::ClassTemplate(t) => t.clone(),
-                        _ => panic!("MakeClass: 定数が ClassTemplate ではありません"),
-                    }
-                };
-                let v = self.build_class(&tpl)?;
-                self.push(v);
-            }
-            OpCode::LoadRegex(cidx) => {
-                let re = {
-                    let f = self.frames.last().unwrap();
-                    match &f.chunk.consts[cidx as usize] {
-                        Const::Regex(r) => r.clone(),
-                        _ => panic!("LoadRegex: 定数が Regex ではありません"),
-                    }
-                };
-                let v = self.alloc_regex_value(re);
-                self.push(v);
-            }
-            OpCode::Await => {
-                // ネイティブ関数の Rust 再帰呼び出し（`call_value`/`call_function_obj`）
-                // の内側では、Rust の呼び出しスタックを巻き戻す手段が無いため
-                // 中断できない（README の既知の制約を参照）。
-                if self.native_call_depth > 0 {
-                    return Err(self.type_error(
-                        "await はネイティブコールバックの内側では中断できません（T3 の既知の制約）",
-                    ));
-                }
-                let v = self.pop();
-                let promise = self.coerce_to_promise(v);
-                let owner = self
-                    .current_owner_promise
-                    .clone()
-                    .expect("await はタスク駆動ループの外では実行されないはず");
-                let frames = std::mem::take(&mut self.frames);
-                let cont = AwaitContinuation {
-                    frames,
-                    owner_promise: owner,
-                };
-                self.add_reaction(&promise, PromiseReaction::Await(cont));
-                return Ok(StepSignal::Suspended);
+            if let Some(popped) = self.frames.pop() {
+                self.release_frame(popped);
             }
         }
-        Ok(StepSignal::None)
     }
 
     // =================================================================
@@ -1491,24 +2226,220 @@ impl Vm {
     }
 
     fn exec_call(&mut self, argc: usize) -> Result<(), Value> {
-        let frame = self.frames.last_mut().unwrap();
-        let n = frame.stack.len();
-        let args: Vec<Value> = frame.stack.split_off(n - argc);
-        let callee = frame.stack.pop().unwrap();
-        let this = frame.stack.pop().unwrap();
-        match self.dispatch_call(callee, this, args)? {
-            CallOutcome::Immediate(v) => self.push(v),
-            CallOutcome::FramePushed => {}
+        let caller = self.frames.last().unwrap();
+        let n = caller.stack.len();
+        let callee_kind = match &caller.stack[n - argc - 1] {
+            Value::Object(o) => {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Function(f) => Some(Ok(f.clone())),
+                    ObjKind::Native(nf) => Some(Err(nf.f.clone())),
+                    ObjKind::Class(_) => {
+                        drop(b);
+                        let caller = self.frames.last_mut().unwrap();
+                        caller.stack.truncate(n - argc - 2);
+                        return Err(
+                            self.type_error("クラスのコンストラクタは 'new' なしで呼び出せません")
+                        );
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(kind) = callee_kind else {
+            let caller = self.frames.last_mut().unwrap();
+            caller.stack.truncate(n - argc - 2);
+            return Err(self.type_error("これは関数ではありません"));
+        };
+        match kind {
+            Ok(fo) => {
+                if fo.is_async {
+                    let mut args = self.take_args_buf();
+                    let caller = self.frames.last_mut().unwrap();
+                    args.extend(caller.stack.drain(n - argc..));
+                    caller.stack.pop(); // callee
+                    let this = caller.stack.pop().unwrap();
+                    let promise = self.spawn_async_task_from_function(&fo, this, &args);
+                    self.put_args_buf(args);
+                    self.push(promise);
+                    return Ok(());
+                }
+                self.push_frame_from_caller_stack(&fo, argc, true);
+                Ok(())
+            }
+            Err(nf) => {
+                let mut args = self.take_args_buf();
+                let this = {
+                    let caller = self.frames.last_mut().unwrap();
+                    args.extend(caller.stack.drain(n - argc..));
+                    caller.stack.pop(); // callee
+                    caller.stack.pop().unwrap() // this
+                };
+                let res = nf(self, this, &args);
+                self.put_args_buf(args);
+                let v = res?;
+                self.track_value_tree(&v);
+                self.push(v);
+                Ok(())
+            }
         }
-        Ok(())
+    }
+
+    fn exec_call_method(&mut self, cidx: ConstIdx, argc: usize, op_ip: usize) -> Result<(), Value> {
+        enum MethodTarget {
+            Builtin(KindTag),
+            Function(Rc<FunctionObj>),
+            Native(NativeFn),
+            Fallback,
+        }
+        let (key, target) = {
+            let caller = self.frames.last().unwrap();
+            let key = caller.chunk.const_str(cidx);
+            let n = caller.stack.len();
+            let obj = &caller.stack[n - argc - 1];
+            let hint = caller.chunk.ic_slots[op_ip].get() as usize;
+            let tgt = match obj {
+                Value::Str(_) => MethodTarget::Builtin(KindTag::Str),
+                Value::Object(o) => {
+                    let b = o.borrow();
+                    if let Some((idx, slot)) = b.props.get_with_hint(&key, hint) {
+                        if idx != hint && idx < u16::MAX as usize {
+                            caller.chunk.ic_slots[op_ip].set(idx as u16);
+                        }
+                        match slot {
+                            PropSlot::Value(Value::Object(fn_o)) => match &fn_o.borrow().kind {
+                                ObjKind::Function(f) => MethodTarget::Function(f.clone()),
+                                ObjKind::Native(nf) => MethodTarget::Native(nf.f.clone()),
+                                _ => MethodTarget::Fallback,
+                            },
+                            _ => MethodTarget::Fallback,
+                        }
+                    } else {
+                        let tag = match &b.kind {
+                            ObjKind::Array(_) => Some(KindTag::Array),
+                            ObjKind::Map(_) => Some(KindTag::Map),
+                            ObjKind::Set(_) => Some(KindTag::Set),
+                            ObjKind::Regex(_) => Some(KindTag::Regex),
+                            ObjKind::Promise(_) => Some(KindTag::Promise),
+                            _ => None,
+                        };
+                        if let Some(tag) = tag {
+                            MethodTarget::Builtin(tag)
+                        } else if let Some(proto) = &b.proto {
+                            let pb = proto.borrow();
+                            if let Some((idx, PropSlot::Value(Value::Object(fn_o)))) =
+                                pb.props.get_with_hint(&key, hint)
+                            {
+                                if idx != hint && idx < u16::MAX as usize {
+                                    caller.chunk.ic_slots[op_ip].set(idx as u16);
+                                }
+                                match &fn_o.borrow().kind {
+                                    ObjKind::Function(f) => MethodTarget::Function(f.clone()),
+                                    ObjKind::Native(nf) => MethodTarget::Native(nf.f.clone()),
+                                    _ => MethodTarget::Fallback,
+                                }
+                            } else {
+                                MethodTarget::Fallback
+                            }
+                        } else {
+                            MethodTarget::Fallback
+                        }
+                    }
+                }
+                _ => MethodTarget::Fallback,
+            };
+            (key, tgt)
+        };
+
+        let n = self.frames.last().unwrap().stack.len();
+        match target {
+            MethodTarget::Builtin(tag) => {
+                let mut args = self.take_args_buf();
+                let obj = {
+                    let caller = self.frames.last_mut().unwrap();
+                    args.extend(caller.stack.drain(n - argc..));
+                    caller.stack.pop().unwrap()
+                };
+                if let Some(res) =
+                    crate::builtins::call_builtin_method(self, tag, obj.clone(), &key, &args)
+                {
+                    self.put_args_buf(args);
+                    let v = res?;
+                    self.track_value_tree(&v);
+                    self.push(v);
+                    return Ok(());
+                }
+                // ビルトインに無いメソッド名はプロトタイプチェーン側へフォールバック
+                let callee = self.get_prop(&obj, &key)?;
+                let out = self.dispatch_call_slice(callee, obj, &args);
+                self.put_args_buf(args);
+                match out? {
+                    CallOutcome::Immediate(v) => self.push(v),
+                    CallOutcome::FramePushed => {}
+                }
+                Ok(())
+            }
+            MethodTarget::Function(fo) => {
+                if fo.is_async {
+                    let mut args = self.take_args_buf();
+                    let this = {
+                        let caller = self.frames.last_mut().unwrap();
+                        args.extend(caller.stack.drain(n - argc..));
+                        caller.stack.pop().unwrap()
+                    };
+                    let promise = self.spawn_async_task_from_function(&fo, this, &args);
+                    self.put_args_buf(args);
+                    self.push(promise);
+                    return Ok(());
+                }
+                self.push_frame_from_caller_stack(&fo, argc, false);
+                Ok(())
+            }
+            MethodTarget::Native(nf) => {
+                let mut args = self.take_args_buf();
+                let this = {
+                    let caller = self.frames.last_mut().unwrap();
+                    args.extend(caller.stack.drain(n - argc..));
+                    caller.stack.pop().unwrap()
+                };
+                let res = nf(self, this, &args);
+                self.put_args_buf(args);
+                let v = res?;
+                self.track_value_tree(&v);
+                self.push(v);
+                Ok(())
+            }
+            MethodTarget::Fallback => {
+                let mut args = self.take_args_buf();
+                let obj = {
+                    let caller = self.frames.last_mut().unwrap();
+                    args.extend(caller.stack.drain(n - argc..));
+                    caller.stack.pop().unwrap()
+                };
+                let callee = self.get_prop(&obj, &key)?;
+                let out = self.dispatch_call_slice(callee, obj, &args);
+                self.put_args_buf(args);
+                match out? {
+                    CallOutcome::Immediate(v) => self.push(v),
+                    CallOutcome::FramePushed => {}
+                }
+                Ok(())
+            }
+        }
     }
 
     fn exec_new(&mut self, argc: usize) -> Result<(), Value> {
-        let frame = self.frames.last_mut().unwrap();
-        let n = frame.stack.len();
-        let args: Vec<Value> = frame.stack.split_off(n - argc);
-        let callee = frame.stack.pop().unwrap();
-        let v = self.dispatch_new(callee, args)?;
+        let mut args = self.take_args_buf();
+        let callee = {
+            let frame = self.frames.last_mut().unwrap();
+            let n = frame.stack.len();
+            args.extend(frame.stack.drain(n - argc..));
+            frame.stack.pop().unwrap()
+        };
+        let res = self.dispatch_new_slice(callee, &args);
+        self.put_args_buf(args);
+        let v = res?;
         self.push(v);
         Ok(())
     }
@@ -1522,7 +2453,7 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, Value> {
         let depth_before = self.frames.len();
-        match self.dispatch_call(callee, this, args.to_vec())? {
+        match self.dispatch_call_slice(callee, this, args)? {
             CallOutcome::Immediate(v) => Ok(v),
             CallOutcome::FramePushed => {
                 // ここから先は「ネイティブ関数の Rust 再帰呼び出しの内側」
@@ -1549,7 +2480,8 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, Value> {
         let depth_before = self.frames.len();
-        self.push_function_frame(&f, this, args.to_vec());
+        let frame = self.acquire_frame_from_slice(&f, this, args);
+        self.frames.push(frame);
         self.native_call_depth += 1;
         let r = self.run_until(depth_before);
         self.native_call_depth -= 1;
@@ -1562,19 +2494,6 @@ impl Vm {
         }
     }
 
-    fn make_function_frame(f: &Rc<FunctionObj>, this: Value, args: Vec<Value>) -> Frame {
-        let raw_args = Rc::new(args);
-        let mut frame = Frame::new(f.chunk.clone(), f.upvalues.clone(), raw_args);
-        if !f.is_arrow && !frame.locals.is_empty() {
-            frame.locals[0].set(this);
-        }
-        frame
-    }
-
-    fn push_function_frame(&mut self, f: &Rc<FunctionObj>, this: Value, args: Vec<Value>) {
-        self.frames.push(Self::make_function_frame(f, this, args));
-    }
-
     /// async 関数呼び出し: 呼び出し元のフレーム列を退避し、この呼び出し
     /// 専用の新しいフレーム列で本体を「最初の await または完了」まで
     /// 同期的に駆動してから、呼び出し元のフレーム列を復元する
@@ -1584,9 +2503,9 @@ impl Vm {
         &mut self,
         f: &Rc<FunctionObj>,
         this: Value,
-        args: Vec<Value>,
+        args: &[Value],
     ) -> Value {
-        let frame = Self::make_function_frame(f, this, args);
+        let frame = self.acquire_frame_from_slice(f, this, args);
         let caller_frames = std::mem::replace(&mut self.frames, vec![frame]);
         let (promise_val, promise_obj) = self.new_pending_promise();
         self.drive_current_task(promise_obj);
@@ -1639,125 +2558,217 @@ impl Vm {
         self.frames = caller_frames;
     }
 
-    fn dispatch_call(
+    fn dispatch_call_slice(
         &mut self,
         callee: Value,
         this: Value,
-        args: Vec<Value>,
+        args: &[Value],
     ) -> Result<CallOutcome, Value> {
-        match &callee {
-            Value::Object(o) => {
-                let kind_is_fn = matches!(o.borrow().kind, ObjKind::Function(_));
-                if kind_is_fn {
-                    let fo = match &o.borrow().kind {
-                        ObjKind::Function(f) => f.clone(),
-                        _ => unreachable!(),
-                    };
-                    if fo.is_async {
-                        let promise = self.spawn_async_task_from_function(&fo, this, args);
-                        return Ok(CallOutcome::Immediate(promise));
-                    }
-                    self.push_function_frame(&fo, this, args);
-                    return Ok(CallOutcome::FramePushed);
+        let Value::Object(o) = &callee else {
+            return Err(self.type_error("これは関数ではありません"));
+        };
+        enum CalleeKind {
+            Fn(Rc<FunctionObj>),
+            Native(NativeFn),
+            Class,
+            Other,
+        }
+        let kind = match &o.borrow().kind {
+            ObjKind::Function(f) => CalleeKind::Fn(f.clone()),
+            ObjKind::Native(n) => CalleeKind::Native(n.f.clone()),
+            ObjKind::Class(_) => CalleeKind::Class,
+            _ => CalleeKind::Other,
+        };
+        match kind {
+            CalleeKind::Fn(fo) => {
+                if fo.is_async {
+                    let promise = self.spawn_async_task_from_function(&fo, this, args);
+                    return Ok(CallOutcome::Immediate(promise));
                 }
-                let is_native = matches!(o.borrow().kind, ObjKind::Native(_));
-                if is_native {
-                    let nf = match &o.borrow().kind {
-                        ObjKind::Native(n) => n.f.clone(),
-                        _ => unreachable!(),
-                    };
-                    let v = nf(self, this, &args)?;
-                    self.track_value_tree(&v);
-                    return Ok(CallOutcome::Immediate(v));
-                }
-                if matches!(o.borrow().kind, ObjKind::Class(_)) {
-                    return Err(
-                        self.type_error("クラスのコンストラクタは 'new' なしで呼び出せません")
-                    );
-                }
-                Err(self.type_error("これは関数ではありません"))
+                let frame = self.acquire_frame_from_slice(&fo, this, args);
+                self.frames.push(frame);
+                Ok(CallOutcome::FramePushed)
             }
-            _ => Err(self.type_error("これは関数ではありません")),
+            CalleeKind::Native(nf) => {
+                let v = nf(self, this, args)?;
+                self.track_value_tree(&v);
+                Ok(CallOutcome::Immediate(v))
+            }
+            CalleeKind::Class => {
+                Err(self.type_error("クラスのコンストラクタは 'new' なしで呼び出せません"))
+            }
+            CalleeKind::Other => Err(self.type_error("これは関数ではありません")),
         }
     }
 
     fn dispatch_new(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, Value> {
+        self.dispatch_new_slice(callee, &args)
+    }
+
+    fn dispatch_new_slice(&mut self, callee: Value, args: &[Value]) -> Result<Value, Value> {
         let Value::Object(co) = &callee else {
             return Err(self.type_error("これはコンストラクタではありません"));
         };
-        let is_class = matches!(co.borrow().kind, ObjKind::Class(_));
-        if is_class {
-            let (ctor, proto, fields) = {
-                let b = co.borrow();
-                let ObjKind::Class(cd) = &b.kind else {
-                    unreachable!()
-                };
-                (
+        enum CtorKind {
+            Class(
+                Option<Rc<FunctionObj>>,
+                ObjRef,
+                Vec<(Rc<str>, Option<Rc<FunctionObj>>)>,
+            ),
+            Native(NativeFn),
+            Fn(Rc<FunctionObj>, Option<ObjRef>),
+            Other,
+        }
+        let kind = {
+            let b = co.borrow();
+            match &b.kind {
+                ObjKind::Class(cd) => CtorKind::Class(
                     cd.ctor.clone(),
                     cd.prototype.clone(),
                     cd.instance_fields.clone(),
-                )
-            };
-            let instance = ObjData {
-                kind: ObjKind::Plain,
-                props: PropMap::new(),
-                proto: Some(proto),
-            };
-            let inst_rc: ObjRef = self.alloc_obj_ref(instance);
-            let inst_val = Value::Object(inst_rc.clone());
-            for (name, init) in &fields {
-                let v = match init {
-                    Some(f) => self.call_function_obj(f.clone(), inst_val.clone(), &[])?,
-                    None => Value::Undefined,
-                };
-                inst_rc.borrow_mut().props.set_value(name.clone(), v);
+                ),
+                ObjKind::Native(n) => CtorKind::Native(n.f.clone()),
+                ObjKind::Function(f) => {
+                    let proto = match b.props.get("prototype") {
+                        Some(PropSlot::Value(Value::Object(p))) => Some(p.clone()),
+                        _ => None,
+                    };
+                    CtorKind::Fn(f.clone(), proto)
+                }
+                _ => CtorKind::Other,
             }
-            if let Some(ctor) = ctor {
-                let ret = self.call_function_obj(ctor, inst_val.clone(), &args)?;
+        };
+        match kind {
+            CtorKind::Class(ctor, proto, fields) => {
+                let instance = ObjData {
+                    kind: ObjKind::Plain,
+                    props: PropMap::new(),
+                    proto: Some(proto),
+                };
+                let inst_rc: ObjRef = self.alloc_obj_ref(instance);
+                let inst_val = Value::Object(inst_rc.clone());
+                for (name, init) in &fields {
+                    let v = match init {
+                        Some(f) => self.call_function_obj(f.clone(), inst_val.clone(), &[])?,
+                        None => Value::Undefined,
+                    };
+                    inst_rc.borrow_mut().props.set_value(name.clone(), v);
+                }
+                if let Some(ctor) = ctor {
+                    let ret = self.call_function_obj(ctor, inst_val.clone(), args)?;
+                    if matches!(ret, Value::Object(_)) {
+                        return Ok(ret);
+                    }
+                }
+                Ok(inst_val)
+            }
+            CtorKind::Native(nf) => {
+                let v = nf(self, Value::Undefined, args)?;
+                self.track_value_tree(&v);
+                Ok(v)
+            }
+            CtorKind::Fn(fo, proto) => {
+                let inst_rc: ObjRef = self.alloc_obj_ref(ObjData {
+                    kind: ObjKind::Plain,
+                    props: PropMap::new(),
+                    proto,
+                });
+                let inst_val = Value::Object(inst_rc.clone());
+                let ret = self.call_function_obj(fo, inst_val.clone(), args)?;
                 if matches!(ret, Value::Object(_)) {
                     return Ok(ret);
                 }
+                Ok(inst_val)
             }
-            return Ok(inst_val);
+            CtorKind::Other => Err(self.type_error("これはコンストラクタではありません")),
         }
-        let is_native = matches!(co.borrow().kind, ObjKind::Native(_));
-        if is_native {
-            let nf = match &co.borrow().kind {
-                ObjKind::Native(n) => n.f.clone(),
-                _ => unreachable!(),
-            };
-            let v = nf(self, Value::Undefined, &args)?;
-            self.track_value_tree(&v);
-            return Ok(v);
-        }
-        let is_fn = matches!(co.borrow().kind, ObjKind::Function(_));
-        if is_fn {
-            let fo = match &co.borrow().kind {
-                ObjKind::Function(f) => f.clone(),
-                _ => unreachable!(),
-            };
-            let proto = match co.borrow().props.get("prototype") {
-                Some(PropSlot::Value(Value::Object(p))) => Some(p.clone()),
-                _ => None,
-            };
-            let inst_rc: ObjRef = self.alloc_obj_ref(ObjData {
-                kind: ObjKind::Plain,
-                props: PropMap::new(),
-                proto,
-            });
-            let inst_val = Value::Object(inst_rc.clone());
-            let ret = self.call_function_obj(fo, inst_val.clone(), &args)?;
-            if matches!(ret, Value::Object(_)) {
-                return Ok(ret);
-            }
-            return Ok(inst_val);
-        }
-        Err(self.type_error("これはコンストラクタではありません"))
     }
 
     // =================================================================
     // プロパティアクセス
     // =================================================================
+
+    fn exec_get_index(&mut self, obj: &Value, key: &Value) -> Result<Value, Value> {
+        match key {
+            Value::Str(s) => match obj {
+                Value::Object(o) => self.get_prop_object(o, o, s),
+                other => self.get_prop(other, s),
+            },
+            other => {
+                let name = to_property_key_string(other);
+                self.get_prop(obj, &name)
+            }
+        }
+    }
+
+    fn exec_set_index(&mut self, obj: &Value, key: &Value, value: Value) -> Result<(), Value> {
+        match key {
+            Value::Str(s) => self.set_prop_rc(obj, s, value),
+            other => {
+                let name = to_property_key_string(other);
+                self.set_prop(obj, &name, value)
+            }
+        }
+    }
+
+    fn get_prop_ic(&mut self, obj: &Value, name: &Rc<str>, op_ip: usize) -> Result<Value, Value> {
+        match obj {
+            Value::Object(o) => {
+                let hint = self
+                    .frames
+                    .last()
+                    .and_then(|f| f.chunk.ic_slots.get(op_ip))
+                    .map(|c| c.get() as usize)
+                    .unwrap_or(u16::MAX as usize);
+                enum Step {
+                    Val(Value),
+                    Getter(Value),
+                    Proto(ObjRef),
+                    Undef,
+                }
+                let step = {
+                    let b = o.borrow();
+                    if let Some((idx, slot)) = b.props.get_with_hint(name, hint) {
+                        if idx != hint && idx < u16::MAX as usize {
+                            if let Some(f) = self.frames.last() {
+                                if let Some(c) = f.chunk.ic_slots.get(op_ip) {
+                                    c.set(idx as u16);
+                                }
+                            }
+                        }
+                        match slot {
+                            PropSlot::Value(v) => Step::Val(v.clone()),
+                            PropSlot::Accessor { get, .. } => match get {
+                                Some(f) => Step::Getter(f.clone()),
+                                None => Step::Undef,
+                            },
+                        }
+                    } else if let Some(v) = kind_prop_lookup(&b.kind, name) {
+                        Step::Val(v)
+                    } else if let Some(tag) = kind_tag_of(&b.kind) {
+                        if let Some(m) = crate::builtins::method_for(tag, name) {
+                            Step::Val(m)
+                        } else if let Some(p) = &b.proto {
+                            Step::Proto(p.clone())
+                        } else {
+                            Step::Undef
+                        }
+                    } else if let Some(p) = &b.proto {
+                        Step::Proto(p.clone())
+                    } else {
+                        Step::Undef
+                    }
+                };
+                match step {
+                    Step::Val(v) => Ok(v),
+                    Step::Getter(f) => self.call_value(f, Value::Object(o.clone()), &[]),
+                    Step::Proto(p) => self.get_prop_object(o, &p, name),
+                    Step::Undef => Ok(Value::Undefined),
+                }
+            }
+            other => self.get_prop(other, name),
+        }
+    }
 
     pub fn get_prop(&mut self, obj: &Value, name: &str) -> Result<Value, Value> {
         match obj {
@@ -1786,68 +2797,44 @@ impl Vm {
         obj_rc: &ObjRef,
         name: &str,
     ) -> Result<Value, Value> {
-        let own = obj_rc.borrow().props.get(name).cloned();
-        if let Some(slot) = own {
-            return match slot {
-                PropSlot::Value(v) => Ok(v),
-                PropSlot::Accessor { get, .. } => match get {
-                    Some(f) => self.call_value(f, Value::Object(receiver.clone()), &[]),
-                    None => Ok(Value::Undefined),
-                },
-            };
+        enum Step {
+            Val(Value),
+            Getter(Value),
+            Proto(ObjRef),
+            Undef,
         }
-        let kind_hit = {
+        let step = {
             let b = obj_rc.borrow();
-            match &b.kind {
-                ObjKind::Array(items) => {
-                    if name == "length" {
-                        Some(Value::Number(items.len() as f64))
-                    } else if let Ok(idx) = name.parse::<usize>() {
-                        Some(items.get(idx).cloned().unwrap_or(Value::Undefined))
-                    } else {
-                        None
-                    }
+            if let Some(slot) = b.props.get(name) {
+                match slot {
+                    PropSlot::Value(v) => Step::Val(v.clone()),
+                    PropSlot::Accessor { get, .. } => match get {
+                        Some(f) => Step::Getter(f.clone()),
+                        None => Step::Undef,
+                    },
                 }
-                ObjKind::Map(m) => (name == "size").then(|| Value::Number(m.entries.len() as f64)),
-                ObjKind::Set(s) => (name == "size").then(|| Value::Number(s.values.len() as f64)),
-                ObjKind::Regex(re) => match name {
-                    "source" => Some(Value::str(re.source.clone())),
-                    "flags" => Some(Value::str(re.flags.clone())),
-                    "global" => Some(Value::Bool(re.global)),
-                    "ignoreCase" => Some(Value::Bool(re.ignore_case)),
-                    "multiline" => Some(Value::Bool(re.multiline)),
-                    "dotAll" => Some(Value::Bool(re.dot_all)),
-                    "unicode" => Some(Value::Bool(re.unicode)),
-                    "sticky" => Some(Value::Bool(false)),
-                    _ => None,
-                },
-                _ => None,
+            } else if let Some(v) = kind_prop_lookup(&b.kind, name) {
+                Step::Val(v)
+            } else if let Some(tag) = kind_tag_of(&b.kind) {
+                if let Some(f) = crate::builtins::method_for(tag, name) {
+                    Step::Val(f)
+                } else if let Some(p) = &b.proto {
+                    Step::Proto(p.clone())
+                } else {
+                    Step::Undef
+                }
+            } else if let Some(p) = &b.proto {
+                Step::Proto(p.clone())
+            } else {
+                Step::Undef
             }
         };
-        if let Some(v) = kind_hit {
-            return Ok(v);
+        match step {
+            Step::Val(v) => Ok(v),
+            Step::Getter(f) => self.call_value(f, Value::Object(receiver.clone()), &[]),
+            Step::Proto(p) => self.get_prop_object(receiver, &p, name),
+            Step::Undef => Ok(Value::Undefined),
         }
-        let tag = {
-            let b = obj_rc.borrow();
-            match &b.kind {
-                ObjKind::Array(_) => Some(KindTag::Array),
-                ObjKind::Map(_) => Some(KindTag::Map),
-                ObjKind::Set(_) => Some(KindTag::Set),
-                ObjKind::Regex(_) => Some(KindTag::Regex),
-                ObjKind::Promise(_) => Some(KindTag::Promise),
-                _ => None,
-            }
-        };
-        if let Some(tag) = tag {
-            if let Some(f) = crate::builtins::method_for(tag, name) {
-                return Ok(f);
-            }
-        }
-        let proto = obj_rc.borrow().proto.clone();
-        if let Some(p) = proto {
-            return self.get_prop_object(receiver, &p, name);
-        }
-        Ok(Value::Undefined)
     }
 
     pub fn set_prop(&mut self, obj: &Value, name: &str, value: Value) -> Result<(), Value> {
@@ -1859,11 +2846,29 @@ impl Vm {
             }
             return Ok(()); // プリミティブへの代入は黙って無視（strict mode の細部は簡略化）。
         };
-        self.set_prop_object(o, name, value)
+        self.set_prop_object(o, name, None, value)
     }
 
-    fn set_prop_object(&mut self, obj_rc: &ObjRef, name: &str, value: Value) -> Result<(), Value> {
-        {
+    fn set_prop_rc(&mut self, obj: &Value, name: &Rc<str>, value: Value) -> Result<(), Value> {
+        let Value::Object(o) = obj else {
+            if obj.is_nullish() {
+                return Err(self.type_error(format!(
+                    "プロパティ '{name}' を設定できません（undefined/null）"
+                )));
+            }
+            return Ok(());
+        };
+        self.set_prop_object(o, name, Some(name), value)
+    }
+
+    fn set_prop_object(
+        &mut self,
+        obj_rc: &ObjRef,
+        name: &str,
+        name_rc: Option<&Rc<str>>,
+        value: Value,
+    ) -> Result<(), Value> {
+        let proto = {
             let mut b = obj_rc.borrow_mut();
             if let Some(slot) = b.props.get_mut(name) {
                 match slot {
@@ -1881,9 +2886,6 @@ impl Vm {
                     }
                 }
             }
-        }
-        {
-            let mut b = obj_rc.borrow_mut();
             if let ObjKind::Array(items) = &mut b.kind {
                 if name == "length" {
                     let n = to_number(&value).max(0.0) as usize;
@@ -1897,15 +2899,21 @@ impl Vm {
                     return Ok(());
                 }
             }
-        }
-        let proto = obj_rc.borrow().proto.clone();
+            if b.proto.is_none() {
+                let key = name_rc.cloned().unwrap_or_else(|| Rc::from(name));
+                b.props.set_value(key, value);
+                return Ok(());
+            }
+            b.proto.clone()
+        };
         if let Some(p) = &proto {
             if let Some(setter) = self.find_proto_accessor_setter(p, name) {
                 self.call_value(setter, Value::Object(obj_rc.clone()), &[value])?;
                 return Ok(());
             }
         }
-        obj_rc.borrow_mut().props.set_value(Rc::from(name), value);
+        let key = name_rc.cloned().unwrap_or_else(|| Rc::from(name));
+        obj_rc.borrow_mut().props.set_value(key, value);
         Ok(())
     }
 
@@ -2665,6 +3673,47 @@ fn gc_visit_obj_data_dedup(
     }
 }
 
+#[inline]
+fn kind_tag_of(kind: &ObjKind) -> Option<KindTag> {
+    match kind {
+        ObjKind::Array(_) => Some(KindTag::Array),
+        ObjKind::Map(_) => Some(KindTag::Map),
+        ObjKind::Set(_) => Some(KindTag::Set),
+        ObjKind::Regex(_) => Some(KindTag::Regex),
+        ObjKind::Promise(_) => Some(KindTag::Promise),
+        _ => None,
+    }
+}
+
+#[inline]
+fn kind_prop_lookup(kind: &ObjKind, name: &str) -> Option<Value> {
+    match kind {
+        ObjKind::Array(items) => {
+            if name == "length" {
+                Some(Value::Number(items.len() as f64))
+            } else if let Ok(idx) = name.parse::<usize>() {
+                Some(items.get(idx).cloned().unwrap_or(Value::Undefined))
+            } else {
+                None
+            }
+        }
+        ObjKind::Map(m) => (name == "size").then(|| Value::Number(m.entries.len() as f64)),
+        ObjKind::Set(s) => (name == "size").then(|| Value::Number(s.values.len() as f64)),
+        ObjKind::Regex(re) => match name {
+            "source" => Some(Value::str(re.source.clone())),
+            "flags" => Some(Value::str(re.flags.clone())),
+            "global" => Some(Value::Bool(re.global)),
+            "ignoreCase" => Some(Value::Bool(re.ignore_case)),
+            "multiline" => Some(Value::Bool(re.multiline)),
+            "dotAll" => Some(Value::Bool(re.dot_all)),
+            "unicode" => Some(Value::Bool(re.unicode)),
+            "sticky" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 enum CallOutcome {
     Immediate(Value),
     FramePushed,
@@ -2702,8 +3751,10 @@ pub fn new_regex_value(re: Rc<crate::regex::Regex>) -> Value {
 // JS セマンティクス寄りの変換関数群（Vm を必要としない純粋関数）
 // =====================================================================
 
+#[inline]
 pub fn to_number(v: &Value) -> f64 {
     match v {
+        Value::Number(n) => *n,
         Value::Undefined | Value::Uninit => f64::NAN,
         Value::Null => 0.0,
         Value::Bool(b) => {
@@ -2713,24 +3764,25 @@ pub fn to_number(v: &Value) -> f64 {
                 0.0
             }
         }
-        Value::Number(n) => *n,
-        Value::Str(s) => {
-            let t = s.trim();
-            if t.is_empty() {
-                0.0
-            } else if t == "Infinity" || t == "+Infinity" {
-                f64::INFINITY
-            } else if t == "-Infinity" {
-                f64::NEG_INFINITY
-            } else if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                i64::from_str_radix(hex, 16)
-                    .map(|n| n as f64)
-                    .unwrap_or(f64::NAN)
-            } else {
-                t.parse::<f64>().unwrap_or(f64::NAN)
-            }
-        }
+        Value::Str(s) => parse_js_number_str(s),
         Value::Object(_) => to_number_from_primitive(&to_primitive(v)),
+    }
+}
+
+fn parse_js_number_str(s: &str) -> f64 {
+    let t = s.trim();
+    if t.is_empty() {
+        0.0
+    } else if t == "Infinity" || t == "+Infinity" {
+        f64::INFINITY
+    } else if t == "-Infinity" {
+        f64::NEG_INFINITY
+    } else if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN)
+    } else {
+        t.parse::<f64>().unwrap_or(f64::NAN)
     }
 }
 
@@ -2741,6 +3793,7 @@ fn to_number_from_primitive(v: &Value) -> f64 {
     }
 }
 
+#[inline]
 pub fn to_int32(v: &Value) -> i32 {
     let n = to_number(v);
     if !n.is_finite() {
@@ -2749,6 +3802,7 @@ pub fn to_int32(v: &Value) -> i32 {
     n as i64 as i32
 }
 
+#[inline]
 pub fn to_uint32(v: &Value) -> u32 {
     let n = to_number(v);
     if !n.is_finite() {
@@ -2766,52 +3820,101 @@ pub fn to_primitive(v: &Value) -> Value {
     }
 }
 
-pub fn number_to_js_string(n: f64) -> String {
+pub(crate) fn number_to_js_string_into(n: f64, out: &mut String) {
+    use std::fmt::Write;
     if n.is_nan() {
-        return "NaN".to_string();
+        out.push_str("NaN");
+        return;
     }
     if n.is_infinite() {
-        return if n > 0.0 {
-            "Infinity".to_string()
+        if n > 0.0 {
+            out.push_str("Infinity");
         } else {
-            "-Infinity".to_string()
-        };
+            out.push_str("-Infinity");
+        }
+        return;
     }
     if n == 0.0 {
-        return "0".to_string();
+        out.push('0');
+        return;
     }
     if n.fract() == 0.0 && n.abs() < 1e15 {
-        return format!("{}", n as i64);
+        let _ = write!(out, "{}", n as i64);
+        return;
     }
-    let mut s = format!("{n}");
-    if s.contains('e') {
-        // Rust の指数表記と JS の表記差はコーパス規模では問題にならない前提。
-        return s;
+    let start = out.len();
+    let _ = write!(out, "{n}");
+    let slice = &out[start..];
+    if slice.contains('e') {
+        return;
     }
-    if !s.contains('.') {
-        s.push_str(".0");
+    if !slice.contains('.') {
+        out.push_str(".0");
     }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    let trimmed_len = out[start..]
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .len();
+    out.truncate(start + trimmed_len);
+}
+
+pub fn number_to_js_string(n: f64) -> String {
+    let mut s = String::new();
+    number_to_js_string_into(n, &mut s);
+    s
+}
+
+pub(crate) fn to_string_into(v: &Value, out: &mut String) {
+    match v {
+        Value::Str(s) => out.push_str(s),
+        Value::Number(n) => number_to_js_string_into(*n, out),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Undefined | Value::Uninit => out.push_str("undefined"),
+        Value::Null => out.push_str("null"),
+        Value::Object(o) => {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Array(items) => {
+                    for (i, it) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
+                            to_string_into(it, out);
+                        }
+                    }
+                }
+                _ => {
+                    drop(b);
+                    out.push_str(&to_string_basic(v));
+                }
+            }
+        }
+    }
 }
 
 pub fn to_string_basic(v: &Value) -> String {
     match v {
         Value::Undefined | Value::Uninit => "undefined".to_string(),
         Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Number(n) => number_to_js_string(*n),
         Value::Str(s) => s.to_string(),
         Value::Object(o) => {
             let b = o.borrow();
             match &b.kind {
-                ObjKind::Array(items) => items
-                    .iter()
-                    .map(|it| match it {
-                        Value::Undefined | Value::Null | Value::Uninit => String::new(),
-                        other => to_string_basic(other),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
+                ObjKind::Array(items) => {
+                    let mut out = String::new();
+                    for (i, it) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
+                            to_string_into(it, &mut out);
+                        }
+                    }
+                    out
+                }
                 ObjKind::Function(f) => format!("function {}() {{ [native code] }}", f.name),
                 ObjKind::Native(n) => format!("function {}() {{ [native code] }}", n.name),
                 ObjKind::Class(c) => format!("class {} {{ }}", c.name),
@@ -2854,26 +3957,60 @@ pub fn to_property_key_string(v: &Value) -> String {
     }
 }
 
+#[inline]
 fn js_add(a: &Value, b: &Value) -> Value {
-    let pa = to_primitive(a);
-    let pb = to_primitive(b);
-    if matches!(pa, Value::Str(_)) || matches!(pb, Value::Str(_)) {
-        Value::Str(format!("{}{}", to_string_basic(&pa), to_string_basic(&pb)).into())
-    } else {
-        Value::Number(to_number(&pa) + to_number(&pb))
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => Value::Number(*x + *y),
+        (Value::Str(x), Value::Str(y)) => {
+            let mut buf = String::with_capacity(x.len() + y.len());
+            buf.push_str(x);
+            buf.push_str(y);
+            Value::Str(buf.into())
+        }
+        (Value::Str(x), other) => {
+            let mut buf = String::with_capacity(x.len() + 16);
+            buf.push_str(x);
+            to_string_into(other, &mut buf);
+            Value::Str(buf.into())
+        }
+        (other, Value::Str(y)) => {
+            let mut buf = String::with_capacity(y.len() + 16);
+            to_string_into(other, &mut buf);
+            buf.push_str(y);
+            Value::Str(buf.into())
+        }
+        (Value::Object(_), _) | (_, Value::Object(_)) => {
+            let pa = to_primitive(a);
+            let pb = to_primitive(b);
+            if matches!(pa, Value::Str(_)) || matches!(pb, Value::Str(_)) {
+                let mut buf = String::new();
+                to_string_into(&pa, &mut buf);
+                to_string_into(&pb, &mut buf);
+                Value::Str(buf.into())
+            } else {
+                Value::Number(to_number(&pa) + to_number(&pb))
+            }
+        }
+        _ => Value::Number(to_number(a) + to_number(b)),
     }
 }
 
 /// `<` `>` `<=` `>=` 共通の比較。NaN が絡む場合は None（常に false になる）。
+#[inline]
 fn js_compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    let pa = to_primitive(a);
-    let pb = to_primitive(b);
-    if let (Value::Str(x), Value::Str(y)) = (&pa, &pb) {
-        return Some(x.as_ref().cmp(y.as_ref()));
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y),
+        (Value::Str(x), Value::Str(y)) => Some(x.as_ref().cmp(y.as_ref())),
+        (Value::Object(_), _) | (_, Value::Object(_)) => {
+            let pa = to_primitive(a);
+            let pb = to_primitive(b);
+            if let (Value::Str(x), Value::Str(y)) = (&pa, &pb) {
+                return Some(x.as_ref().cmp(y.as_ref()));
+            }
+            to_number(&pa).partial_cmp(&to_number(&pb))
+        }
+        _ => to_number(a).partial_cmp(&to_number(b)),
     }
-    let x = to_number(&pa);
-    let y = to_number(&pb);
-    x.partial_cmp(&y)
 }
 
 /// `==` の主要規則（Symbol は非対応のため考慮しない）。
