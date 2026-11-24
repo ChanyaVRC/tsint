@@ -471,6 +471,46 @@ fn string_replace_regex(
     Ok(Value::str(out))
 }
 
+/// リテラル文字列一致を走査し、各一致箇所で `on_match(before, after, out)` を呼ぶ共通ループ。
+fn run_literal_replace<E>(
+    s: &str,
+    needle: &str,
+    force_all: bool,
+    out: &mut String,
+    mut on_match: impl FnMut(&str, &str, &mut String) -> Result<(), E>,
+) -> Result<bool, E> {
+    if !force_all {
+        let Some(idx) = s.find(needle) else {
+            return Ok(false);
+        };
+        let (before, after) = (&s[..idx], &s[idx + needle.len()..]);
+        out.reserve(s.len());
+        out.push_str(before);
+        on_match(before, after, out)?;
+        out.push_str(after);
+        return Ok(true);
+    }
+    if needle.is_empty() {
+        out.reserve(s.len() * 2);
+        for (byte_i, c) in s.char_indices() {
+            on_match(&s[..byte_i], &s[byte_i..], out)?;
+            out.push(c);
+        }
+        on_match(s, "", out)?;
+        return Ok(true);
+    }
+    out.reserve(s.len());
+    let mut pos = 0usize;
+    while let Some(rel) = s[pos..].find(needle) {
+        let abs = pos + rel;
+        out.push_str(&s[pos..abs]);
+        on_match(&s[..abs], &s[abs + needle.len()..], out)?;
+        pos = abs + needle.len();
+    }
+    out.push_str(&s[pos..]);
+    Ok(true)
+}
+
 fn string_replace_literal(
     vm: &mut Vm,
     s: &str,
@@ -483,90 +523,26 @@ fn string_replace_literal(
     if !is_callable(replacement) {
         let template = value_as_cow_str(replacement);
         if !template.contains('$') {
-            if force_all {
-                if needle.is_empty() {
-                    return Ok(Value::Str(with_str_buf_rc(|out| {
-                        out.reserve(s.len() + template.len() * (s.len() + 1));
-                        for c in s.chars() {
-                            out.push_str(&template);
-                            out.push(c);
-                        }
-                        out.push_str(&template);
-                    })));
-                }
-                return Ok(Value::Str(with_str_buf_rc(|out| {
-                    out.reserve(s.len());
-                    let mut pos = 0usize;
-                    while let Some(rel) = s[pos..].find(needle.as_ref()) {
-                        let abs = pos + rel;
-                        out.push_str(&s[pos..abs]);
-                        out.push_str(&template);
-                        pos = abs + needle.len();
-                    }
-                    out.push_str(&s[pos..]);
-                })));
+            if !force_all && !s.contains(needle.as_ref()) {
+                return Ok(Value::str(s));
             }
-            return match s.find(needle.as_ref()) {
-                Some(idx) => Ok(Value::Str(with_str_buf_rc(|out| {
-                    out.reserve(s.len() - needle.len() + template.len());
-                    out.push_str(&s[..idx]);
-                    out.push_str(&template);
-                    out.push_str(&s[idx + needle.len()..]);
-                }))),
-                None => Ok(Value::str(s)),
-            };
+            return Ok(Value::Str(with_str_buf_rc(|out| {
+                let _ = run_literal_replace::<()>(s, &needle, force_all, out, |_, _, dst| {
+                    dst.push_str(&template);
+                    Ok(())
+                });
+            })));
         }
     }
-    if force_all {
-        if needle.is_empty() {
-            let mut out = String::with_capacity(s.len() * 2);
-            for (byte_i, c) in s.char_indices() {
-                append_replacement_str(
-                    vm,
-                    replacement,
-                    "",
-                    &s[..byte_i],
-                    &s[byte_i..],
-                    s,
-                    &mut out,
-                )?;
-                out.push(c);
-            }
-            append_replacement_str(vm, replacement, "", s, "", s, &mut out)?;
-            return Ok(Value::str(out));
-        }
-        let mut out = String::with_capacity(s.len());
-        let mut pos = 0usize;
-        while let Some(rel) = s[pos..].find(needle.as_ref()) {
-            let abs = pos + rel;
-            out.push_str(&s[pos..abs]);
-            append_replacement_str(
-                vm,
-                replacement,
-                &needle,
-                &s[..abs],
-                &s[abs + needle.len()..],
-                s,
-                &mut out,
-            )?;
-            pos = abs + needle.len();
-        }
-        out.push_str(&s[pos..]);
-        Ok(Value::str(out))
+    let mut out = String::new();
+    let matched = run_literal_replace(s, &needle, force_all, &mut out, |before, after, dst| {
+        append_replacement_str(vm, replacement, &needle, before, after, s, dst)
+    })?;
+    Ok(if matched {
+        Value::str(out)
     } else {
-        match s.find(needle.as_ref()) {
-            Some(idx) => {
-                let before = &s[..idx];
-                let after = &s[idx + needle.len()..];
-                let mut out = String::with_capacity(s.len());
-                out.push_str(before);
-                append_replacement_str(vm, replacement, &needle, before, after, s, &mut out)?;
-                out.push_str(after);
-                Ok(Value::str(out))
-            }
-            None => Ok(Value::str(s)),
-        }
-    }
+        Value::str(s)
+    })
 }
 
 /// `String.prototype.split(regex, limit)` 本体。

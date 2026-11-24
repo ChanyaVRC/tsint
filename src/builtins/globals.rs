@@ -335,11 +335,7 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
             matches!(arg_ref(args, 0), Value::Object(o) if matches!(o.borrow().kind, ObjKind::Array(_))),
         ))
     });
-    if let Value::Object(o) = &array_global {
-        o.borrow_mut()
-            .props
-            .set_value(Rc::from("isArray"), array_is_array);
-    }
+    set_props(&array_global, [("isArray", array_is_array)]);
     vm.define_global("Array", array_global);
 
     // `new Function(...args, body)`: 実行時に自前パーサでコンパイルする。
@@ -393,34 +389,31 @@ pub(super) fn install_errors(vm: &mut Vm) {
 // Date（現在時刻はホスト注入。VM 自体は決定的に保つ）
 // =====================================================================
 
+fn date_time_ms(this: &Value) -> f64 {
+    if let Value::Object(o) = this {
+        if let Some(PropSlot::Value(Value::Number(n))) = o.borrow().props.get("%time") {
+            return *n;
+        }
+    }
+    0.0
+}
+
 pub(super) fn install_date(vm: &mut Vm) {
     let proto: ObjRef = Rc::new(RefCell::new(ObjData::new(ObjKind::Plain)));
     let get_time = native("getTime", 0, |_vm, this, _args| {
-        if let Value::Object(o) = &this {
-            if let Some(PropSlot::Value(v)) = o.borrow().props.get("%time") {
-                return Ok(v.clone());
-            }
-        }
-        Ok(Value::Number(0.0))
+        Ok(Value::Number(date_time_ms(&this)))
     });
     let to_locale_string = native("toLocaleString", 0, |_vm, this, _args| {
-        let t = if let Value::Object(o) = &this {
-            match o.borrow().props.get("%time") {
-                Some(PropSlot::Value(Value::Number(n))) => *n,
-                _ => 0.0,
-            }
-        } else {
-            0.0
-        };
-        Ok(Value::str(format_epoch_millis(t)))
+        Ok(Value::str(format_epoch_millis(date_time_ms(&this))))
     });
-    {
-        let mut b = proto.borrow_mut();
-        b.props.set_value(Rc::from("getTime"), get_time);
-        b.props
-            .set_value(Rc::from("toLocaleString"), to_locale_string.clone());
-        b.props.set_value(Rc::from("toString"), to_locale_string);
-    }
+    set_props(
+        &Value::Object(proto.clone()),
+        [
+            ("getTime", get_time),
+            ("toLocaleString", to_locale_string.clone()),
+            ("toString", to_locale_string),
+        ],
+    );
 
     let proto_for_ctor = proto.clone();
     vm.register_native(
