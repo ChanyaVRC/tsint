@@ -11,10 +11,11 @@
 //! 拡張が自然に可能になる。
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
 use crate::bytecode::*;
+use crate::hash::{FastHashMap, FastHashSet};
 use crate::value::*;
 
 /// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。
@@ -391,7 +392,7 @@ impl Vm {
 
     /// 現在 GC 追跡リスト上で生存しているオブジェクト数を返す（テスト・診断用）。
     pub fn live_tracked_objects(&self) -> usize {
-        let mut seen = HashSet::new();
+        let mut seen = FastHashSet::default();
         self.gc_objects
             .borrow()
             .iter()
@@ -429,8 +430,10 @@ impl Vm {
     /// 戻り値は今回参照切断（回収）した循環オブジェクトの個数。
     pub fn collect_garbage(&mut self) -> usize {
         // ---- Phase 1: VM ルートからのマーク ----
-        let mut marked: HashSet<usize> = HashSet::new();
-        let mut worklist: Vec<ObjRef> = Vec::new();
+        let tracked_hint = self.gc_objects.borrow().len();
+        let mut marked: FastHashSet<usize> =
+            FastHashSet::with_capacity_and_hasher(tracked_hint.min(4096), Default::default());
+        let mut worklist: Vec<ObjRef> = Vec::with_capacity(64);
 
         for frame in &self.frames {
             gc_mark_frame(frame, &mut marked, &mut worklist);
@@ -500,9 +503,10 @@ impl Vm {
         // ---- Phase 2: 死亡済み弱参照の除去と未マーク候補の収集 ----
         let raw_weaks = std::mem::take(&mut *self.gc_objects.borrow_mut());
         let mut live_weaks: Vec<Weak<RefCell<ObjData>>> = Vec::with_capacity(raw_weaks.len());
-        let mut seen_weaks: HashSet<usize> = HashSet::with_capacity(raw_weaks.len());
+        let mut seen_weaks: FastHashSet<usize> =
+            FastHashSet::with_capacity_and_hasher(raw_weaks.len(), Default::default());
         let mut candidates: Vec<(usize, ObjRef)> = Vec::new();
-        let mut candidate_idx: HashMap<usize, usize> = HashMap::new();
+        let mut candidate_idx: FastHashMap<usize, usize> = FastHashMap::default();
 
         for w in raw_weaks {
             if let Some(rc) = w.upgrade() {
@@ -535,9 +539,9 @@ impl Vm {
 
         // 共有される中間 Rc コンテナ（FunctionObj / アップバリューセル / raw_args）は
         // 内部に持つ ObjRef の strong_count を 1 回分しか増やさないため重複排除する。
-        let mut seen_fns: HashSet<usize> = HashSet::new();
-        let mut seen_cells: HashSet<usize> = HashSet::new();
-        let mut seen_raw_args: HashSet<usize> = HashSet::new();
+        let mut seen_fns: FastHashSet<usize> = FastHashSet::default();
+        let mut seen_cells: FastHashSet<usize> = FastHashSet::default();
+        let mut seen_raw_args: FastHashSet<usize> = FastHashSet::default();
 
         for (i, (_, rc)) in candidates.iter().enumerate() {
             let Ok(b) = rc.try_borrow() else {
@@ -2361,20 +2365,20 @@ impl Default for Vm {
 // GC トレースヘルパー
 // =====================================================================
 
-fn gc_mark_obj(obj: &ObjRef, marked: &mut HashSet<usize>, worklist: &mut Vec<ObjRef>) {
+fn gc_mark_obj(obj: &ObjRef, marked: &mut FastHashSet<usize>, worklist: &mut Vec<ObjRef>) {
     let ptr = Rc::as_ptr(obj) as usize;
     if marked.insert(ptr) {
         worklist.push(obj.clone());
     }
 }
 
-fn gc_mark_value(v: &Value, marked: &mut HashSet<usize>, worklist: &mut Vec<ObjRef>) {
+fn gc_mark_value(v: &Value, marked: &mut FastHashSet<usize>, worklist: &mut Vec<ObjRef>) {
     if let Value::Object(o) = v {
         gc_mark_obj(o, marked, worklist);
     }
 }
 
-fn gc_mark_frame(frame: &Frame, marked: &mut HashSet<usize>, worklist: &mut Vec<ObjRef>) {
+fn gc_mark_frame(frame: &Frame, marked: &mut FastHashSet<usize>, worklist: &mut Vec<ObjRef>) {
     for slot in &frame.locals {
         match slot {
             LocalSlot::Direct(v) => gc_mark_value(v, marked, worklist),
@@ -2535,24 +2539,25 @@ fn gc_visit_obj_outgoing(obj: &ObjRef, f: &mut impl FnMut(&ObjRef)) {
 /// `Frame::raw_args`）はポインタ単位で重複排除して exact な参照数を保つ。
 fn gc_visit_obj_data_dedup(
     b: &ObjData,
-    seen_fns: &mut HashSet<usize>,
-    seen_cells: &mut HashSet<usize>,
-    seen_raw_args: &mut HashSet<usize>,
+    seen_fns: &mut FastHashSet<usize>,
+    seen_cells: &mut FastHashSet<usize>,
+    seen_raw_args: &mut FastHashSet<usize>,
     f: &mut impl FnMut(&ObjRef),
 ) {
-    let visit_cell =
-        |cell: &Rc<RefCell<Value>>, seen_cells: &mut HashSet<usize>, f: &mut dyn FnMut(&ObjRef)| {
-            if seen_cells.insert(Rc::as_ptr(cell) as usize) {
-                if let Ok(v) = cell.try_borrow() {
-                    if let Value::Object(o) = &*v {
-                        f(o);
-                    }
+    let visit_cell = |cell: &Rc<RefCell<Value>>,
+                      seen_cells: &mut FastHashSet<usize>,
+                      f: &mut dyn FnMut(&ObjRef)| {
+        if seen_cells.insert(Rc::as_ptr(cell) as usize) {
+            if let Ok(v) = cell.try_borrow() {
+                if let Value::Object(o) = &*v {
+                    f(o);
                 }
             }
-        };
+        }
+    };
     let visit_fn = |fo: &Rc<FunctionObj>,
-                    seen_fns: &mut HashSet<usize>,
-                    seen_cells: &mut HashSet<usize>,
+                    seen_fns: &mut FastHashSet<usize>,
+                    seen_cells: &mut FastHashSet<usize>,
                     f: &mut dyn FnMut(&ObjRef)| {
         if seen_fns.insert(Rc::as_ptr(fo) as usize) {
             for cell in fo.upvalues.iter() {

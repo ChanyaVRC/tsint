@@ -17,6 +17,7 @@ pub mod ast;
 pub mod builtins;
 pub mod bytecode;
 pub mod compiler;
+pub(crate) mod hash;
 pub mod lexer;
 pub mod module;
 pub mod parser;

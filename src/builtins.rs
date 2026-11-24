@@ -745,11 +745,7 @@ fn install_map_set_ctors(vm: &mut Vm) {
                         let pv = array_values(&pair);
                         let k = pv.first().cloned().unwrap_or(Value::Undefined);
                         let val = pv.get(1).cloned().unwrap_or(Value::Undefined);
-                        if let Some(idx) = data.find(&k) {
-                            data.entries[idx].1 = val;
-                        } else {
-                            data.entries.push((k, val));
-                        }
+                        data.set(k, val);
                     }
                 }
             }
@@ -766,9 +762,7 @@ fn install_map_set_ctors(vm: &mut Vm) {
             if let Some(it) = args.first() {
                 if !it.is_nullish() {
                     for v in vm.materialize_iter_array(it)? {
-                        if data.find(&v).is_none() {
-                            data.values.push(v);
-                        }
+                        data.add(v);
                     }
                 }
             }
@@ -1632,11 +1626,7 @@ fn map_method(name: &str) -> Option<Value> {
             let val = arg(args, 1);
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &mut o.borrow_mut().kind {
-                    if let Some(i) = m.find(&key) {
-                        m.entries[i].1 = val;
-                    } else {
-                        m.entries.push((key, val));
-                    }
+                    m.set(key, val);
                 }
             }
             Ok(this)
@@ -1654,10 +1644,7 @@ fn map_method(name: &str) -> Option<Value> {
             let key = arg(args, 0);
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &mut o.borrow_mut().kind {
-                    if let Some(i) = m.find(&key) {
-                        m.entries.remove(i);
-                        return Ok(Value::Bool(true));
-                    }
+                    return Ok(Value::Bool(m.delete(&key)));
                 }
             }
             Ok(Value::Bool(false))
@@ -1714,7 +1701,7 @@ fn map_method(name: &str) -> Option<Value> {
         "clear" => native("clear", 0, |_vm, this, _args| {
             if let Value::Object(o) = &this {
                 if let ObjKind::Map(m) = &mut o.borrow_mut().kind {
-                    m.entries.clear();
+                    m.clear();
                 }
             }
             Ok(Value::Undefined)
@@ -1731,9 +1718,7 @@ fn set_method(name: &str) -> Option<Value> {
             let v = arg(args, 0);
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &mut o.borrow_mut().kind {
-                    if s.find(&v).is_none() {
-                        s.values.push(v);
-                    }
+                    s.add(v);
                 }
             }
             Ok(this)
@@ -1751,10 +1736,7 @@ fn set_method(name: &str) -> Option<Value> {
             let v = arg(args, 0);
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &mut o.borrow_mut().kind {
-                    if let Some(i) = s.find(&v) {
-                        s.values.remove(i);
-                        return Ok(Value::Bool(true));
-                    }
+                    return Ok(Value::Bool(s.delete(&v)));
                 }
             }
             Ok(Value::Bool(false))
@@ -1786,7 +1768,7 @@ fn set_method(name: &str) -> Option<Value> {
         "clear" => native("clear", 0, |_vm, this, _args| {
             if let Value::Object(o) = &this {
                 if let ObjKind::Set(s) = &mut o.borrow_mut().kind {
-                    s.values.clear();
+                    s.clear();
                 }
             }
             Ok(Value::Undefined)
