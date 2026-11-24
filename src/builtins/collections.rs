@@ -2,9 +2,31 @@
 
 use std::rc::Rc;
 
-use super::{arg, arg_ref, native};
+use super::{arg, arg_ref, lookup_method};
 use crate::value::*;
 use crate::vm::{array_values, Vm};
+
+const MAP_METHODS: &[(&str, usize)] = &[
+    ("get", 1),
+    ("set", 2),
+    ("has", 1),
+    ("delete", 1),
+    ("keys", 0),
+    ("values", 0),
+    ("entries", 0),
+    ("forEach", 1),
+    ("clear", 0),
+];
+
+const SET_METHODS: &[(&str, usize)] = &[
+    ("add", 1),
+    ("has", 1),
+    ("delete", 1),
+    ("keys", 0),
+    ("values", 0),
+    ("forEach", 1),
+    ("clear", 0),
+];
 
 pub(super) fn install_map_set_ctors(vm: &mut Vm) {
     vm.register_native(
@@ -83,21 +105,7 @@ fn with_set_mut<T>(this: &Value, f: impl FnOnce(&mut SetData) -> T) -> Option<T>
 }
 
 pub(super) fn map_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "get" => ("get", 1),
-        "set" => ("set", 2),
-        "has" => ("has", 1),
-        "delete" => ("delete", 1),
-        "keys" => ("keys", 0),
-        "values" => ("values", 0),
-        "entries" => ("entries", 0),
-        "forEach" => ("forEach", 1),
-        "clear" => ("clear", 0),
-        _ => return None,
-    };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_map_method(vm, this, static_name, args).unwrap()
-    }))
+    lookup_method(MAP_METHODS, name, call_map_method)
 }
 
 pub(super) fn call_map_method(
@@ -171,18 +179,7 @@ pub(super) fn call_map_method(
 }
 
 pub(super) fn set_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "add" => ("add", 1),
-        "has" => ("has", 1),
-        "delete" => ("delete", 1),
-        "keys" | "values" => ("values", 0),
-        "forEach" => ("forEach", 1),
-        "clear" => ("clear", 0),
-        _ => return None,
-    };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_set_method(vm, this, static_name, args).unwrap()
-    }))
+    lookup_method(SET_METHODS, name, call_set_method)
 }
 
 pub(super) fn call_set_method(

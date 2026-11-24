@@ -33,27 +33,21 @@ impl Vm {
         })
     }
 
+    fn install_class_members(&self, target: &mut PropMap, tpl: &ClassTemplate, is_static: bool) {
+        for m in tpl.methods.iter().filter(|m| m.is_static == is_static) {
+            let fo = self.build_closure(&m.func);
+            target.set_value(m.name.clone(), self.wrap_function(fo));
+        }
+        for a in tpl.accessors.iter().filter(|a| a.is_static == is_static) {
+            let fo = self.build_closure(&a.func);
+            target.define_accessor(a.name.clone(), a.is_get, self.wrap_function(fo));
+        }
+    }
+
     pub(super) fn build_class(&mut self, tpl: &Rc<ClassTemplate>) -> Result<Value, Value> {
         let ctor = tpl.ctor.as_ref().map(|c| self.build_closure(c));
         let mut proto = ObjData::new(ObjKind::Plain);
-        for m in &tpl.methods {
-            if m.is_static {
-                continue;
-            }
-            let fo = self.build_closure(&m.func);
-            proto
-                .props
-                .set_value(m.name.clone(), self.wrap_function(fo));
-        }
-        for a in &tpl.accessors {
-            if a.is_static {
-                continue;
-            }
-            let fo = self.build_closure(&a.func);
-            proto
-                .props
-                .define_accessor(a.name.clone(), a.is_get, self.wrap_function(fo));
-        }
+        self.install_class_members(&mut proto.props, tpl, false);
         let proto_rc: ObjRef = self.alloc_obj_ref(proto);
 
         let instance_fields: InstanceFields = tpl
@@ -80,28 +74,7 @@ impl Vm {
                 .set_value(Rc::from("name"), Value::Str(tpl.name.clone()));
             cb.props
                 .set_value(Rc::from("prototype"), Value::Object(proto_rc.clone()));
-        }
-
-        for m in &tpl.methods {
-            if !m.is_static {
-                continue;
-            }
-            let fo = self.build_closure(&m.func);
-            class_rc
-                .borrow_mut()
-                .props
-                .set_value(m.name.clone(), self.wrap_function(fo));
-        }
-        for a in &tpl.accessors {
-            if !a.is_static {
-                continue;
-            }
-            let fo = self.build_closure(&a.func);
-            class_rc.borrow_mut().props.define_accessor(
-                a.name.clone(),
-                a.is_get,
-                self.wrap_function(fo),
-            );
+            self.install_class_members(&mut cb.props, tpl, true);
         }
         for (name, init) in &tpl.static_fields {
             let v = match init {
@@ -153,6 +126,40 @@ impl Vm {
         Ok(())
     }
 
+    #[inline]
+    fn invoke_js_fn_from_stack(
+        &mut self,
+        fo: Rc<FunctionObj>,
+        argc: usize,
+        slot: StackCalleeSlot,
+    ) -> Result<(), Value> {
+        if fo.is_async {
+            let (this, args) = self.pop_call_args_and_this(argc, slot);
+            let promise = self.spawn_async_task_from_function(&fo, this, &args);
+            self.put_args_buf(args);
+            self.push(promise);
+        } else {
+            self.push_frame_from_caller_stack(&fo, argc, slot);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn invoke_native_from_stack(
+        &mut self,
+        nf: NativeFn,
+        argc: usize,
+        slot: StackCalleeSlot,
+    ) -> Result<(), Value> {
+        let (this, args) = self.pop_call_args_and_this(argc, slot);
+        let res = nf(self, this, &args);
+        self.put_args_buf(args);
+        let v = res?;
+        self.track_value_tree(&v);
+        self.push(v);
+        Ok(())
+    }
+
     pub(super) fn exec_call(&mut self, argc: usize) -> Result<(), Value> {
         let caller = self.frames.last().unwrap();
         let n = caller.stack.len();
@@ -181,26 +188,8 @@ impl Vm {
             return Err(self.type_error("これは関数ではありません"));
         };
         match kind {
-            Ok(fo) => {
-                if fo.is_async {
-                    let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Present);
-                    let promise = self.spawn_async_task_from_function(&fo, this, &args);
-                    self.put_args_buf(args);
-                    self.push(promise);
-                    return Ok(());
-                }
-                self.push_frame_from_caller_stack(&fo, argc, StackCalleeSlot::Present);
-                Ok(())
-            }
-            Err(nf) => {
-                let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Present);
-                let res = nf(self, this, &args);
-                self.put_args_buf(args);
-                let v = res?;
-                self.track_value_tree(&v);
-                self.push(v);
-                Ok(())
-            }
+            Ok(fo) => self.invoke_js_fn_from_stack(fo, argc, StackCalleeSlot::Present),
+            Err(nf) => self.invoke_native_from_stack(nf, argc, StackCalleeSlot::Present),
         }
     }
 
@@ -275,24 +264,10 @@ impl Vm {
                 self.finish_method_fallback(obj, &key, args)
             }
             MethodTarget::Function(fo) => {
-                if fo.is_async {
-                    let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);
-                    let promise = self.spawn_async_task_from_function(&fo, this, &args);
-                    self.put_args_buf(args);
-                    self.push(promise);
-                    return Ok(());
-                }
-                self.push_frame_from_caller_stack(&fo, argc, StackCalleeSlot::Omitted);
-                Ok(())
+                self.invoke_js_fn_from_stack(fo, argc, StackCalleeSlot::Omitted)
             }
             MethodTarget::Native(nf) => {
-                let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);
-                let res = nf(self, this, &args);
-                self.put_args_buf(args);
-                let v = res?;
-                self.track_value_tree(&v);
-                self.push(v);
-                Ok(())
+                self.invoke_native_from_stack(nf, argc, StackCalleeSlot::Omitted)
             }
             MethodTarget::Fallback => {
                 let (obj, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);

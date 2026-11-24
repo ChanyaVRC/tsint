@@ -8,10 +8,39 @@ use super::regex::{
     regex_split, string_replace,
 };
 use super::{
-    native, norm_index, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch,
+    lookup_method, norm_index, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch,
 };
 use crate::value::*;
 use crate::vm::{ascii_char_rc, to_number, to_string_basic, with_str_buf_rc, Vm};
+
+const STRING_METHODS: &[(&str, usize)] = &[
+    ("slice", 2),
+    ("split", 2),
+    ("trim", 0),
+    ("startsWith", 1),
+    ("endsWith", 1),
+    ("includes", 1),
+    ("indexOf", 1),
+    ("replace", 2),
+    ("replaceAll", 2),
+    ("match", 1),
+    ("search", 1),
+    ("toLowerCase", 0),
+    ("toUpperCase", 0),
+    ("charCodeAt", 1),
+    ("codePointAt", 1),
+    ("repeat", 1),
+    ("padStart", 2),
+];
+
+#[inline]
+fn str_code_at(s: &str, idx: usize) -> Option<f64> {
+    if s.is_ascii() {
+        s.as_bytes().get(idx).map(|&b| b as f64)
+    } else {
+        s.chars().nth(idx).map(|c| c as u32 as f64)
+    }
+}
 
 pub fn string_get_prop(vm: &mut Vm, s: &Rc<str>, name: &str) -> Result<Value, Value> {
     if name == "length" {
@@ -41,29 +70,7 @@ pub fn string_get_prop(vm: &mut Vm, s: &Rc<str>, name: &str) -> Result<Value, Va
 }
 
 pub(super) fn string_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "slice" => ("slice", 2),
-        "split" => ("split", 2),
-        "trim" => ("trim", 0),
-        "startsWith" => ("startsWith", 1),
-        "endsWith" => ("endsWith", 1),
-        "includes" => ("includes", 1),
-        "indexOf" => ("indexOf", 1),
-        "replace" => ("replace", 2),
-        "replaceAll" => ("replaceAll", 2),
-        "match" => ("match", 1),
-        "search" => ("search", 1),
-        "toLowerCase" => ("toLowerCase", 0),
-        "toUpperCase" => ("toUpperCase", 0),
-        "charCodeAt" => ("charCodeAt", 1),
-        "codePointAt" => ("codePointAt", 1),
-        "repeat" => ("repeat", 1),
-        "padStart" => ("padStart", 2),
-        _ => return None,
-    };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_string_method(vm, this, static_name, args).unwrap()
-    }))
+    lookup_method(STRING_METHODS, name, call_string_method)
 }
 
 pub(super) fn call_string_method(
@@ -287,25 +294,15 @@ pub(super) fn call_string_method(
         })(),
         "toLowerCase" => Ok(Value::str(value_as_cow_str(&this).to_lowercase())),
         "toUpperCase" => Ok(Value::str(value_as_cow_str(&this).to_uppercase())),
-        "charCodeAt" => {
+        "charCodeAt" | "codePointAt" => {
             let s = value_as_cow_str(&this);
             let idx = to_number(args.first().unwrap_or(&Value::Undefined)) as usize;
-            let code = if s.is_ascii() {
-                s.as_bytes().get(idx).map(|&b| b as f64)
-            } else {
-                s.chars().nth(idx).map(|c| c as u32 as f64)
-            };
-            Ok(Value::Number(code.unwrap_or(f64::NAN)))
-        }
-        "codePointAt" => {
-            let s = value_as_cow_str(&this);
-            let idx = to_number(args.first().unwrap_or(&Value::Undefined)) as usize;
-            let code = if s.is_ascii() {
-                s.as_bytes().get(idx).map(|&b| Value::Number(b as f64))
-            } else {
-                s.chars().nth(idx).map(|c| Value::Number(c as u32 as f64))
-            };
-            Ok(code.unwrap_or(Value::Undefined))
+            let code = str_code_at(&s, idx);
+            Ok(match (name == "codePointAt", code) {
+                (_, Some(n)) => Value::Number(n),
+                (true, None) => Value::Undefined,
+                (false, None) => Value::Number(f64::NAN),
+            })
         }
         "repeat" => {
             let s = value_as_cow_str(&this);

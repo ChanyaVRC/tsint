@@ -2,10 +2,12 @@
 
 use std::rc::Rc;
 
-use super::{native, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch};
+use super::{lookup_method, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch};
 use crate::regex::RegexScratch;
 use crate::value::*;
 use crate::vm::{is_callable, to_number, with_str_buf_rc, Vm};
+
+const REGEX_METHODS: &[(&str, usize)] = &[("test", 1), ("exec", 1), ("toString", 0)];
 
 thread_local! {
     static KEY_LAST_INDEX: Rc<str> = Rc::from("lastIndex");
@@ -145,15 +147,17 @@ fn exec_regex_stateful<R>(
 }
 
 pub(super) fn regex_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "test" => ("test", 1),
-        "exec" => ("exec", 1),
-        "toString" => ("toString", 0),
-        _ => return None,
+    lookup_method(REGEX_METHODS, name, call_regex_method)
+}
+
+fn extract_regex_receiver(this: &Value) -> Option<(&ObjRef, Rc<crate::regex::Regex>)> {
+    let Value::Object(o) = this else {
+        return None;
     };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_regex_method(vm, this, static_name, args).unwrap()
-    }))
+    match &o.borrow().kind {
+        ObjKind::Regex(r) => Some((o, r.clone())),
+        _ => None,
+    }
 }
 
 pub(super) fn call_regex_method(
@@ -163,25 +167,17 @@ pub(super) fn call_regex_method(
     args: &[Value],
 ) -> Option<Result<Value, Value>> {
     Some(match name {
-        "test" => (|| {
+        "test" => {
             let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            let Value::Object(o) = &this else {
-                return Ok(Value::Bool(false));
-            };
-            let re = match &o.borrow().kind {
-                ObjKind::Regex(r) => r.clone(),
-                _ => return Ok(Value::Bool(false)),
+            let Some((o, re)) = extract_regex_receiver(&this) else {
+                return Some(Ok(Value::Bool(false)));
             };
             exec_regex_stateful(vm, o, &re, &s, |_, mat, _| Value::Bool(mat.is_some()))
-        })(),
-        "exec" => (|| {
+        }
+        "exec" => {
             let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            let Value::Object(o) = &this else {
-                return Err(vm.type_error("RegExp ではありません"));
-            };
-            let re = match &o.borrow().kind {
-                ObjKind::Regex(r) => r.clone(),
-                _ => return Err(vm.type_error("RegExp ではありません")),
+            let Some((o, re)) = extract_regex_receiver(&this) else {
+                return Some(Err(vm.type_error("RegExp ではありません")));
             };
             exec_regex_stateful(vm, o, &re, &s, |chars, mat, scratch| match mat {
                 Some((start, end)) => build_match_array_from_scratch(
@@ -195,7 +191,7 @@ pub(super) fn call_regex_method(
                 ),
                 None => Value::Null,
             })
-        })(),
+        }
         "toString" => Ok(Value::str(vm.to_display_string(&this))),
         _ => return None,
     })

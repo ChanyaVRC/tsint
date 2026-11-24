@@ -2,9 +2,29 @@
 
 use std::borrow::Cow;
 
-use super::{arg, native, norm_index};
+use super::{arg, lookup_method, norm_index};
 use crate::value::*;
 use crate::vm::{array_values, Vm};
+
+const ARRAY_METHODS: &[(&str, usize)] = &[
+    ("push", 1),
+    ("pop", 0),
+    ("shift", 0),
+    ("unshift", 1),
+    ("slice", 2),
+    ("splice", 2),
+    ("join", 1),
+    ("indexOf", 1),
+    ("includes", 1),
+    ("concat", 1),
+    ("map", 1),
+    ("filter", 1),
+    ("forEach", 1),
+    ("find", 1),
+    ("flatMap", 1),
+    ("some", 1),
+    ("every", 1),
+];
 
 #[inline]
 fn with_array_ref<T>(this: &Value, f: impl FnOnce(&[Value]) -> T) -> Option<T> {
@@ -27,29 +47,7 @@ fn with_array_mut<T>(this: &Value, f: impl FnOnce(&mut Vec<Value>) -> T) -> Opti
 }
 
 pub(super) fn array_method(name: &str) -> Option<Value> {
-    let (static_name, arity): (&'static str, usize) = match name {
-        "push" => ("push", 1),
-        "pop" => ("pop", 0),
-        "shift" => ("shift", 0),
-        "unshift" => ("unshift", 1),
-        "slice" => ("slice", 2),
-        "splice" => ("splice", 2),
-        "join" => ("join", 1),
-        "indexOf" => ("indexOf", 1),
-        "includes" => ("includes", 1),
-        "concat" => ("concat", 1),
-        "map" => ("map", 1),
-        "filter" => ("filter", 1),
-        "forEach" => ("forEach", 1),
-        "find" => ("find", 1),
-        "flatMap" => ("flatMap", 1),
-        "some" => ("some", 1),
-        "every" => ("every", 1),
-        _ => return None,
-    };
-    Some(native(static_name, arity, move |vm, this, args| {
-        call_array_method(vm, this, static_name, args).unwrap()
-    }))
+    lookup_method(ARRAY_METHODS, name, call_array_method)
 }
 
 pub(super) fn call_array_method(

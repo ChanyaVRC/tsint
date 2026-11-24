@@ -37,31 +37,11 @@ impl Vm {
             }
             self.track_object(&obj);
             if let Ok(b) = obj.try_borrow() {
-                let mut push_untracked = |child: &ObjRef| {
+                gc_visit_obj_data(&b, None, &mut |child| {
                     if Rc::weak_count(child) == 0 {
                         stack.push(child.clone());
                     }
-                };
-                gc_visit_props_and_proto(&b, &mut push_untracked);
-                match &b.kind {
-                    ObjKind::Array(items) => {
-                        for it in items {
-                            gc_visit_value(it, &mut push_untracked);
-                        }
-                    }
-                    ObjKind::Map(m) => {
-                        for (k, val) in &m.entries {
-                            gc_visit_value(k, &mut push_untracked);
-                            gc_visit_value(val, &mut push_untracked);
-                        }
-                    }
-                    ObjKind::Set(s) => {
-                        for val in &s.values {
-                            gc_visit_value(val, &mut push_untracked);
-                        }
-                    }
-                    _ => {}
-                }
+                });
             }
         }
     }

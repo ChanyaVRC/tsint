@@ -333,6 +333,51 @@ impl Vm {
     }
 
     #[inline]
+    fn acquire_pooled_frame(&mut self, fo: &Rc<FunctionObj>) -> Frame {
+        if let Some(mut frame) = self.frame_pool.pop() {
+            frame.chunk = fo.chunk.clone();
+            frame.ip = 0;
+            frame.upvalues = fo.upvalues.clone();
+            frame.stack.clear();
+            frame.reinit_locals();
+            frame
+        } else {
+            Frame::new(
+                fo.chunk.clone(),
+                fo.upvalues.clone(),
+                self.empty_args.clone(),
+            )
+        }
+    }
+
+    #[inline]
+    fn fill_frame_raw_args(
+        &mut self,
+        frame: &mut Frame,
+        needs_raw: bool,
+        fill: impl FnOnce(&mut Vec<Value>),
+    ) {
+        if needs_raw {
+            if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
+                if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                    v.clear();
+                    fill(v);
+                    return;
+                }
+            }
+            let mut v = self.take_args_buf();
+            fill(&mut v);
+            frame.raw_args = Rc::new(v);
+        } else if !frame.raw_args.is_empty() {
+            if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                v.clear();
+            } else {
+                frame.raw_args = self.empty_args.clone();
+            }
+        }
+    }
+
+    #[inline]
     pub(super) fn acquire_frame_from_slice(
         &mut self,
         f: &Rc<FunctionObj>,
@@ -340,43 +385,8 @@ impl Vm {
         args: &[Value],
     ) -> Frame {
         let needs_raw = f.chunk.needs_raw_args && !args.is_empty();
-        let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
-            frame.chunk = f.chunk.clone();
-            frame.ip = 0;
-            frame.upvalues = f.upvalues.clone();
-            frame.stack.clear();
-            if needs_raw {
-                if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
-                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
-                        v.clear();
-                        v.extend_from_slice(args);
-                    } else {
-                        let mut v = self.take_args_buf();
-                        v.extend_from_slice(args);
-                        frame.raw_args = Rc::new(v);
-                    }
-                } else {
-                    let mut v = self.take_args_buf();
-                    v.extend_from_slice(args);
-                    frame.raw_args = Rc::new(v);
-                }
-            } else if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
-                v.clear();
-            } else {
-                frame.raw_args = self.empty_args.clone();
-            }
-            frame.reinit_locals();
-            frame
-        } else {
-            let raw_args = if needs_raw {
-                let mut v = self.take_args_buf();
-                v.extend_from_slice(args);
-                Rc::new(v)
-            } else {
-                self.empty_args.clone()
-            };
-            Frame::new(f.chunk.clone(), f.upvalues.clone(), raw_args)
-        };
+        let mut frame = self.acquire_pooled_frame(f);
+        self.fill_frame_raw_args(&mut frame, needs_raw, |v| v.extend_from_slice(args));
         let param_base = if !f.is_arrow && !frame.locals.is_empty() {
             frame.locals[0].set(this);
             1usize
@@ -399,27 +409,13 @@ impl Vm {
         callee_slot: StackCalleeSlot,
     ) {
         let needs_raw = fo.chunk.needs_raw_args && argc > 0;
-        let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
-            frame.chunk = fo.chunk.clone();
-            frame.ip = 0;
-            frame.upvalues = fo.upvalues.clone();
-            frame.stack.clear();
-            frame.reinit_locals();
-            frame
-        } else {
-            Frame::new(
-                fo.chunk.clone(),
-                fo.upvalues.clone(),
-                self.empty_args.clone(),
-            )
-        };
+        let mut frame = self.acquire_pooled_frame(fo);
         let sp = fo.chunk.simple_param_count as usize;
         let param_base = usize::from(!fo.is_arrow && !frame.locals.is_empty());
 
         let this = {
             let caller = self.frames.last_mut().unwrap();
-            let n = caller.stack.len();
-            let arg_start = n - argc;
+            let arg_start = caller.stack.len() - argc;
             if needs_raw {
                 let mut reused = false;
                 if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {

@@ -169,6 +169,7 @@ pub fn number_to_js_string(n: f64) -> String {
 }
 
 pub(crate) fn to_string_into(v: &Value, out: &mut String) {
+    use std::fmt::Write;
     match v {
         Value::Str(s) => out.push_str(s),
         Value::Number(n) => number_to_js_string_into(*n, out),
@@ -188,40 +189,15 @@ pub(crate) fn to_string_into(v: &Value, out: &mut String) {
                         }
                     }
                 }
-                _ => {
-                    drop(b);
-                    out.push_str(&to_string_basic(v));
+                ObjKind::Function(f) => {
+                    let _ = write!(out, "function {}() {{ [native code] }}", f.name);
                 }
-            }
-        }
-    }
-}
-
-pub fn to_string_basic(v: &Value) -> String {
-    match v {
-        Value::Undefined | Value::Uninit => "undefined".to_string(),
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-        Value::Number(n) => number_to_js_string(*n),
-        Value::Str(s) => s.to_string(),
-        Value::Object(o) => {
-            let b = o.borrow();
-            match &b.kind {
-                ObjKind::Array(items) => {
-                    let mut out = String::new();
-                    for (i, it) in items.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
-                            to_string_into(it, &mut out);
-                        }
-                    }
-                    out
+                ObjKind::Native(n) => {
+                    let _ = write!(out, "function {}() {{ [native code] }}", n.name);
                 }
-                ObjKind::Function(f) => format!("function {}() {{ [native code] }}", f.name),
-                ObjKind::Native(n) => format!("function {}() {{ [native code] }}", n.name),
-                ObjKind::Class(c) => format!("class {} {{ }}", c.name),
+                ObjKind::Class(c) => {
+                    let _ = write!(out, "class {} {{ }}", c.name);
+                }
                 ObjKind::Error => {
                     let name = match b.props.get("name") {
                         Some(PropSlot::Value(Value::Str(s))) => &**s,
@@ -231,26 +207,43 @@ pub fn to_string_basic(v: &Value) -> String {
                         Some(PropSlot::Value(Value::Str(s))) => &**s,
                         _ => "",
                     };
-                    if msg.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{name}: {msg}")
+                    out.push_str(name);
+                    if !msg.is_empty() {
+                        out.push_str(": ");
+                        out.push_str(msg);
                     }
                 }
-                ObjKind::Regex(re) => format!("/{}/{}", re.source, re.flags),
-                ObjKind::Map(_) => "[object Map]".to_string(),
-                ObjKind::Set(_) => "[object Set]".to_string(),
-                ObjKind::Plain => "[object Object]".to_string(),
+                ObjKind::Regex(re) => {
+                    let _ = write!(out, "/{}/{}", re.source, re.flags);
+                }
+                ObjKind::Map(_) => out.push_str("[object Map]"),
+                ObjKind::Set(_) => out.push_str("[object Set]"),
+                ObjKind::Plain => out.push_str("[object Object]"),
                 ObjKind::Promise(pd) => match &pd.state {
-                    PromiseState::Pending => "Promise { <pending> }".to_string(),
-                    PromiseState::Fulfilled(v) => format!("Promise {{ {} }}", to_string_basic(v)),
+                    PromiseState::Pending => out.push_str("Promise { <pending> }"),
+                    PromiseState::Fulfilled(v) => {
+                        out.push_str("Promise { ");
+                        to_string_into(v, out);
+                        out.push_str(" }");
+                    }
                     PromiseState::Rejected(v) => {
-                        format!("Promise {{ <rejected> {} }}", to_string_basic(v))
+                        out.push_str("Promise { <rejected> ");
+                        to_string_into(v, out);
+                        out.push_str(" }");
                     }
                 },
             }
         }
     }
+}
+
+pub fn to_string_basic(v: &Value) -> String {
+    if let Value::Str(s) = v {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    to_string_into(v, &mut out);
+    out
 }
 
 pub fn to_property_key_string(v: &Value) -> String {
