@@ -4,10 +4,8 @@ use std::rc::Rc;
 
 use super::{native, value_as_cow_str};
 use crate::value::*;
-use crate::vm::{number_to_js_string_into, Vm};
+use crate::vm::{number_to_js_string_into, with_str_buf_rc, Vm};
 
-/// `JSON.stringify` の初期出力バッファ容量。
-const STRINGIFY_INITIAL_CAP: usize = 128;
 /// `f64` で正確に表現できる JSON 整数桁数の高速パス上限。
 const FAST_INT_MAX_DIGITS: usize = 15;
 
@@ -19,9 +17,12 @@ pub(super) fn install_json(vm: &mut Vm) {
             _ => 0,
         };
         let target = args.first().unwrap_or(&Value::Undefined);
-        let mut out = String::with_capacity(STRINGIFY_INITIAL_CAP);
-        if json_stringify_into(target, indent, 0, &mut out) {
-            Ok(Value::str(out))
+        let mut ok = false;
+        let rc = with_str_buf_rc(|out| {
+            ok = json_stringify_into(target, indent, 0, out);
+        });
+        if ok {
+            Ok(Value::Str(rc))
         } else {
             Ok(Value::Undefined)
         }

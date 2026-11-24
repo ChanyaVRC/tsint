@@ -8,7 +8,7 @@ use crate::value::*;
 
 use super::ops::{
     array_values, js_add, js_compare, loose_eq, to_int32, to_number, to_property_key_string,
-    to_string_basic, to_string_into, to_uint32,
+    to_string_into, to_uint32, with_str_buf_rc,
 };
 use super::{ascii_char_rc, LocalSlot, RunOutcome, Vm};
 
@@ -543,18 +543,19 @@ impl Vm {
                         OpCode::ToStringOp => {
                             let a = frame.stack.last_mut().expect("オペランドスタックが空です");
                             if !matches!(a, Value::Str(_)) {
-                                *a = Value::Str(to_string_basic(a).into());
+                                *a = Value::Str(with_str_buf_rc(|buf| to_string_into(a, buf)));
                             }
                         }
                         OpCode::ConcatStrings(count) => {
                             let cnt = count as usize;
                             let start = frame.stack.len() - cnt;
-                            let mut buf = String::new();
-                            for v in &frame.stack[start..] {
-                                to_string_into(v, &mut buf);
-                            }
+                            let rc = with_str_buf_rc(|buf| {
+                                for v in &frame.stack[start..] {
+                                    to_string_into(v, buf);
+                                }
+                            });
                             frame.stack.truncate(start);
-                            frame.stack.push(Value::Str(buf.into()));
+                            frame.stack.push(Value::Str(rc));
                         }
 
                         // --- 制御フロー・融合比較ジャンプ ---

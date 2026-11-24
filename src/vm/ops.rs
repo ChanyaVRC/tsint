@@ -96,6 +96,33 @@ pub fn to_primitive(v: &Value) -> Value {
 
 /// 整数フォーマット高速パスを使う `f64` の絶対値上限（`i64` キャストで精度欠落しない範囲）。
 const FAST_INT_FORMAT_LIMIT: f64 = 1e15;
+/// スレッドローカル文字列スクラッチの上限容量（これを超えたら縮める）。
+const MAX_STR_SCRATCH_CAP: usize = 64 * 1024;
+
+thread_local! {
+    static STR_SCRATCH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// 再利用可能なスレッドローカル `String` バッファへ書き込み、単一アロケーションで `Rc<str>` を生成する。
+#[inline]
+pub(crate) fn with_str_buf_rc(f: impl FnOnce(&mut String)) -> Rc<str> {
+    STR_SCRATCH.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            f(&mut buf);
+            let out = Rc::from(buf.as_str());
+            if buf.capacity() > MAX_STR_SCRATCH_CAP {
+                buf.clear();
+                buf.shrink_to(MAX_STR_SCRATCH_CAP);
+            }
+            out
+        } else {
+            let mut local = String::new();
+            f(&mut local);
+            Rc::from(local.as_str())
+        }
+    })
+}
 
 pub(crate) fn number_to_js_string_into(n: f64, out: &mut String) {
     use std::fmt::Write;
@@ -238,32 +265,26 @@ pub fn to_property_key_string(v: &Value) -> String {
 pub(super) fn js_add(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => Value::Number(*x + *y),
-        (Value::Str(x), Value::Str(y)) => {
-            let mut buf = String::with_capacity(x.len() + y.len());
+        (Value::Str(x), Value::Str(y)) => Value::Str(with_str_buf_rc(|buf| {
             buf.push_str(x);
             buf.push_str(y);
-            Value::Str(buf.into())
-        }
-        (Value::Str(x), other) => {
-            let mut buf = String::with_capacity(x.len() + 16);
+        })),
+        (Value::Str(x), other) => Value::Str(with_str_buf_rc(|buf| {
             buf.push_str(x);
-            to_string_into(other, &mut buf);
-            Value::Str(buf.into())
-        }
-        (other, Value::Str(y)) => {
-            let mut buf = String::with_capacity(y.len() + 16);
-            to_string_into(other, &mut buf);
+            to_string_into(other, buf);
+        })),
+        (other, Value::Str(y)) => Value::Str(with_str_buf_rc(|buf| {
+            to_string_into(other, buf);
             buf.push_str(y);
-            Value::Str(buf.into())
-        }
+        })),
         (Value::Object(_), _) | (_, Value::Object(_)) => {
             let pa = to_primitive(a);
             let pb = to_primitive(b);
             if matches!(pa, Value::Str(_)) || matches!(pb, Value::Str(_)) {
-                let mut buf = String::new();
-                to_string_into(&pa, &mut buf);
-                to_string_into(&pb, &mut buf);
-                Value::Str(buf.into())
+                Value::Str(with_str_buf_rc(|buf| {
+                    to_string_into(&pa, buf);
+                    to_string_into(&pb, buf);
+                }))
             } else {
                 Value::Number(to_number(&pa) + to_number(&pb))
             }

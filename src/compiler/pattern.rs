@@ -290,12 +290,12 @@ impl Compiler {
             }
             match m.kind {
                 ClassMemberKind::Constructor => {
-                    let f = m.function.as_ref().unwrap();
+                    let f = m.function.as_deref().unwrap();
                     let tpl = self.compile_function(f, "constructor")?;
                     ctor_tpl = Some(Rc::new(tpl));
                 }
                 ClassMemberKind::Method => {
-                    let f = m.function.as_ref().unwrap();
+                    let f = m.function.as_deref().unwrap();
                     let tpl = self.compile_function(f, &mname)?;
                     methods.push(ClassMethodTemplate {
                         name: Rc::from(mname.as_ref()),
@@ -304,7 +304,7 @@ impl Compiler {
                     });
                 }
                 ClassMemberKind::Getter | ClassMemberKind::Setter => {
-                    let f = m.function.as_ref().unwrap();
+                    let f = m.function.as_deref().unwrap();
                     let tpl = self.compile_function(f, &mname)?;
                     accessors.push(ClassAccessorTemplate {
                         name: Rc::from(mname.as_ref()),

@@ -36,6 +36,44 @@ impl From<LexError> for ParseError {
 
 pub(crate) type PResult<T> = Result<T, ParseError>;
 
+/// 0/1/2 要素のリストを余剰キャパシティ・再確保なしで `Box<[T]>` へ確定するステージングバッファ。
+pub(crate) enum SmallStage<T> {
+    Empty,
+    One(T),
+    Two(T, T),
+    Many(Vec<T>),
+}
+
+impl<T> SmallStage<T> {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        SmallStage::Empty
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, item: T) {
+        match std::mem::replace(self, SmallStage::Empty) {
+            SmallStage::Empty => *self = SmallStage::One(item),
+            SmallStage::One(a) => *self = SmallStage::Two(a, item),
+            SmallStage::Two(a, b) => *self = SmallStage::Many(vec![a, b, item]),
+            SmallStage::Many(mut v) => {
+                v.push(item);
+                *self = SmallStage::Many(v);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_boxed_slice(self) -> Box<[T]> {
+        match self {
+            SmallStage::Empty => Box::new([]),
+            SmallStage::One(a) => Box::new([a]),
+            SmallStage::Two(a, b) => Box::new([a, b]),
+            SmallStage::Many(v) => v.into_boxed_slice(),
+        }
+    }
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -45,6 +83,9 @@ pub struct Parser {
     /// ネストしたジェネリクス (`Foo<Bar<Baz>>`) をレキサ側でトークン分割
     /// せずに扱うための簡易な帳尻合わせ。
     pending_angle_closes: i32,
+    /// 投機的パース（`begin_speculate`）のネスト深さ。0 のときは現在トークンの
+    /// `String` をクローンせず `std::mem::take` で AST へ直接ムーブできる。
+    speculative_depth: u32,
 }
 
 impl Parser {
@@ -55,6 +96,7 @@ impl Parser {
             pos: 0,
             next_id: 0,
             pending_angle_closes: 0,
+            speculative_depth: 0,
         })
     }
 
@@ -90,12 +132,21 @@ impl Parser {
     }
 
     #[inline]
-    fn save(&self) -> usize {
+    fn begin_speculate(&mut self) -> usize {
+        self.speculative_depth += 1;
         self.pos
     }
 
     #[inline]
-    fn restore(&mut self, mark: usize) {
+    fn commit_speculate(&mut self) {
+        debug_assert!(self.speculative_depth > 0);
+        self.speculative_depth -= 1;
+    }
+
+    #[inline]
+    fn abort_speculate(&mut self, mark: usize) {
+        debug_assert!(self.speculative_depth > 0);
+        self.speculative_depth -= 1;
         self.pos = mark;
     }
 
@@ -183,23 +234,89 @@ impl Parser {
         }
     }
 
-    fn ident_name(&self) -> Option<String> {
-        match &self.cur().kind {
-            TokenKind::Ident(s) => Some(s.clone()),
-            _ => None,
-        }
+    /// 現在トークンが識別子なら消費して名前を取り出す（非投機時はゼロコピーでムーブ）。
+    #[inline]
+    fn bump_ident(&mut self) -> Option<String> {
+        let idx = self.pos.min(self.tokens.len() - 1);
+        let name = match &mut self.tokens[idx].kind {
+            TokenKind::Ident(s) => {
+                if self.speculative_depth == 0 {
+                    std::mem::take(s)
+                } else {
+                    s.clone()
+                }
+            }
+            _ => return None,
+        };
+        self.bump();
+        Some(name)
+    }
+
+    /// 現在トークンが文字列リテラルなら消費して中身を取り出す（非投機時はゼロコピーでムーブ）。
+    #[inline]
+    fn bump_str(&mut self) -> Option<String> {
+        let idx = self.pos.min(self.tokens.len() - 1);
+        let s = match &mut self.tokens[idx].kind {
+            TokenKind::Str(s) => {
+                if self.speculative_depth == 0 {
+                    std::mem::take(s)
+                } else {
+                    s.clone()
+                }
+            }
+            _ => return None,
+        };
+        self.bump();
+        Some(s)
+    }
+
+    /// 現在トークンがテンプレート断片なら消費して中身を取り出す（非投機時はゼロコピーでムーブ）。
+    #[inline]
+    fn bump_template_str(&mut self) -> String {
+        let idx = self.pos.min(self.tokens.len() - 1);
+        let s = match &mut self.tokens[idx].kind {
+            TokenKind::NoSubTemplate(s)
+            | TokenKind::TemplateHead(s)
+            | TokenKind::TemplateMiddle(s)
+            | TokenKind::TemplateTail(s) => {
+                if self.speculative_depth == 0 {
+                    std::mem::take(s)
+                } else {
+                    s.clone()
+                }
+            }
+            _ => unreachable!("テンプレート断片トークンを期待しました"),
+        };
+        self.bump();
+        s
+    }
+
+    /// 現在トークンが正規表現リテラルなら消費して `(pattern, flags)` を取り出す。
+    #[inline]
+    fn bump_regex(&mut self) -> (String, String) {
+        let idx = self.pos.min(self.tokens.len() - 1);
+        let pair = match &mut self.tokens[idx].kind {
+            TokenKind::Regex(re) => {
+                if self.speculative_depth == 0 {
+                    (
+                        std::mem::take(&mut re.pattern),
+                        std::mem::take(&mut re.flags),
+                    )
+                } else {
+                    (re.pattern.clone(), re.flags.clone())
+                }
+            }
+            _ => unreachable!("正規表現トークンを期待しました"),
+        };
+        self.bump();
+        pair
     }
 
     /// 識別子（束縛名として使うためのもの。ほとんどの TS 文脈キーワードは
     /// 予約語ではないのでこれで受理してよい）を読む。
     fn parse_binding_ident(&mut self) -> PResult<String> {
-        match self.ident_name() {
-            Some(s) => {
-                self.bump();
-                Ok(s)
-            }
-            None => Err(self.err("識別子を期待しました")),
-        }
+        self.bump_ident()
+            .ok_or_else(|| self.err("識別子を期待しました"))
     }
 
     /// ASI: 文の区切りとして `;` を読む。無ければ、直前に改行があるか

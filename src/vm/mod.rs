@@ -28,7 +28,7 @@ pub use ops::{
     array_values, is_callable, loose_eq, new_regex_value, number_to_js_string, to_int32, to_number,
     to_primitive, to_property_key_string, to_string_basic, to_uint32,
 };
-pub(crate) use ops::{number_to_js_string_into, to_string_into};
+pub(crate) use ops::{number_to_js_string_into, to_string_into, with_str_buf_rc};
 pub(crate) use props::own_enumerable_keys;
 
 /// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。

@@ -1,6 +1,6 @@
 //! 分割代入パターン（変数宣言・関数引数・catch 節・for-of/in の左辺で共有）。
 
-use super::{PResult, Parser};
+use super::{PResult, Parser, SmallStage};
 use crate::ast::*;
 use crate::lexer::Punct;
 
@@ -35,7 +35,7 @@ impl Parser {
 
     fn parse_object_pattern(&mut self) -> PResult<Pattern> {
         self.expect_punct(Punct::LBrace)?;
-        let mut props = Vec::new();
+        let mut props = SmallStage::new();
         let mut rest = None;
         while !self.is_punct(Punct::RBrace) {
             if self.eat_punct(Punct::DotDotDot) {
@@ -77,12 +77,15 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RBrace)?;
-        Ok(Pattern::Object { props, rest })
+        Ok(Pattern::Object {
+            props: props.into_boxed_slice(),
+            rest,
+        })
     }
 
     fn parse_array_pattern(&mut self) -> PResult<Pattern> {
         self.expect_punct(Punct::LBracket)?;
-        let mut elements = Vec::new();
+        let mut elements = SmallStage::new();
         let mut rest = None;
         while !self.is_punct(Punct::RBracket) {
             if self.is_punct(Punct::Comma) {
@@ -100,7 +103,10 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RBracket)?;
-        Ok(Pattern::Array { elements, rest })
+        Ok(Pattern::Array {
+            elements: elements.into_boxed_slice(),
+            rest,
+        })
     }
 
     /// プロパティキー（分割代入・オブジェクトリテラル共通）。
@@ -110,23 +116,16 @@ impl Parser {
             self.expect_punct(Punct::RBracket)?;
             return Ok(PropertyKey::Computed(Box::new(e)));
         }
-        match &self.cur().kind {
-            crate::lexer::TokenKind::Str(s) => {
-                let s = s.clone();
-                self.bump();
-                Ok(PropertyKey::Str(s))
-            }
-            crate::lexer::TokenKind::Number(n) => {
-                let n = *n;
-                self.bump();
-                Ok(PropertyKey::Num(n))
-            }
-            crate::lexer::TokenKind::Ident(name) => {
-                let name = name.clone();
-                self.bump();
-                Ok(PropertyKey::Ident(name))
-            }
-            _ => Err(self.err("プロパティ名が必要です")),
+        if let Some(s) = self.bump_str() {
+            return Ok(PropertyKey::Str(s));
         }
+        if let crate::lexer::TokenKind::Number(n) = self.cur().kind {
+            self.bump();
+            return Ok(PropertyKey::Num(n));
+        }
+        if let Some(name) = self.bump_ident() {
+            return Ok(PropertyKey::Ident(name));
+        }
+        Err(self.err("プロパティ名が必要です"))
     }
 }

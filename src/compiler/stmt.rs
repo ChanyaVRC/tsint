@@ -144,7 +144,7 @@ impl Compiler {
                 block,
                 handler,
                 finalizer,
-            } => self.compile_try(block, handler.as_ref(), finalizer.as_deref(), line)?,
+            } => self.compile_try(block, handler.as_deref(), finalizer.as_deref(), line)?,
             StmtKind::Throw(e) => {
                 self.compile_expr(e)?;
                 self.emit(OpCode::Throw, line);

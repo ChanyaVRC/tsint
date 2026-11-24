@@ -159,10 +159,10 @@ fn const_decl(name: &str, init: Expr, line: u32) -> Stmt {
         span: line_span(line),
         kind: StmtKind::VarDecl {
             kind: VarKind::Const,
-            decls: vec![VarDeclarator {
+            decls: Box::new([VarDeclarator {
                 name: ast::Pattern::Ident(name.to_string()),
                 init: Some(Box::new(init)),
-            }],
+            }]),
         },
     }
 }
@@ -174,10 +174,10 @@ fn export_named(name: &str, line: u32) -> Stmt {
         id: 0,
         span: line_span(line),
         kind: StmtKind::ExportNamed {
-            specifiers: vec![ast::ExportSpecifier::Named {
+            specifiers: Box::new([ast::ExportSpecifier::Named {
                 local: name.to_string(),
                 exported: name.to_string(),
-            }],
+            }]),
             source: None,
             type_only: false,
         },
@@ -251,10 +251,10 @@ impl<'i, 'h> Loader<'i, 'h> {
             id: 0,
             span: line_span(line),
             kind: StmtKind::ExportNamed {
-                specifiers: vec![ast::ExportSpecifier::Named {
+                specifiers: Box::new([ast::ExportSpecifier::Named {
                     local: tmp,
                     exported,
-                }],
+                }]),
                 source: None,
                 type_only: false,
             },
@@ -354,7 +354,7 @@ impl<'i, 'h> Loader<'i, 'h> {
                 }
                 let resolved = self.resolve(&src, referrer)?;
                 let ns_name = self.load_dependency(&resolved)?;
-                for spec in specifiers {
+                for spec in specifiers.into_vec() {
                     let ast::ExportSpecifier::Named { local, exported } = spec;
                     self.push_reexport(out, &ns_name, &local, exported, line);
                 }

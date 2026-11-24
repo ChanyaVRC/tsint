@@ -12,6 +12,12 @@
 
 use crate::ast::{Pos, Span};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegexToken {
+    pub pattern: String,
+    pub flags: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Ident(String),
@@ -25,10 +31,7 @@ pub enum TokenKind {
     TemplateMiddle(String),
     /// `` }...` `` — 末尾断片。
     TemplateTail(String),
-    Regex {
-        pattern: String,
-        flags: String,
-    },
+    Regex(Box<RegexToken>),
     Punct(Punct),
     Eof,
 }
@@ -174,7 +177,7 @@ fn regex_allowed_after(kind: &TokenKind) -> bool {
         | TokenKind::Str(_)
         | TokenKind::NoSubTemplate(_)
         | TokenKind::TemplateTail(_)
-        | TokenKind::Regex { .. } => false,
+        | TokenKind::Regex(_) => false,
         TokenKind::Punct(p) => !matches!(
             p,
             Punct::RParen | Punct::RBracket | Punct::PlusPlus | Punct::MinusMinus
@@ -789,10 +792,10 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
-                    return Ok(TokenKind::Regex {
+                    return Ok(TokenKind::Regex(Box::new(RegexToken {
                         pattern: self.src[pat_start..pat_end].to_owned(),
                         flags: self.src[flags_start..self.pos].to_owned(),
-                    });
+                    })));
                 }
                 Some(_) => {
                     self.advance_char();

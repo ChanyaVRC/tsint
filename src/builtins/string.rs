@@ -4,14 +4,14 @@ use std::borrow::Cow;
 use std::rc::Rc;
 
 use super::regex::{
-    as_regex, build_match_array, coerce_to_regex, next_search_pos, regex_err, regex_split,
-    string_replace,
+    as_regex, build_match_array_from_scratch, coerce_to_regex, next_search_pos, regex_err,
+    regex_split, string_replace,
 };
 use super::{
-    chars_slice_to_val, native, norm_index, value_as_cow_str, with_chars_buf, with_regex_scratch,
+    native, norm_index, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch,
 };
 use crate::value::*;
-use crate::vm::{ascii_char_rc, to_number, to_string_basic, Vm};
+use crate::vm::{ascii_char_rc, to_number, to_string_basic, with_str_buf_rc, Vm};
 
 pub fn string_get_prop(vm: &mut Vm, s: &Rc<str>, name: &str) -> Result<Value, Value> {
     if name == "length" {
@@ -233,17 +233,14 @@ pub(super) fn call_string_method(
                     let mut out = vec![];
                     let mut from = 0usize;
                     with_regex_scratch(|scratch| -> Result<(), Value> {
-                        loop {
-                            if from > chars.len() {
-                                break;
-                            }
+                        while from <= chars.len() {
                             match re
-                                .search_with_scratch(chars, from, scratch)
+                                .find_with_scratch(chars, from, scratch)
                                 .map_err(|e| regex_err(vm, e))?
                             {
-                                Some(mat) => {
-                                    out.push(chars_slice_to_val(&chars[mat.start..mat.end]));
-                                    from = next_search_pos(&mat);
+                                Some((start, end)) => {
+                                    out.push(slice_to_val(&s, chars, start, end));
+                                    from = next_search_pos(start, end);
                                 }
                                 None => break,
                             }
@@ -256,12 +253,23 @@ pub(super) fn call_string_method(
                         Ok(vm.alloc_array(out))
                     }
                 } else {
-                    match with_regex_scratch(|scratch| re.search_with_scratch(chars, 0, scratch))
-                        .map_err(|e| regex_err(vm, e))?
-                    {
-                        Some(mat) => Ok(build_match_array(vm, chars, &mat, &s)),
-                        None => Ok(Value::Null),
-                    }
+                    with_regex_scratch(|scratch| {
+                        match re
+                            .find_with_scratch(chars, 0, scratch)
+                            .map_err(|e| regex_err(vm, e))?
+                        {
+                            Some((start, end)) => Ok(build_match_array_from_scratch(
+                                vm,
+                                &s,
+                                chars,
+                                start,
+                                end,
+                                re.ncaptures(),
+                                scratch,
+                            )),
+                            None => Ok(Value::Null),
+                        }
+                    })
                 }
             })
         })(),
@@ -269,10 +277,10 @@ pub(super) fn call_string_method(
             let s = value_as_cow_str(&this);
             let re = coerce_to_regex(vm, args.first().unwrap_or(&Value::Undefined))?;
             with_chars_buf(&s, |chars| {
-                match with_regex_scratch(|scratch| re.search_with_scratch(chars, 0, scratch))
+                match with_regex_scratch(|scratch| re.find_with_scratch(chars, 0, scratch))
                     .map_err(|e| regex_err(vm, e))?
                 {
-                    Some(mat) => Ok(Value::Number(mat.start as f64)),
+                    Some((start, _)) => Ok(Value::Number(start as f64)),
                     None => Ok(Value::Number(-1.0)),
                 }
             })
@@ -305,7 +313,13 @@ pub(super) fn call_string_method(
             if n < 0.0 || !n.is_finite() {
                 Err(vm.range_error("repeat count は非負の有限数である必要があります"))
             } else {
-                Ok(Value::str(s.repeat(n as usize)))
+                let count = n as usize;
+                Ok(Value::Str(with_str_buf_rc(|out| {
+                    out.reserve(s.len().saturating_mul(count));
+                    for _ in 0..count {
+                        out.push_str(&s);
+                    }
+                })))
             }
         }
         "padStart" => {
@@ -328,16 +342,17 @@ pub(super) fn call_string_method(
                 }
             } else {
                 let need = target_len - cur_len;
-                let mut out = String::with_capacity(need + s.len());
                 let pad_chars: Vec<char> = pad.chars().collect();
-                let mut written = 0usize;
-                while written < need {
-                    let take = (need - written).min(pad_chars.len());
-                    out.extend(&pad_chars[..take]);
-                    written += take;
-                }
-                out.push_str(&s);
-                Ok(Value::str(out))
+                Ok(Value::Str(with_str_buf_rc(|out| {
+                    out.reserve(need + s.len());
+                    let mut written = 0usize;
+                    while written < need {
+                        let take = (need - written).min(pad_chars.len());
+                        out.extend(&pad_chars[..take]);
+                        written += take;
+                    }
+                    out.push_str(&s);
+                })))
             }
         }
         _ => return None,

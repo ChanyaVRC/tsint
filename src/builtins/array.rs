@@ -128,18 +128,19 @@ pub(super) fn call_array_method(
                 Some(Value::Str(s)) => Cow::Borrowed(&**s),
                 Some(v) => Cow::Owned(vm.to_display_string(v)),
             };
-            let mut out = String::new();
-            with_array_ref(&this, |items| {
-                for (i, it) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(&sep);
+            let rc = crate::vm::with_str_buf_rc(|out| {
+                with_array_ref(&this, |items| {
+                    for (i, it) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(&sep);
+                        }
+                        if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
+                            crate::vm::to_string_into(it, out);
+                        }
                     }
-                    if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
-                        crate::vm::to_string_into(it, &mut out);
-                    }
-                }
+                });
             });
-            Ok(Value::str(out))
+            Ok(Value::Str(rc))
         }
         "indexOf" => {
             let target = args.first().unwrap_or(&Value::Undefined);
@@ -172,112 +173,91 @@ pub(super) fn call_array_method(
             }
             Ok(vm.alloc_array(out))
         }
-        "map" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
-            let mut out = Vec::with_capacity(items.len());
-            for (i, it) in items.into_iter().enumerate() {
-                out.push(vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it, Value::Number(i as f64), this.clone()],
-                )?);
-            }
-            Ok(vm.alloc_array(out))
-        })(),
-        "filter" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
+        "map" => {
+            let len = with_array_ref(&this, <[Value]>::len).unwrap_or(0);
+            let mut out = Vec::with_capacity(len);
+            array_iter_cb(vm, &this, arg(args, 0), |_it, res| {
+                out.push(res);
+                std::ops::ControlFlow::<()>::Continue(())
+            })
+            .map(|_| vm.alloc_array(out))
+        }
+        "filter" => {
             let mut out = Vec::new();
-            for (i, it) in items.into_iter().enumerate() {
-                let keep = vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
-                )?;
+            array_iter_cb(vm, &this, arg(args, 0), |it, keep| {
                 if keep.to_bool() {
                     out.push(it);
                 }
+                std::ops::ControlFlow::<()>::Continue(())
+            })
+            .map(|_| vm.alloc_array(out))
+        }
+        "forEach" => array_iter_cb(vm, &this, arg(args, 0), |_it, _res| {
+            std::ops::ControlFlow::<()>::Continue(())
+        })
+        .map(|_| Value::Undefined),
+        "find" => array_iter_cb(vm, &this, arg(args, 0), |it, hit| {
+            if hit.to_bool() {
+                std::ops::ControlFlow::Break(it)
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
-            Ok(vm.alloc_array(out))
-        })(),
-        "forEach" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
-            for (i, it) in items.into_iter().enumerate() {
-                vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it, Value::Number(i as f64), this.clone()],
-                )?;
-            }
-            Ok(Value::Undefined)
-        })(),
-        "find" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
-            for (i, it) in items.into_iter().enumerate() {
-                let hit = vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
-                )?;
-                if hit.to_bool() {
-                    return Ok(it);
-                }
-            }
-            Ok(Value::Undefined)
-        })(),
-        "flatMap" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
+        })
+        .map(|found| found.unwrap_or(Value::Undefined)),
+        "flatMap" => {
             let mut out = Vec::new();
-            for (i, it) in items.into_iter().enumerate() {
-                let r = vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it, Value::Number(i as f64), this.clone()],
-                )?;
+            array_iter_cb(vm, &this, arg(args, 0), |_it, r| {
                 if let Value::Object(o) = &r {
                     if let ObjKind::Array(sub) = &o.borrow().kind {
                         out.extend_from_slice(sub);
-                        continue;
+                        return std::ops::ControlFlow::<()>::Continue(());
                     }
                 }
                 out.push(r);
+                std::ops::ControlFlow::<()>::Continue(())
+            })
+            .map(|_| vm.alloc_array(out))
+        }
+        "some" => array_iter_cb(vm, &this, arg(args, 0), |_it, hit| {
+            if hit.to_bool() {
+                std::ops::ControlFlow::Break(true)
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
-            Ok(vm.alloc_array(out))
-        })(),
-        "some" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
-            for (i, it) in items.into_iter().enumerate() {
-                let hit = vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it, Value::Number(i as f64), this.clone()],
-                )?;
-                if hit.to_bool() {
-                    return Ok(Value::Bool(true));
-                }
+        })
+        .map(|hit| Value::Bool(hit.unwrap_or(false))),
+        "every" => array_iter_cb(vm, &this, arg(args, 0), |_it, hit| {
+            if !hit.to_bool() {
+                std::ops::ControlFlow::Break(false)
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
-            Ok(Value::Bool(false))
-        })(),
-        "every" => (|| {
-            let items = array_values(&this);
-            let cb = arg(args, 0);
-            for (i, it) in items.into_iter().enumerate() {
-                let hit = vm.call_value(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[it, Value::Number(i as f64), this.clone()],
-                )?;
-                if !hit.to_bool() {
-                    return Ok(Value::Bool(false));
-                }
-            }
-            Ok(Value::Bool(true))
-        })(),
+        })
+        .map(|ok| Value::Bool(ok.unwrap_or(true))),
         _ => return None,
     })
+}
+
+/// 配列を先頭から `len` 件走査し、配列全体を複製せずにコールバックを呼び出す共通ヘルパー。
+fn array_iter_cb<B>(
+    vm: &mut Vm,
+    this: &Value,
+    cb: Value,
+    mut on_elem: impl FnMut(Value, Value) -> std::ops::ControlFlow<B>,
+) -> Result<Option<B>, Value> {
+    let len = with_array_ref(this, <[Value]>::len).unwrap_or(0);
+    for i in 0..len {
+        let Some(it) = with_array_ref(this, |items| items.get(i).cloned()).flatten() else {
+            break;
+        };
+        let res = vm.call_value(
+            cb.clone(),
+            Value::Undefined,
+            &[it.clone(), Value::Number(i as f64), this.clone()],
+        )?;
+        if let std::ops::ControlFlow::Break(b) = on_elem(it, res) {
+            return Ok(Some(b));
+        }
+    }
+    Ok(None)
 }

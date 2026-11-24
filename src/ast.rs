@@ -254,7 +254,7 @@ pub struct VarDeclarator {
 
 #[derive(Debug, Clone)]
 pub enum ForInit {
-    VarDecl(VarKind, Vec<VarDeclarator>),
+    VarDecl(VarKind, Box<[VarDeclarator]>),
     Expr(Box<Expr>),
 }
 
@@ -262,13 +262,13 @@ pub enum ForInit {
 pub struct SwitchCase {
     /// None は default 節。
     pub test: Option<Box<Expr>>,
-    pub body: Vec<Stmt>,
+    pub body: Box<[Stmt]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CatchClause {
     pub param: Option<Pattern>,
-    pub body: Vec<Stmt>,
+    pub body: Box<[Stmt]>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +283,7 @@ pub enum ImportSpecifier {
 
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
-    pub specifiers: Vec<ImportSpecifier>,
+    pub specifiers: Box<[ImportSpecifier]>,
     pub source: String,
     /// `import type { ... }` — 型のみ import（実行時には何も束縛しない）。
     pub type_only: bool,
@@ -306,10 +306,10 @@ pub enum StmtKind {
     Empty,
     Debugger,
     Expr(Box<Expr>),
-    Block(Vec<Stmt>),
+    Block(Box<[Stmt]>),
     VarDecl {
         kind: VarKind,
-        decls: Vec<VarDeclarator>,
+        decls: Box<[VarDeclarator]>,
     },
     FunctionDecl(Box<Function>),
     ClassDecl(Box<Class>),
@@ -341,12 +341,12 @@ pub enum StmtKind {
     },
     Switch {
         disc: Box<Expr>,
-        cases: Vec<SwitchCase>,
+        cases: Box<[SwitchCase]>,
     },
     Try {
-        block: Vec<Stmt>,
-        handler: Option<CatchClause>,
-        finalizer: Option<Vec<Stmt>>,
+        block: Box<[Stmt]>,
+        handler: Option<Box<CatchClause>>,
+        finalizer: Option<Box<[Stmt]>>,
     },
     Throw(Box<Expr>),
     Return(Option<Box<Expr>>),
@@ -356,16 +356,16 @@ pub enum StmtKind {
         label: String,
         body: Box<Stmt>,
     },
-    Import(ImportDecl),
+    Import(Box<ImportDecl>),
     ExportNamed {
-        specifiers: Vec<ExportSpecifier>,
+        specifiers: Box<[ExportSpecifier]>,
         /// `export { a } from "mod"` の再エクスポート元。
-        source: Option<String>,
+        source: Option<Box<str>>,
         type_only: bool,
     },
     ExportAll {
         /// `export * as ns from "mod"` の ns。
-        as_name: Option<String>,
+        as_name: Option<Box<str>>,
         source: String,
     },
     ExportDefault(Box<DefaultExportable>),
@@ -382,7 +382,7 @@ pub enum StmtKind {
     /// `declare module "..." { ... }` / `declare namespace ... { ... }`
     TsModule {
         name: String,
-        body: Vec<Stmt>,
+        body: Box<[Stmt]>,
     },
     /// `declare` が付いた素のアンビエント宣言（module 以外）。中身は捨てる。
     TsAmbientDecl,
@@ -483,10 +483,10 @@ impl Stmt {
 pub struct Function {
     pub id: NodeId,
     pub span: Span,
-    pub name: Option<String>,
-    pub params: Vec<Param>,
+    pub name: Option<Box<str>>,
+    pub params: Box<[Param]>,
     /// None は本体を持たないアンビエント宣言（.d.ts 由来のオーバーロード等）。
-    pub body: Option<Vec<Stmt>>,
+    pub body: Option<Box<[Stmt]>>,
     /// アロー関数の式本体（`x => x + 1`）。body と排他。
     pub expr_body: Option<Box<Expr>>,
     pub is_async: bool,
@@ -504,11 +504,11 @@ pub struct Param {
 pub enum Pattern {
     Ident(String),
     Object {
-        props: Vec<ObjectPatternProp>,
+        props: Box<[ObjectPatternProp]>,
         rest: Option<Box<Pattern>>,
     },
     Array {
-        elements: Vec<Option<Pattern>>,
+        elements: Box<[Option<Pattern>]>,
         rest: Option<Box<Pattern>>,
     },
     /// 分割代入内のデフォルト値付き要素（例: `{ a = 1 }`）。
@@ -547,7 +547,7 @@ pub struct ClassMember {
     pub kind: ClassMemberKind,
     pub is_static: bool,
     pub name: PropertyKey,
-    pub function: Option<Function>,
+    pub function: Option<Box<Function>>,
     pub value: Option<Box<Expr>>,
 }
 
@@ -555,9 +555,9 @@ pub struct ClassMember {
 pub struct Class {
     pub id: NodeId,
     pub span: Span,
-    pub name: Option<String>,
+    pub name: Option<Box<str>>,
     pub super_class: Option<Box<Expr>>,
-    pub members: Vec<ClassMember>,
+    pub members: Box<[ClassMember]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,14 +665,14 @@ pub enum ExprKind {
     TemplateLit {
         /// テンプレートの文字列断片。exprs より 1 つ多い。
         quasis: Vec<String>,
-        exprs: Vec<Expr>,
+        exprs: Box<[Expr]>,
     },
     RegexLit {
         pattern: String,
         flags: String,
     },
-    ArrayLit(Vec<Option<Expr>>),
-    ObjectLit(Vec<ObjectProp>),
+    ArrayLit(Box<[Option<Expr>]>),
+    ObjectLit(Box<[ObjectProp]>),
     Function(Box<Function>),
     Arrow(Box<Function>),
     Class(Box<Class>),
@@ -707,19 +707,19 @@ pub enum ExprKind {
     },
     Call {
         callee: Box<Expr>,
-        args: Vec<Expr>,
+        args: Box<[Expr]>,
         optional: bool,
     },
     New {
         callee: Box<Expr>,
-        args: Vec<Expr>,
+        args: Box<[Expr]>,
     },
     Member {
         obj: Box<Expr>,
         prop: PropertyKey,
         optional: bool,
     },
-    Sequence(Vec<Expr>),
+    Sequence(Box<[Expr]>),
     Spread(Box<Expr>),
     Await(Box<Expr>),
     /// `expr as Type` / `expr as const` — 型は捨てる。

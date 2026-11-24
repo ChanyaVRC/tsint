@@ -96,9 +96,16 @@ pub(super) fn norm_index(v: Option<&Value>, default: i64, len: i64) -> i64 {
 
 #[inline]
 pub(super) fn chars_slice_to_val(chars: &[char]) -> Value {
-    let mut s = String::with_capacity(chars.len());
-    s.extend(chars);
-    Value::str(s)
+    Value::Str(crate::vm::with_str_buf_rc(|buf| buf.extend(chars)))
+}
+
+#[inline]
+pub(super) fn slice_to_val(src: &str, chars: &[char], start: usize, end: usize) -> Value {
+    if src.is_ascii() {
+        Value::str(&src[start..end])
+    } else {
+        chars_slice_to_val(&chars[start..end])
+    }
 }
 
 pub fn install(vm: &mut Vm) {
