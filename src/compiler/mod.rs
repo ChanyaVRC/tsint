@@ -73,7 +73,7 @@ pub(super) enum Ctrl {
 }
 
 pub(super) struct FuncCtx {
-    pub(super) chunk: Chunk,
+    pub(super) chunk: ChunkBuilder,
     pub(super) locals: Vec<LocalVar>,
     pub(super) next_slot: LocalIdx,
     pub(super) upvalues: Vec<UpvalueDesc>,
@@ -91,7 +91,7 @@ pub(super) struct FuncCtx {
 impl FuncCtx {
     pub(super) fn new(name: impl Into<Rc<str>>) -> Self {
         FuncCtx {
-            chunk: Chunk::new(name),
+            chunk: ChunkBuilder::new(name),
             locals: Vec::new(),
             next_slot: 0,
             upvalues: Vec::new(),
@@ -191,9 +191,8 @@ pub fn compile_module(module: &Module) -> CResult<Rc<Chunk>> {
     c.emit(OpCode::LoadUndefined, 0);
     c.emit(OpCode::Return, 0);
 
-    let mut f = c.funcs.pop().unwrap();
-    f.chunk.finalize();
-    Ok(Rc::new(f.chunk))
+    let f = c.funcs.pop().unwrap();
+    Ok(Rc::new(f.chunk.finish()))
 }
 
 fn collect_exports(c: &mut Compiler, s: &Stmt) -> CResult<()> {

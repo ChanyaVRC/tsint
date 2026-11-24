@@ -66,7 +66,7 @@ pub(super) fn install_object(vm: &mut Vm) {
                     .iter()
                     .filter_map(|(k, slot)| match slot {
                         PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                        PropSlot::Accessor { .. } => None,
+                        PropSlot::Accessor(_) => None,
                     })
                     .collect();
                 let mut tb = t.borrow_mut();
@@ -104,7 +104,7 @@ fn own_enumerable_entries(vm: &Vm, v: &Value) -> Vec<Value> {
                         PropSlot::Value(val) => {
                             Some(vm.alloc_array(vec![Value::Str(k.clone()), val.clone()]))
                         }
-                        PropSlot::Accessor { .. } => None,
+                        PropSlot::Accessor(_) => None,
                     })
                     .collect(),
             }
@@ -124,7 +124,7 @@ fn own_enumerable_values(v: &Value) -> Vec<Value> {
                     .iter()
                     .filter_map(|(_, s)| match s {
                         PropSlot::Value(v) => Some(v.clone()),
-                        PropSlot::Accessor { .. } => None,
+                        PropSlot::Accessor(_) => None,
                     })
                     .collect(),
             }

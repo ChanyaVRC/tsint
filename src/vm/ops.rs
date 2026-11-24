@@ -24,9 +24,7 @@ pub fn array_values(v: &Value) -> Vec<Value> {
 
 /// コンパイル済み正規表現から `RegExp` インスタンスを作る。
 pub fn new_regex_value(re: Rc<crate::regex::Regex>) -> Value {
-    let mut o = ObjData::new(ObjKind::Regex(re));
-    o.props.set_value(Rc::from("lastIndex"), Value::Number(0.0));
-    Value::Object(Rc::new(RefCell::new(o)))
+    Value::Object(Rc::new(RefCell::new(ObjData::new(ObjKind::Regex(re)))))
 }
 
 #[inline]

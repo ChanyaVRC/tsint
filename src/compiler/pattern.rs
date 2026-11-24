@@ -255,15 +255,14 @@ impl Compiler {
             self.emit(OpCode::Return, f.span.start.line);
         }
 
-        let mut fctx = self.funcs.pop().unwrap();
-        fctx.chunk.finalize();
+        let fctx = self.funcs.pop().unwrap();
         Ok(FunctionTemplate {
             name: Rc::from(name),
-            chunk: Rc::new(fctx.chunk),
-            upvalues: fctx.upvalues,
+            chunk: Rc::new(fctx.chunk.finish()),
+            upvalues: fctx.upvalues.into_boxed_slice(),
+            param_count: f.params.iter().filter(|p| !p.rest).count() as u16,
             is_arrow: f.is_arrow,
             is_async: f.is_async,
-            param_count: f.params.iter().filter(|p| !p.rest).count(),
             has_rest,
         })
     }
@@ -332,10 +331,10 @@ impl Compiler {
         let template = ClassTemplate {
             name: Rc::from(name),
             ctor: ctor_tpl,
-            methods,
-            accessors,
-            static_fields,
-            instance_fields,
+            methods: methods.into_boxed_slice(),
+            accessors: accessors.into_boxed_slice(),
+            static_fields: static_fields.into_boxed_slice(),
+            instance_fields: instance_fields.into_boxed_slice(),
         };
         let cidx = self.add_const(Const::ClassTemplate(Rc::new(template)));
         self.emit(OpCode::MakeClass(cidx), line);
@@ -351,15 +350,14 @@ impl Compiler {
         });
         self.compile_expr(e)?;
         self.emit(OpCode::Return, e.span.start.line);
-        let mut fctx = self.funcs.pop().unwrap();
-        fctx.chunk.finalize();
+        let fctx = self.funcs.pop().unwrap();
         Ok(Rc::new(FunctionTemplate {
             name: Rc::from("<field-init>"),
-            chunk: Rc::new(fctx.chunk),
-            upvalues: fctx.upvalues,
+            chunk: Rc::new(fctx.chunk.finish()),
+            upvalues: fctx.upvalues.into_boxed_slice(),
+            param_count: 0,
             is_arrow: false,
             is_async: false,
-            param_count: 0,
             has_rest: false,
         }))
     }

@@ -10,19 +10,24 @@ use super::{CallOutcome, KindTag, RunOutcome, StackCalleeSlot, Vm};
 
 impl Vm {
     pub(super) fn build_closure(&self, tpl: &Rc<FunctionTemplate>) -> Rc<FunctionObj> {
-        let frame = self.frames.last().unwrap();
-        let mut ups = Vec::with_capacity(tpl.upvalues.len());
-        for d in &tpl.upvalues {
-            let cell = match d {
-                UpvalueDesc::ParentLocal(slot) => frame.locals[*slot as usize].as_boxed_cell(),
-                UpvalueDesc::ParentUpvalue(idx) => frame.upvalues[*idx as usize].clone(),
-            };
-            ups.push(cell);
-        }
+        let upvalues = if tpl.upvalues.is_empty() {
+            self.empty_upvalues.clone()
+        } else {
+            let frame = self.frames.last().unwrap();
+            let mut ups = Vec::with_capacity(tpl.upvalues.len());
+            for d in &tpl.upvalues {
+                let cell = match d {
+                    UpvalueDesc::ParentLocal(slot) => frame.locals[*slot as usize].as_boxed_cell(),
+                    UpvalueDesc::ParentUpvalue(idx) => frame.upvalues[*idx as usize].clone(),
+                };
+                ups.push(cell);
+            }
+            Rc::new(ups)
+        };
         Rc::new(FunctionObj {
             name: tpl.name.clone(),
             chunk: tpl.chunk.clone(),
-            upvalues: Rc::new(ups),
+            upvalues,
             is_arrow: tpl.is_arrow,
             is_async: tpl.is_async,
         })
@@ -51,7 +56,7 @@ impl Vm {
         }
         let proto_rc: ObjRef = self.alloc_obj_ref(proto);
 
-        let instance_fields: Vec<(Rc<str>, Option<Rc<FunctionObj>>)> = tpl
+        let instance_fields: InstanceFields = tpl
             .instance_fields
             .iter()
             .map(|(n, f)| (n.clone(), f.as_ref().map(|t| self.build_closure(t))))
@@ -63,7 +68,8 @@ impl Vm {
             prototype: proto_rc.clone(),
             instance_fields,
         };
-        let class_rc: ObjRef = self.alloc_obj_ref(ObjData::new(ObjKind::Class(class_data)));
+        let class_rc: ObjRef =
+            self.alloc_obj_ref(ObjData::new(ObjKind::Class(Box::new(class_data))));
         proto_rc
             .borrow_mut()
             .props
@@ -400,11 +406,7 @@ impl Vm {
             return Err(self.type_error("これはコンストラクタではありません"));
         };
         enum CtorKind {
-            Class(
-                Option<Rc<FunctionObj>>,
-                ObjRef,
-                Vec<(Rc<str>, Option<Rc<FunctionObj>>)>,
-            ),
+            Class(Option<Rc<FunctionObj>>, ObjRef, InstanceFields),
             Native(NativeFn),
             Fn(Rc<FunctionObj>, Option<ObjRef>),
             Other,
@@ -432,12 +434,12 @@ impl Vm {
             CtorKind::Class(ctor, proto, fields) => {
                 let instance = ObjData {
                     kind: ObjKind::Plain,
-                    props: PropMap::new(),
+                    props: PropMap::with_capacity(fields.len()),
                     proto: Some(proto),
                 };
                 let inst_rc: ObjRef = self.alloc_obj_ref(instance);
                 let inst_val = Value::Object(inst_rc.clone());
-                for (name, init) in &fields {
+                for (name, init) in fields.iter() {
                     let v = match init {
                         Some(f) => self.call_function_obj(f.clone(), inst_val.clone(), &[])?,
                         None => Value::Undefined,

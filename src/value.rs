@@ -91,12 +91,12 @@ impl Value {
 
     pub fn native_fn(name: &str, arity: usize, f: NativeFn) -> Value {
         Value::Object(Rc::new(RefCell::new(ObjData::new(ObjKind::Native(
-            NativeObj {
+            Box::new(NativeObj {
                 name: name.into(),
                 arity,
                 f,
-                captures: Vec::new(),
-            },
+                captures: Box::new([]),
+            }),
         )))))
     }
 }
@@ -115,14 +115,18 @@ impl fmt::Debug for Value {
     }
 }
 
+/// getter / setter のペア（まれなアクセサプロパティをヒープ間接化して `PropSlot` を 24B に保つ）。
+#[derive(Clone)]
+pub struct Accessor {
+    pub get: Option<Value>,
+    pub set: Option<Value>,
+}
+
 /// プロパティ値のスロット。アクセサ（getter/setter）と通常値を区別する。
 #[derive(Clone)]
 pub enum PropSlot {
     Value(Value),
-    Accessor {
-        get: Option<Value>,
-        set: Option<Value>,
-    },
+    Accessor(Box<Accessor>),
 }
 
 /// `PropMap` が線形探索からハッシュ索引へ切り替えるプロパティ数の閾値。
@@ -142,7 +146,6 @@ const PROP_MAP_LINEAR_THRESHOLD: usize = 16;
 #[derive(Clone, Default)]
 pub struct PropMap {
     entries: Vec<Option<(Rc<str>, PropSlot)>>,
-    live_len: usize,
     // Keep `PropMap` compact (1 pointer width when `None`) for small objects below
     // `PROP_MAP_LINEAR_THRESHOLD`, which make up the vast majority of JS objects.
     #[allow(clippy::box_collection)]
@@ -152,6 +155,13 @@ pub struct PropMap {
 impl PropMap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        PropMap {
+            entries: Vec::with_capacity(cap),
+            index: None,
+        }
     }
 
     #[inline]
@@ -205,18 +215,24 @@ impl PropMap {
 
     #[inline]
     pub(crate) fn set_value_returning_idx(&mut self, key: Rc<str>, value: Value) -> usize {
+        self.set_slot_returning_idx(key, PropSlot::Value(value))
+    }
+
+    #[inline]
+    fn set_slot_returning_idx(&mut self, key: Rc<str>, slot: PropSlot) -> usize {
         if let Some(idx) = self.find_index_rc(&key) {
-            if let Some((_, slot)) = &mut self.entries[idx] {
-                *slot = PropSlot::Value(value);
+            if let Some((_, existing)) = &mut self.entries[idx] {
+                *existing = slot;
             }
             idx
         } else {
-            self.push_new(key, PropSlot::Value(value))
+            self.push_new(key, slot)
         }
     }
 
     fn build_index(&mut self) {
-        let mut map = FastHashMap::with_capacity_and_hasher(self.live_len * 2, Default::default());
+        let mut map =
+            FastHashMap::with_capacity_and_hasher(self.entries.len() * 2, Default::default());
         for (i, entry) in self.entries.iter().enumerate() {
             if let Some((k, _)) = entry {
                 map.insert(k.clone(), i);
@@ -230,11 +246,9 @@ impl PropMap {
         if let Some(ref mut idx_map) = self.index {
             idx_map.insert(key.clone(), new_idx);
             self.entries.push(Some((key, slot)));
-            self.live_len += 1;
         } else {
             self.entries.push(Some((key, slot)));
-            self.live_len += 1;
-            if self.live_len > PROP_MAP_LINEAR_THRESHOLD {
+            if self.entries.len() > PROP_MAP_LINEAR_THRESHOLD {
                 self.build_index();
             }
         }
@@ -242,15 +256,16 @@ impl PropMap {
     }
 
     fn maybe_compact(&mut self) {
-        if self.live_len == 0 {
+        let live_len = self.len();
+        if live_len == 0 {
             self.entries.clear();
             self.index = None;
             return;
         }
-        let drop_index = self.live_len <= PROP_MAP_LINEAR_THRESHOLD / 2;
+        let drop_index = live_len <= PROP_MAP_LINEAR_THRESHOLD / 2;
         if drop_index
             || (self.entries.len() > PROP_MAP_LINEAR_THRESHOLD
-                && self.live_len * 2 <= self.entries.len())
+                && live_len * 2 <= self.entries.len())
         {
             self.entries.retain(|e| e.is_some());
             if drop_index {
@@ -280,61 +295,44 @@ impl PropMap {
 
     #[inline]
     pub fn set_value(&mut self, key: Rc<str>, value: Value) {
-        if let Some(idx) = self.find_index_rc(&key) {
-            if let Some((_, slot)) = &mut self.entries[idx] {
-                *slot = PropSlot::Value(value);
-            }
-        } else {
-            self.push_new(key, PropSlot::Value(value));
-        }
+        self.set_slot_returning_idx(key, PropSlot::Value(value));
     }
 
     pub fn set_slot(&mut self, key: Rc<str>, slot: PropSlot) {
-        if let Some(idx) = self.find_index_rc(&key) {
-            if let Some((_, existing)) = &mut self.entries[idx] {
-                *existing = slot;
-            }
-        } else {
-            self.push_new(key, slot);
-        }
+        self.set_slot_returning_idx(key, slot);
     }
 
     pub fn define_accessor(&mut self, key: Rc<str>, is_get: bool, f: Value) {
+        let mk_acc = |f: Value| {
+            let (get, set) = if is_get {
+                (Some(f), None)
+            } else {
+                (None, Some(f))
+            };
+            PropSlot::Accessor(Box::new(Accessor { get, set }))
+        };
         if let Some(idx) = self.find_index_rc(&key) {
             if let Some((_, slot)) = &mut self.entries[idx] {
                 match slot {
-                    PropSlot::Accessor { get, set } => {
+                    PropSlot::Accessor(acc) => {
                         if is_get {
-                            *get = Some(f);
+                            acc.get = Some(f);
                         } else {
-                            *set = Some(f);
+                            acc.set = Some(f);
                         }
                     }
-                    _ => {
-                        let (get, set) = if is_get {
-                            (Some(f), None)
-                        } else {
-                            (None, Some(f))
-                        };
-                        *slot = PropSlot::Accessor { get, set };
-                    }
+                    _ => *slot = mk_acc(f),
                 }
             }
             return;
         }
-        let (get, set) = if is_get {
-            (Some(f), None)
-        } else {
-            (None, Some(f))
-        };
-        self.push_new(key, PropSlot::Accessor { get, set });
+        self.push_new(key, mk_acc(f));
     }
 
     pub fn delete(&mut self, key: &str) -> bool {
         if let Some(ref mut idx_map) = self.index {
             if let Some(idx) = idx_map.remove(key) {
                 self.entries[idx] = None;
-                self.live_len -= 1;
                 self.maybe_compact();
                 true
             } else {
@@ -346,7 +344,6 @@ impl PropMap {
             .position(|e| matches!(e, Some((k, _)) if &**k == key))
         {
             self.entries.remove(idx);
-            self.live_len -= 1;
             true
         } else {
             false
@@ -367,17 +364,19 @@ impl PropMap {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.live_len
+        match &self.index {
+            Some(m) => m.len(),
+            None => self.entries.len(),
+        }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.live_len == 0
+        self.len() == 0
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.live_len = 0;
         self.index = None;
     }
 }
@@ -399,6 +398,14 @@ impl ObjData {
             proto: None,
         }
     }
+
+    pub(crate) fn with_props_cap(kind: ObjKind, cap: usize) -> Self {
+        ObjData {
+            kind,
+            props: PropMap::with_capacity(cap),
+            proto: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -408,7 +415,7 @@ pub struct NativeObj {
     pub f: NativeFn,
     /// ビルトイン（Promise の resolve/reject/finally 等）が Rust クロージャ内に
     /// Weak で参照している JS オブジェクトの強い参照を GC から可視化するためのリスト。
-    pub(crate) captures: Vec<ObjRef>,
+    pub(crate) captures: Box<[ObjRef]>,
 }
 
 /// バイトコード関数（クロージャ）。
@@ -465,13 +472,45 @@ impl MapKey {
     }
 }
 
+type ValIndex = Option<Box<FastHashMap<MapKey, usize>>>;
+
+fn build_val_index<'a>(keys: impl ExactSizeIterator<Item = &'a Value>) -> ValIndex {
+    let mut map = FastHashMap::with_capacity_and_hasher(keys.len() * 2, Default::default());
+    for (i, k) in keys.enumerate() {
+        map.insert(MapKey::from_value(k), i);
+    }
+    Some(Box::new(map))
+}
+
+fn sync_index_after_delete(
+    index: &mut ValIndex,
+    key: &Value,
+    idx: usize,
+    new_len: usize,
+    rebuild_keys: impl FnOnce() -> ValIndex,
+) {
+    if new_len <= MAP_LINEAR_THRESHOLD / 2 {
+        *index = None;
+    } else if let Some(ref mut idx_map) = index {
+        if idx_map.len() == new_len + 1 {
+            idx_map.remove(&MapKey::from_value(key));
+            for pos in idx_map.values_mut() {
+                if *pos > idx {
+                    *pos -= 1;
+                }
+            }
+        } else {
+            *index = rebuild_keys();
+        }
+    }
+}
+
 /// 挿入順を保持する Map ストレージ。要素数が少ない間は線形探索のみで追加確保ゼロ、
 /// 閾値を超えると遅延ハッシュ索引を構築して `find`/`set`/`has` を O(1) 化する。
 #[derive(Default)]
 pub struct MapData {
     pub entries: Vec<(Value, Value)>,
-    #[allow(clippy::box_collection)]
-    index: Option<Box<FastHashMap<MapKey, usize>>>,
+    index: ValIndex,
 }
 
 impl MapData {
@@ -488,16 +527,11 @@ impl MapData {
     }
 
     fn build_index(&mut self) {
-        let mut map =
-            FastHashMap::with_capacity_and_hasher(self.entries.len() * 2, Default::default());
-        for (i, (k, _)) in self.entries.iter().enumerate() {
-            map.insert(MapKey::from_value(k), i);
-        }
-        self.index = Some(Box::new(map));
+        self.index = build_val_index(self.entries.iter().map(|(k, _)| k));
     }
 
     pub fn set(&mut self, key: Value, val: Value) {
-        if let Some(ref mut idx_map) = self.index {
+        if let Some(ref idx_map) = self.index {
             if idx_map.len() != self.entries.len() {
                 self.build_index();
             }
@@ -532,20 +566,11 @@ impl MapData {
             return false;
         };
         self.entries.remove(idx);
-        if self.entries.len() <= MAP_LINEAR_THRESHOLD / 2 {
-            self.index = None;
-        } else if let Some(ref mut idx_map) = self.index {
-            if idx_map.len() == self.entries.len() + 1 {
-                idx_map.remove(&MapKey::from_value(key));
-                for v in idx_map.values_mut() {
-                    if *v > idx {
-                        *v -= 1;
-                    }
-                }
-            } else {
-                self.build_index();
-            }
-        }
+        let new_len = self.entries.len();
+        let entries = &self.entries;
+        sync_index_after_delete(&mut self.index, key, idx, new_len, || {
+            build_val_index(entries.iter().map(|(k, _)| k))
+        });
         true
     }
 
@@ -559,8 +584,7 @@ impl MapData {
 #[derive(Default)]
 pub struct SetData {
     pub values: Vec<Value>,
-    #[allow(clippy::box_collection)]
-    index: Option<Box<FastHashMap<MapKey, usize>>>,
+    index: ValIndex,
 }
 
 impl SetData {
@@ -575,16 +599,11 @@ impl SetData {
     }
 
     fn build_index(&mut self) {
-        let mut map =
-            FastHashMap::with_capacity_and_hasher(self.values.len() * 2, Default::default());
-        for (i, v) in self.values.iter().enumerate() {
-            map.insert(MapKey::from_value(v), i);
-        }
-        self.index = Some(Box::new(map));
+        self.index = build_val_index(self.values.iter());
     }
 
     pub fn add(&mut self, v: Value) {
-        if let Some(ref mut idx_map) = self.index {
+        if let Some(ref idx_map) = self.index {
             if idx_map.len() != self.values.len() {
                 self.build_index();
             }
@@ -611,20 +630,11 @@ impl SetData {
             return false;
         };
         self.values.remove(idx);
-        if self.values.len() <= MAP_LINEAR_THRESHOLD / 2 {
-            self.index = None;
-        } else if let Some(ref mut idx_map) = self.index {
-            if idx_map.len() == self.values.len() + 1 {
-                idx_map.remove(&MapKey::from_value(v));
-                for pos in idx_map.values_mut() {
-                    if *pos > idx {
-                        *pos -= 1;
-                    }
-                }
-            } else {
-                self.build_index();
-            }
-        }
+        let new_len = self.values.len();
+        let values = &self.values;
+        sync_index_after_delete(&mut self.index, v, idx, new_len, || {
+            build_val_index(values.iter())
+        });
         true
     }
 
@@ -638,17 +648,17 @@ pub enum ObjKind {
     Plain,
     Array(Vec<Value>),
     Function(Rc<FunctionObj>),
-    Native(NativeObj),
+    Native(Box<NativeObj>),
     /// クラス本体。`Value::Object` 自身が呼び出し可能なコンストラクタを兼ねる。
-    Class(ClassData),
-    Map(MapData),
-    Set(SetData),
+    Class(Box<ClassData>),
+    Map(Box<MapData>),
+    Set(Box<SetData>),
     /// Error 系オブジェクト（`message`/`name` は props に格納。マーカーのみ）。
     Error,
     /// 正規表現（T4 本実装。`crate::regex` 参照）。
     Regex(Rc<crate::regex::Regex>),
     /// Promise（T3）。状態と pending 中の反応（reaction）を保持する。
-    Promise(PromiseData),
+    Promise(Box<PromiseData>),
 }
 
 /// Promise の 3 状態。
@@ -700,13 +710,15 @@ impl PromiseData {
     }
 }
 
+pub type InstanceFields = Rc<[(Rc<str>, Option<Rc<FunctionObj>>)]>;
+
 pub struct ClassData {
     pub name: Rc<str>,
     pub ctor: Option<Rc<FunctionObj>>,
     /// インスタンス用プロトタイプオブジェクト（メソッド/getter/setter を保持）。
     pub prototype: ObjRef,
     /// インスタンスフィールド初期化子（`new` のたびに `this` = 新インスタンスで呼ぶ）。
-    pub instance_fields: Vec<(Rc<str>, Option<Rc<FunctionObj>>)>,
+    pub instance_fields: InstanceFields,
 }
 
 /// SameValueZero（Map/Set のキー比較・Array.includes に使用）。
@@ -905,10 +917,11 @@ mod tests {
         assert_eq!(m.len(), 24);
         assert_eq!(key_vec(&m)[5], "k5");
         match m.get("k5") {
-            Some(PropSlot::Accessor {
-                get: Some(Value::Bool(true)),
-                set: Some(Value::Bool(false)),
-            }) => {}
+            Some(PropSlot::Accessor(acc))
+                if matches!(
+                    (&acc.get, &acc.set),
+                    (Some(Value::Bool(true)), Some(Value::Bool(false)))
+                ) => {}
             _ => panic!("expected getter+setter accessor at k5"),
         }
     }

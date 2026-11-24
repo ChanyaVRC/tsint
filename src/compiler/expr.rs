@@ -134,7 +134,12 @@ impl Compiler {
                 self.emit(OpCode::LoadRegex(c), line);
             }
             ExprKind::ArrayLit(elements) => {
-                self.emit(OpCode::NewArray, line);
+                if elements.is_empty() {
+                    self.emit(OpCode::NewArray, line);
+                } else {
+                    let cap = elements.len().min(u16::MAX as usize) as u16;
+                    self.emit(OpCode::NewArrayWithCap(cap), line);
+                }
                 for el in elements {
                     match el {
                         None => {
@@ -251,7 +256,12 @@ impl Compiler {
     }
 
     fn compile_object_lit(&mut self, props: &[ObjectProp], line: u32) -> CResult<()> {
-        self.emit(OpCode::NewObject, line);
+        if props.is_empty() || (props.len() >= 3 && props.len() <= 4) {
+            self.emit(OpCode::NewObject, line);
+        } else {
+            let cap = props.len().min(u16::MAX as usize) as u16;
+            self.emit(OpCode::NewObjectWithCap(cap), line);
+        }
         for p in props {
             match p {
                 ObjectProp::KeyValue { key, value, .. } => match key {

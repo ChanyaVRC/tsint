@@ -22,7 +22,7 @@ pub(super) fn install_map_set_ctors(vm: &mut Vm) {
                     }
                 }
             }
-            Ok(vm.alloc_obj(ObjData::new(ObjKind::Map(data))))
+            Ok(vm.alloc_obj(ObjData::new(ObjKind::Map(Box::new(data)))))
         }),
     );
     vm.register_native(
@@ -37,7 +37,7 @@ pub(super) fn install_map_set_ctors(vm: &mut Vm) {
                     }
                 }
             }
-            Ok(vm.alloc_obj(ObjData::new(ObjKind::Set(data))))
+            Ok(vm.alloc_obj(ObjData::new(ObjKind::Set(Box::new(data)))))
         }),
     );
 }

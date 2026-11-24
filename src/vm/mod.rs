@@ -305,7 +305,7 @@ impl Vm {
     #[inline]
     pub(super) fn put_args_buf(&mut self, mut buf: Vec<Value>) {
         buf.clear();
-        if self.args_pool.len() < MAX_ARGS_POOL {
+        if self.args_pool.len() < MAX_ARGS_POOL && buf.capacity() <= 64 {
             self.args_pool.push(buf);
         }
     }
@@ -315,12 +315,19 @@ impl Vm {
         frame.stack.clear();
         frame.locals.clear();
         if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
-            v.clear();
+            if v.capacity() <= 64 {
+                v.clear();
+            } else {
+                frame.raw_args = self.empty_args.clone();
+            }
         } else {
             frame.raw_args = self.empty_args.clone();
         }
         frame.upvalues = self.empty_upvalues.clone();
-        if self.frame_pool.len() < MAX_FRAME_POOL {
+        if self.frame_pool.len() < MAX_FRAME_POOL
+            && frame.stack.capacity() <= 128
+            && frame.locals.capacity() <= 128
+        {
             self.frame_pool.push(frame);
         }
     }
@@ -476,18 +483,17 @@ impl Vm {
         self.alloc_obj(ObjData::new(ObjKind::Plain))
     }
 
+    pub(crate) fn alloc_plain_object_with_cap(&self, cap: usize) -> Value {
+        self.alloc_obj(ObjData::with_props_cap(ObjKind::Plain, cap))
+    }
+
     pub(crate) fn alloc_array(&self, items: Vec<Value>) -> Value {
         self.alloc_obj(ObjData::new(ObjKind::Array(items)))
     }
 
     pub(crate) fn alloc_regex_value(&self, re: Rc<crate::regex::Regex>) -> Value {
-        thread_local! {
-            static KEY_LAST_INDEX: Rc<str> = Rc::from("lastIndex");
-        }
-        let mut o = ObjData::new(ObjKind::Regex(re));
-        o.props
-            .set_value(KEY_LAST_INDEX.with(|k| k.clone()), Value::Number(0.0));
-        self.alloc_obj(o)
+        // `lastIndex` は読み取り既定値が 0.0 のため遅延確保する（非 global 正規表現での PropMap 確保ゼロ）。
+        self.alloc_obj(ObjData::new(ObjKind::Regex(re)))
     }
 
     pub(crate) fn alloc_native_with_captures(
@@ -497,12 +503,12 @@ impl Vm {
         captures: Vec<ObjRef>,
         f: NativeFn,
     ) -> Value {
-        self.alloc_obj(ObjData::new(ObjKind::Native(NativeObj {
+        self.alloc_obj(ObjData::new(ObjKind::Native(Box::new(NativeObj {
             name: name.into(),
             arity,
             f,
-            captures,
-        })))
+            captures: captures.into_boxed_slice(),
+        }))))
     }
 
     pub(super) fn wrap_function(&self, fo: Rc<FunctionObj>) -> Value {

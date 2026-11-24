@@ -1012,8 +1012,20 @@ impl Vm {
                 self.maybe_gc_if_top_level();
                 Ok(None)
             }
+            OpCode::NewObjectWithCap(cap) => {
+                let o = self.alloc_plain_object_with_cap(cap as usize);
+                self.push(o);
+                self.maybe_gc_if_top_level();
+                Ok(None)
+            }
             OpCode::NewArray => {
                 let a = self.alloc_array(Vec::new());
+                self.push(a);
+                self.maybe_gc_if_top_level();
+                Ok(None)
+            }
+            OpCode::NewArrayWithCap(cap) => {
+                let a = self.alloc_array(Vec::with_capacity(cap as usize));
                 self.push(a);
                 self.maybe_gc_if_top_level();
                 Ok(None)
@@ -1041,7 +1053,7 @@ impl Vm {
                             .iter()
                             .filter_map(|(k, s)| match s {
                                 PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                                PropSlot::Accessor { .. } => None,
+                                PropSlot::Accessor(_) => None,
                             })
                             .collect();
                         let arr_items = match &sb.kind {

@@ -55,8 +55,9 @@ fn kind_prop_lookup(kind: &ObjKind, name: &str) -> Option<Value> {
         ObjKind::Map(m) => (name == "size").then(|| Value::Number(m.entries.len() as f64)),
         ObjKind::Set(s) => (name == "size").then(|| Value::Number(s.values.len() as f64)),
         ObjKind::Regex(re) => match name {
-            "source" => Some(Value::str(re.source.clone())),
-            "flags" => Some(Value::str(re.flags.clone())),
+            "source" => Some(Value::Str(re.source.clone())),
+            "flags" => Some(Value::Str(re.flags.clone())),
+            "lastIndex" => Some(Value::Number(0.0)),
             "global" => Some(Value::Bool(re.global)),
             "ignoreCase" => Some(Value::Bool(re.ignore_case)),
             "multiline" => Some(Value::Bool(re.multiline)),
@@ -79,7 +80,7 @@ enum PropStep {
 fn classify_slot(slot: &PropSlot) -> PropStep {
     match slot {
         PropSlot::Value(v) => PropStep::Val(v.clone()),
-        PropSlot::Accessor { get, .. } => match get {
+        PropSlot::Accessor(acc) => match &acc.get {
             Some(f) => PropStep::Getter(f.clone()),
             None => PropStep::Undef,
         },
@@ -251,8 +252,8 @@ impl Vm {
                         *v = value;
                         return Ok(());
                     }
-                    PropSlot::Accessor { set, .. } => {
-                        let s = set.clone();
+                    PropSlot::Accessor(acc) => {
+                        let s = acc.set.clone();
                         drop(b);
                         if let Some(f) = s {
                             self.call_value(f, Value::Object(obj_rc.clone()), &[value])?;
@@ -294,8 +295,8 @@ impl Vm {
 
     fn find_proto_accessor_setter(&self, obj_rc: &ObjRef, name: &str) -> Option<Value> {
         let b = obj_rc.borrow();
-        if let Some(PropSlot::Accessor { set, .. }) = b.props.get(name) {
-            return set.clone();
+        if let Some(PropSlot::Accessor(acc)) = b.props.get(name) {
+            return acc.set.clone();
         }
         if b.props.get(name).is_some() {
             return None;

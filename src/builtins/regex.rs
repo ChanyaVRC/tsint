@@ -33,7 +33,7 @@ pub(super) fn install_regexp(vm: &mut Vm) {
         Rc::new(|vm, _this, args| {
             let (pattern, default_flags) = match args.first() {
                 Some(v) => match as_regex(v) {
-                    Some(re) => (re.source.clone(), re.flags.clone()),
+                    Some(re) => (re.source.to_string(), re.flags.to_string()),
                     None => (vm.to_display_string(v), String::new()),
                 },
                 None => (String::new(), String::new()),
@@ -80,8 +80,12 @@ fn regex_last_index(o: &ObjRef) -> usize {
 }
 
 fn set_last_index(o: &ObjRef, n: usize) {
+    let mut b = o.borrow_mut();
+    if n == 0 && b.props.is_empty() {
+        return;
+    }
     let key = KEY_LAST_INDEX.with(|k| k.clone());
-    o.borrow_mut().props.set_value(key, Value::Number(n as f64));
+    b.props.set_value(key, Value::Number(n as f64));
 }
 
 /// `RegExp.prototype.exec` の戻り値の配列（`index`/`input`/`groups` プロパティ付き）を組み立てる。
