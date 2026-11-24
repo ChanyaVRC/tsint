@@ -5,11 +5,57 @@
 //! 目指すものではないため、対応外の呼び出しは「明確なエラー」を返す
 //! （黙って undefined を返したりしない）方針を優先する。
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::regex::RegexScratch;
 use crate::value::*;
-use crate::vm::{array_values, is_callable, number_to_js_string, to_number, KindTag, Vm};
+use crate::vm::{
+    array_values, ascii_char_rc, is_callable, number_to_js_string_into, to_number, to_string_basic,
+    KindTag, Vm,
+};
+
+thread_local! {
+    static REGEX_SCRATCH: RefCell<RegexScratch> = RefCell::new(RegexScratch::default());
+    static CHARS_SCRATCH: RefCell<Vec<char>> = const { RefCell::new(Vec::new()) };
+    static KEY_LAST_INDEX: Rc<str> = Rc::from("lastIndex");
+    static KEY_INDEX: Rc<str> = Rc::from("index");
+    static KEY_INPUT: Rc<str> = Rc::from("input");
+    static KEY_GROUPS: Rc<str> = Rc::from("groups");
+}
+
+#[inline]
+fn value_as_cow_str(v: &Value) -> Cow<'_, str> {
+    match v {
+        Value::Str(s) => Cow::Borrowed(s),
+        other => Cow::Owned(to_string_basic(other)),
+    }
+}
+
+fn with_regex_scratch<R>(f: impl FnOnce(&mut RegexScratch) -> R) -> R {
+    REGEX_SCRATCH.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            f(&mut guard)
+        } else {
+            let mut local = RegexScratch::default();
+            f(&mut local)
+        }
+    })
+}
+
+fn with_chars_buf<R>(s: &str, f: impl FnOnce(&[char]) -> R) -> R {
+    CHARS_SCRATCH.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            buf.extend(s.chars());
+            f(&buf)
+        } else {
+            let local: Vec<char> = s.chars().collect();
+            f(&local)
+        }
+    })
+}
 
 fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
@@ -230,21 +276,21 @@ fn install_math(vm: &mut Vm) {
 fn install_json(vm: &mut Vm) {
     let json = Value::new_plain_object();
     let stringify = native("stringify", 1, |_vm, _this, args| {
-        let indent = match arg(args, 2) {
-            Value::Number(n) => n.max(0.0) as usize,
+        let indent = match args.get(2) {
+            Some(Value::Number(n)) => n.max(0.0) as usize,
             _ => 0,
         };
-        match json_stringify(&arg(args, 0), indent, 0) {
-            Some(s) => Ok(Value::str(s)),
-            None => Ok(Value::Undefined),
+        let target = args.first().unwrap_or(&Value::Undefined);
+        let mut out = String::with_capacity(128);
+        if json_stringify_into(target, indent, 0, &mut out) {
+            Ok(Value::str(out))
+        } else {
+            Ok(Value::Undefined)
         }
     });
     let parse = native("parse", 1, |vm, _this, args| {
-        let s = vm.to_display_string(&arg(args, 0));
-        let val =
-            json_parse(&s).map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))?;
-        vm.track_value_tree(&val);
-        Ok(val)
+        let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
+        json_parse(vm, &s).map_err(|e| vm.make_error("SyntaxError", format!("JSON.parse: {e}")))
     });
     if let Value::Object(o) = &json {
         let mut b = o.borrow_mut();
@@ -254,238 +300,332 @@ fn install_json(vm: &mut Vm) {
     vm.define_global("JSON", json);
 }
 
-fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+fn json_quote_into(s: &str, out: &mut String) {
+    use std::fmt::Write;
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let esc = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0..=0x1f => None, // control char handled below
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if start < i {
+            out.push_str(&s[start..i]);
         }
+        if let Some(e) = esc {
+            out.push_str(e);
+        } else {
+            let _ = write!(out, "\\u{:04x}", b as u32);
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
     }
     out.push('"');
-    out
 }
 
-fn json_stringify(v: &Value, indent: usize, depth: usize) -> Option<String> {
-    let pad = |d: usize| " ".repeat(indent * d);
+fn push_indent(out: &mut String, spaces: usize) {
+    for _ in 0..spaces {
+        out.push(' ');
+    }
+}
+
+fn json_stringify_into(v: &Value, indent: usize, depth: usize, out: &mut String) -> bool {
     match v {
-        Value::Undefined | Value::Uninit => None,
-        Value::Null => Some("null".to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(if n.is_finite() {
-            number_to_js_string(*n)
-        } else {
-            "null".to_string()
-        }),
-        Value::Str(s) => Some(json_quote(s)),
+        Value::Undefined | Value::Uninit => false,
+        Value::Null => {
+            out.push_str("null");
+            true
+        }
+        Value::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+            true
+        }
+        Value::Number(n) => {
+            if n.is_finite() {
+                number_to_js_string_into(*n, out);
+            } else {
+                out.push_str("null");
+            }
+            true
+        }
+        Value::Str(s) => {
+            json_quote_into(s, out);
+            true
+        }
         Value::Object(o) => {
-            let is_array = matches!(o.borrow().kind, ObjKind::Array(_));
-            let is_callable = matches!(
-                o.borrow().kind,
-                ObjKind::Function(_) | ObjKind::Native(_) | ObjKind::Class(_)
-            );
-            if is_callable {
-                return None;
-            }
-            if is_array {
-                let items = array_values(v);
-                let parts: Vec<String> = items
-                    .iter()
-                    .map(|it| {
-                        json_stringify(it, indent, depth + 1).unwrap_or_else(|| "null".to_string())
-                    })
-                    .collect();
-                if indent == 0 || parts.is_empty() {
-                    return Some(format!("[{}]", parts.join(",")));
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Function(_) | ObjKind::Native(_) | ObjKind::Class(_) => false,
+                ObjKind::Array(items) => {
+                    if items.is_empty() {
+                        out.push_str("[]");
+                        return true;
+                    }
+                    out.push('[');
+                    if indent > 0 {
+                        out.push('\n');
+                    }
+                    for (i, it) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                            if indent > 0 {
+                                out.push('\n');
+                            }
+                        }
+                        if indent > 0 {
+                            push_indent(out, indent * (depth + 1));
+                        }
+                        if !json_stringify_into(it, indent, depth + 1, out) {
+                            out.push_str("null");
+                        }
+                    }
+                    if indent > 0 {
+                        out.push('\n');
+                        push_indent(out, indent * depth);
+                    }
+                    out.push(']');
+                    true
                 }
-                let inner = parts
-                    .iter()
-                    .map(|p| format!("{}{}", pad(depth + 1), p))
-                    .collect::<Vec<_>>()
-                    .join(",\n");
-                return Some(format!("[\n{}\n{}]", inner, pad(depth)));
-            }
-            let entries: Vec<(Rc<str>, Value)> = o
-                .borrow()
-                .props
-                .iter()
-                .filter_map(|(k, slot)| match slot {
-                    PropSlot::Value(val) => Some((k.clone(), val.clone())),
-                    PropSlot::Accessor { .. } => None,
-                })
-                .collect();
-            let mut parts = Vec::new();
-            for (k, val) in entries {
-                if let Some(s) = json_stringify(&val, indent, depth + 1) {
-                    parts.push(format!("{}:{}", json_quote(&k), s));
+                _ => {
+                    let start_len = out.len();
+                    out.push('{');
+                    let mut count = 0usize;
+                    for (k, slot) in b.props.iter() {
+                        let PropSlot::Value(val) = slot else {
+                            continue;
+                        };
+                        let entry_mark = out.len();
+                        if count > 0 {
+                            out.push(',');
+                        }
+                        if indent > 0 {
+                            out.push('\n');
+                            push_indent(out, indent * (depth + 1));
+                        }
+                        json_quote_into(k, out);
+                        out.push(':');
+                        if json_stringify_into(val, indent, depth + 1, out) {
+                            count += 1;
+                        } else {
+                            out.truncate(entry_mark);
+                        }
+                    }
+                    if count == 0 {
+                        out.truncate(start_len);
+                        out.push_str("{}");
+                        return true;
+                    }
+                    if indent > 0 {
+                        out.push('\n');
+                        push_indent(out, indent * depth);
+                    }
+                    out.push('}');
+                    true
                 }
             }
-            if indent == 0 || parts.is_empty() {
-                return Some(format!("{{{}}}", parts.join(",")));
-            }
-            let inner = parts
-                .iter()
-                .map(|p| format!("{}{}", pad(depth + 1), p))
-                .collect::<Vec<_>>()
-                .join(",\n");
-            Some(format!("{{\n{}\n{}}}", inner, pad(depth)))
         }
     }
 }
 
 struct JsonParser<'a> {
-    chars: Vec<char>,
+    src: &'a str,
+    bytes: &'a [u8],
     pos: usize,
-    _src: &'a str,
 }
 
-fn json_parse(s: &str) -> Result<Value, String> {
+fn json_parse(vm: &Vm, s: &str) -> Result<Value, String> {
     let mut p = JsonParser {
-        chars: s.chars().collect(),
+        src: s,
+        bytes: s.as_bytes(),
         pos: 0,
-        _src: s,
     };
     p.skip_ws();
-    let v = p.parse_value()?;
+    let v = p.parse_value(vm)?;
     p.skip_ws();
-    if p.pos != p.chars.len() {
+    if p.pos != p.bytes.len() {
         return Err("末尾に余分な文字があります".to_string());
     }
     Ok(v)
 }
 
 impl<'a> JsonParser<'a> {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
+    #[inline]
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
-            self.pos += 1;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                self.pos += 1;
+            } else if b >= 0x80 {
+                // 非 ASCII 空白へのフォールバック
+                let ch = self.src[self.pos..].chars().next().unwrap();
+                if ch.is_whitespace() {
+                    self.pos += ch.len_utf8();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
     }
-    fn expect(&mut self, c: char) -> Result<(), String> {
+    #[inline]
+    fn expect(&mut self, c: u8) -> Result<(), String> {
         if self.peek() == Some(c) {
             self.pos += 1;
             Ok(())
         } else {
-            Err(format!("'{c}' を期待しました（位置 {}）", self.pos))
+            Err(format!(
+                "'{}' を期待しました（位置 {}）",
+                c as char, self.pos
+            ))
         }
     }
-    fn parse_value(&mut self) -> Result<Value, String> {
+    fn parse_value(&mut self, vm: &Vm) -> Result<Value, String> {
         self.skip_ws();
         match self.peek() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
-            Some('"') => Ok(Value::str(self.parse_string()?)),
-            Some('t') => {
-                self.expect_word("true")?;
+            Some(b'{') => self.parse_object(vm),
+            Some(b'[') => self.parse_array(vm),
+            Some(b'"') => Ok(Value::Str(self.parse_string_rc()?)),
+            Some(b't') => {
+                self.expect_word(b"true")?;
                 Ok(Value::Bool(true))
             }
-            Some('f') => {
-                self.expect_word("false")?;
+            Some(b'f') => {
+                self.expect_word(b"false")?;
                 Ok(Value::Bool(false))
             }
-            Some('n') => {
-                self.expect_word("null")?;
+            Some(b'n') => {
+                self.expect_word(b"null")?;
                 Ok(Value::Null)
             }
-            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
             _ => Err(format!("値を期待しました（位置 {}）", self.pos)),
         }
     }
-    fn expect_word(&mut self, w: &str) -> Result<(), String> {
-        for c in w.chars() {
-            self.expect(c)?;
+    fn expect_word(&mut self, w: &[u8]) -> Result<(), String> {
+        if self.bytes[self.pos..].starts_with(w) {
+            self.pos += w.len();
+            Ok(())
+        } else {
+            Err(format!(
+                "'{}' を期待しました（位置 {}）",
+                std::str::from_utf8(w).unwrap_or(""),
+                self.pos
+            ))
         }
-        Ok(())
     }
-    fn parse_object(&mut self) -> Result<Value, String> {
-        self.expect('{')?;
-        let obj = Value::new_plain_object();
+    fn parse_object(&mut self, vm: &Vm) -> Result<Value, String> {
+        self.expect(b'{')?;
+        let mut obj_data = ObjData::new(ObjKind::Plain);
         self.skip_ws();
-        if self.peek() == Some('}') {
+        if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok(obj);
+            return Ok(vm.alloc_obj(obj_data));
         }
         loop {
             self.skip_ws();
-            let key = self.parse_string()?;
+            let key = self.parse_string_rc()?;
             self.skip_ws();
-            self.expect(':')?;
-            let val = self.parse_value()?;
-            if let Value::Object(o) = &obj {
-                o.borrow_mut().props.set_value(Rc::from(key.as_str()), val);
-            }
+            self.expect(b':')?;
+            let val = self.parse_value(vm)?;
+            obj_data.props.set_value(key, val);
             self.skip_ws();
             match self.peek() {
-                Some(',') => {
+                Some(b',') => {
                     self.pos += 1;
                 }
-                Some('}') => {
+                Some(b'}') => {
                     self.pos += 1;
                     break;
                 }
                 _ => return Err(format!("',' か '}}' を期待しました（位置 {}）", self.pos)),
             }
         }
-        Ok(obj)
+        Ok(vm.alloc_obj(obj_data))
     }
-    fn parse_array(&mut self) -> Result<Value, String> {
-        self.expect('[')?;
+    fn parse_array(&mut self, vm: &Vm) -> Result<Value, String> {
+        self.expect(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
-        if self.peek() == Some(']') {
+        if self.peek() == Some(b']') {
             self.pos += 1;
-            return Ok(Value::new_array(items));
+            return Ok(vm.alloc_array(items));
         }
         loop {
-            let v = self.parse_value()?;
+            let v = self.parse_value(vm)?;
             items.push(v);
             self.skip_ws();
             match self.peek() {
-                Some(',') => {
+                Some(b',') => {
                     self.pos += 1;
                 }
-                Some(']') => {
+                Some(b']') => {
                     self.pos += 1;
                     break;
                 }
                 _ => return Err(format!("',' か ']' を期待しました（位置 {}）", self.pos)),
             }
         }
-        Ok(Value::new_array(items))
+        Ok(vm.alloc_array(items))
     }
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.expect('"')?;
-        let mut out = String::new();
+    fn parse_string_rc(&mut self) -> Result<Rc<str>, String> {
+        self.expect(b'"')?;
+        let start = self.pos;
+        // エスケープ無しの高速パス（大半の JSON 文字列・キーがここに落ちる）
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if b == b'"' {
+                let s = &self.src[start..self.pos];
+                self.pos += 1;
+                return Ok(Rc::from(s));
+            }
+            if b == b'\\' {
+                break;
+            }
+            self.pos += 1;
+        }
+        let mut out = String::with_capacity(self.pos - start + 16);
+        out.push_str(&self.src[start..self.pos]);
         loop {
             match self.peek() {
                 None => return Err("文字列が閉じられていません".to_string()),
-                Some('"') => {
+                Some(b'"') => {
                     self.pos += 1;
                     break;
                 }
-                Some('\\') => {
+                Some(b'\\') => {
                     self.pos += 1;
                     match self.peek() {
-                        Some('"') => out.push('"'),
-                        Some('\\') => out.push('\\'),
-                        Some('/') => out.push('/'),
-                        Some('n') => out.push('\n'),
-                        Some('t') => out.push('\t'),
-                        Some('r') => out.push('\r'),
-                        Some('b') => out.push('\u{8}'),
-                        Some('f') => out.push('\u{c}'),
-                        Some('u') => {
-                            let hex: String =
-                                self.chars[self.pos + 1..self.pos + 5].iter().collect();
-                            let code = u32::from_str_radix(&hex, 16)
+                        Some(b'"') => out.push('"'),
+                        Some(b'\\') => out.push('\\'),
+                        Some(b'/') => out.push('/'),
+                        Some(b'n') => out.push('\n'),
+                        Some(b't') => out.push('\t'),
+                        Some(b'r') => out.push('\r'),
+                        Some(b'b') => out.push('\u{8}'),
+                        Some(b'f') => out.push('\u{c}'),
+                        Some(b'u') => {
+                            if self.pos + 5 > self.bytes.len() {
+                                return Err("不正な \\u エスケープです".to_string());
+                            }
+                            let hex = &self.src[self.pos + 1..self.pos + 5];
+                            let code = u32::from_str_radix(hex, 16)
                                 .map_err(|_| "不正な \\u エスケープです".to_string())?;
                             if let Some(c) = char::from_u32(code) {
                                 out.push(c);
@@ -496,39 +636,72 @@ impl<'a> JsonParser<'a> {
                     }
                     self.pos += 1;
                 }
-                Some(c) => {
-                    out.push(c);
+                Some(_) => {
+                    let chunk_start = self.pos;
                     self.pos += 1;
+                    while let Some(&b) = self.bytes.get(self.pos) {
+                        if b == b'"' || b == b'\\' {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    out.push_str(&self.src[chunk_start..self.pos]);
                 }
             }
         }
-        Ok(out)
+        Ok(Rc::from(out))
     }
     fn parse_number(&mut self) -> Result<Value, String> {
         let start = self.pos;
-        if self.peek() == Some('-') {
+        let neg = if self.peek() == Some(b'-') {
             self.pos += 1;
+            true
+        } else {
+            false
+        };
+        let int_start = self.pos;
+        let mut int_acc: i64 = 0;
+        let mut int_digits = 0usize;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if b.is_ascii_digit() {
+                if int_digits < 15 {
+                    int_acc = int_acc * 10 + (b - b'0') as i64;
+                }
+                int_digits += 1;
+                self.pos += 1;
+            } else {
+                break;
+            }
         }
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
             self.pos += 1;
-        }
-        if self.peek() == Some('.') {
-            self.pos += 1;
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
         }
-        if matches!(self.peek(), Some('e') | Some('E')) {
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            is_float = true;
             self.pos += 1;
-            if matches!(self.peek(), Some('+') | Some('-')) {
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
                 self.pos += 1;
             }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
         }
-        let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>()
+        if !is_float && int_digits > 0 && int_digits <= 15 {
+            let n = if neg {
+                -(int_acc as f64)
+            } else {
+                int_acc as f64
+            };
+            return Ok(Value::Number(n));
+        }
+        let _ = int_start;
+        self.src[start..self.pos]
+            .parse::<f64>()
             .map(Value::Number)
             .map_err(|_| "不正な数値です".to_string())
     }
@@ -1472,9 +1645,21 @@ fn norm_index(v: Option<&Value>, default: i64, len: i64) -> i64 {
 
 pub fn string_get_prop(vm: &mut Vm, s: &Rc<str>, name: &str) -> Result<Value, Value> {
     if name == "length" {
-        return Ok(Value::Number(s.chars().count() as f64));
+        let len = if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        };
+        return Ok(Value::Number(len as f64));
     }
     if let Ok(idx) = name.parse::<usize>() {
+        if s.is_ascii() {
+            return Ok(s
+                .as_bytes()
+                .get(idx)
+                .map(|&b| Value::Str(ascii_char_rc(b)))
+                .unwrap_or(Value::Undefined));
+        }
         return Ok(s
             .chars()
             .nth(idx)
@@ -1519,20 +1704,40 @@ fn call_string_method(
 ) -> Option<Result<Value, Value>> {
     Some(match name {
         "slice" => {
-            let s = vm.to_display_string(&this);
-            let chars: Vec<char> = s.chars().collect();
-            let len = chars.len() as i64;
-            let start = norm_index(args.first(), 0, len);
-            let end = norm_index(args.get(1), len, len);
-            let out: String = if start < end {
-                chars[start as usize..end as usize].iter().collect()
+            let s = value_as_cow_str(&this);
+            if s.is_ascii() {
+                let len = s.len() as i64;
+                let start = norm_index(args.first(), 0, len) as usize;
+                let end = norm_index(args.get(1), len, len) as usize;
+                if start < end {
+                    Ok(Value::str(&s[start..end]))
+                } else {
+                    Ok(Value::str(""))
+                }
             } else {
-                String::new()
-            };
-            Ok(Value::str(out))
+                let char_len = s.chars().count() as i64;
+                let start = norm_index(args.first(), 0, char_len) as usize;
+                let end = norm_index(args.get(1), char_len, char_len) as usize;
+                if start >= end {
+                    Ok(Value::str(""))
+                } else {
+                    let mut byte_start = s.len();
+                    let mut byte_end = s.len();
+                    for (ci, (bi, _)) in s.char_indices().enumerate() {
+                        if ci == start {
+                            byte_start = bi;
+                        }
+                        if ci == end {
+                            byte_end = bi;
+                            break;
+                        }
+                    }
+                    Ok(Value::str(&s[byte_start..byte_end]))
+                }
+            }
         }
         "split" => (|| {
-            let s = vm.to_display_string(&this);
+            let s = value_as_cow_str(&this);
             let limit = match args.get(1) {
                 None | Some(Value::Undefined) => usize::MAX,
                 Some(v) => {
@@ -1546,7 +1751,13 @@ fn call_string_method(
             };
             match args.first() {
                 None | Some(Value::Undefined) => {
-                    let mut out = vec![Value::str(s)];
+                    let mut out = if limit == 0 {
+                        Vec::new()
+                    } else if let Value::Str(rc) = &this {
+                        vec![Value::Str(rc.clone())]
+                    } else {
+                        vec![Value::str(s.as_ref())]
+                    };
                     out.truncate(limit);
                     Ok(vm.alloc_array(out))
                 }
@@ -1559,14 +1770,22 @@ fn call_string_method(
                     Ok(vm.alloc_array(items))
                 }
                 Some(sep) => {
-                    let sep_s = vm.to_display_string(sep);
+                    let sep_s = value_as_cow_str(sep);
                     let out: Vec<Value> = if sep_s.is_empty() {
-                        s.chars()
-                            .take(limit)
-                            .map(|c| Value::str(c.to_string()))
-                            .collect()
+                        if s.is_ascii() {
+                            s.as_bytes()
+                                .iter()
+                                .take(limit)
+                                .map(|&b| Value::Str(ascii_char_rc(b)))
+                                .collect()
+                        } else {
+                            s.chars()
+                                .take(limit)
+                                .map(|c| Value::str(c.to_string()))
+                                .collect()
+                        }
                     } else {
-                        s.split(sep_s.as_str())
+                        s.split(sep_s.as_ref())
                             .take(limit)
                             .map(Value::str)
                             .collect()
@@ -1575,28 +1794,40 @@ fn call_string_method(
                 }
             }
         })(),
-        "trim" => Ok(Value::str(vm.to_display_string(&this).trim().to_string())),
+        "trim" => {
+            if let Value::Str(rc) = &this {
+                let t = rc.trim();
+                if t.len() == rc.len() {
+                    Ok(Value::Str(rc.clone()))
+                } else {
+                    Ok(Value::str(t))
+                }
+            } else {
+                let s = to_string_basic(&this);
+                Ok(Value::str(s.trim()))
+            }
+        }
         "startsWith" => {
-            let s = vm.to_display_string(&this);
-            let p = vm.to_display_string(&arg(args, 0));
-            Ok(Value::Bool(s.starts_with(&p)))
+            let s = value_as_cow_str(&this);
+            let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
+            Ok(Value::Bool(s.starts_with(p.as_ref())))
         }
         "endsWith" => {
-            let s = vm.to_display_string(&this);
-            let p = vm.to_display_string(&arg(args, 0));
-            Ok(Value::Bool(s.ends_with(&p)))
+            let s = value_as_cow_str(&this);
+            let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
+            Ok(Value::Bool(s.ends_with(p.as_ref())))
         }
         "includes" => {
-            let s = vm.to_display_string(&this);
-            let p = vm.to_display_string(&arg(args, 0));
-            Ok(Value::Bool(s.contains(&p)))
+            let s = value_as_cow_str(&this);
+            let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
+            Ok(Value::Bool(s.contains(p.as_ref())))
         }
         "indexOf" => {
-            let s = vm.to_display_string(&this);
-            let p = vm.to_display_string(&arg(args, 0));
+            let s = value_as_cow_str(&this);
+            let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
             if p.is_empty() {
                 Ok(Value::Number(0.0))
-            } else if let Some(byte_idx) = s.find(&p) {
+            } else if let Some(byte_idx) = s.find(p.as_ref()) {
                 let char_idx = if s.is_ascii() {
                     byte_idx
                 } else {
@@ -1608,16 +1839,16 @@ fn call_string_method(
             }
         }
         "replace" => {
-            let s = vm.to_display_string(&this);
-            let pattern = arg(args, 0);
-            let replacement = arg(args, 1);
-            string_replace(vm, &s, &pattern, &replacement, false)
+            let s = value_as_cow_str(&this);
+            let pattern = args.first().unwrap_or(&Value::Undefined);
+            let replacement = args.get(1).unwrap_or(&Value::Undefined);
+            string_replace(vm, &s, pattern, replacement, false)
         }
         "replaceAll" => {
-            let s = vm.to_display_string(&this);
-            let pattern = arg(args, 0);
-            let replacement = arg(args, 1);
-            if let Value::Object(o) = &pattern {
+            let s = value_as_cow_str(&this);
+            let pattern = args.first().unwrap_or(&Value::Undefined);
+            let replacement = args.get(1).unwrap_or(&Value::Undefined);
+            if let Value::Object(o) = pattern {
                 if let ObjKind::Regex(re) = &o.borrow().kind {
                     if !re.global {
                         return Some(Err(vm.type_error(
@@ -1626,75 +1857,91 @@ fn call_string_method(
                     }
                 }
             }
-            string_replace(vm, &s, &pattern, &replacement, true)
+            string_replace(vm, &s, pattern, replacement, true)
         }
         "match" => (|| {
-            let s = vm.to_display_string(&this);
-            let re = coerce_to_regex(vm, &arg(args, 0))?;
-            let chars: Vec<char> = s.chars().collect();
-            if re.global {
-                let mut out = vec![];
-                let mut from = 0usize;
-                loop {
-                    if from > chars.len() {
-                        break;
-                    }
-                    match re.search(&chars, from).map_err(|e| regex_err(vm, e))? {
-                        Some(mat) => {
-                            out.push(Value::str(
-                                chars[mat.start..mat.end].iter().collect::<String>(),
-                            ));
-                            from = if mat.end == mat.start {
-                                mat.end + 1
-                            } else {
-                                mat.end
-                            };
+            let s = value_as_cow_str(&this);
+            let re = coerce_to_regex(vm, args.first().unwrap_or(&Value::Undefined))?;
+            with_chars_buf(&s, |chars| {
+                if re.global {
+                    let mut out = vec![];
+                    let mut from = 0usize;
+                    with_regex_scratch(|scratch| -> Result<(), Value> {
+                        loop {
+                            if from > chars.len() {
+                                break;
+                            }
+                            match re
+                                .search_with_scratch(chars, from, scratch)
+                                .map_err(|e| regex_err(vm, e))?
+                            {
+                                Some(mat) => {
+                                    let mut piece = String::with_capacity(mat.end - mat.start);
+                                    piece.extend(&chars[mat.start..mat.end]);
+                                    out.push(Value::str(piece));
+                                    from = if mat.end == mat.start {
+                                        mat.end + 1
+                                    } else {
+                                        mat.end
+                                    };
+                                }
+                                None => break,
+                            }
                         }
-                        None => break,
+                        Ok(())
+                    })?;
+                    if out.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(vm.alloc_array(out))
+                    }
+                } else {
+                    match with_regex_scratch(|scratch| re.search_with_scratch(chars, 0, scratch))
+                        .map_err(|e| regex_err(vm, e))?
+                    {
+                        Some(mat) => Ok(build_match_array(vm, chars, &mat, &s)),
+                        None => Ok(Value::Null),
                     }
                 }
-                if out.is_empty() {
-                    Ok(Value::Null)
-                } else {
-                    Ok(vm.alloc_array(out))
-                }
-            } else {
-                match re.search(&chars, 0).map_err(|e| regex_err(vm, e))? {
-                    Some(mat) => Ok(build_match_array(&chars, &mat, &s)),
-                    None => Ok(Value::Null),
-                }
-            }
+            })
         })(),
         "search" => (|| {
-            let s = vm.to_display_string(&this);
-            let re = coerce_to_regex(vm, &arg(args, 0))?;
-            let chars: Vec<char> = s.chars().collect();
-            match re.search(&chars, 0).map_err(|e| regex_err(vm, e))? {
-                Some(mat) => Ok(Value::Number(mat.start as f64)),
-                None => Ok(Value::Number(-1.0)),
-            }
+            let s = value_as_cow_str(&this);
+            let re = coerce_to_regex(vm, args.first().unwrap_or(&Value::Undefined))?;
+            with_chars_buf(&s, |chars| {
+                match with_regex_scratch(|scratch| re.search_with_scratch(chars, 0, scratch))
+                    .map_err(|e| regex_err(vm, e))?
+                {
+                    Some(mat) => Ok(Value::Number(mat.start as f64)),
+                    None => Ok(Value::Number(-1.0)),
+                }
+            })
         })(),
-        "toLowerCase" => Ok(Value::str(vm.to_display_string(&this).to_lowercase())),
-        "toUpperCase" => Ok(Value::str(vm.to_display_string(&this).to_uppercase())),
+        "toLowerCase" => Ok(Value::str(value_as_cow_str(&this).to_lowercase())),
+        "toUpperCase" => Ok(Value::str(value_as_cow_str(&this).to_uppercase())),
         "charCodeAt" => {
-            let s = vm.to_display_string(&this);
-            let idx = to_number(&arg(args, 0)) as usize;
-            Ok(s.chars()
-                .nth(idx)
-                .map(|c| Value::Number(c as u32 as f64))
-                .unwrap_or(Value::Number(f64::NAN)))
+            let s = value_as_cow_str(&this);
+            let idx = to_number(args.first().unwrap_or(&Value::Undefined)) as usize;
+            let code = if s.is_ascii() {
+                s.as_bytes().get(idx).map(|&b| b as f64)
+            } else {
+                s.chars().nth(idx).map(|c| c as u32 as f64)
+            };
+            Ok(Value::Number(code.unwrap_or(f64::NAN)))
         }
         "codePointAt" => {
-            let s = vm.to_display_string(&this);
-            let idx = to_number(&arg(args, 0)) as usize;
-            Ok(s.chars()
-                .nth(idx)
-                .map(|c| Value::Number(c as u32 as f64))
-                .unwrap_or(Value::Undefined))
+            let s = value_as_cow_str(&this);
+            let idx = to_number(args.first().unwrap_or(&Value::Undefined)) as usize;
+            let code = if s.is_ascii() {
+                s.as_bytes().get(idx).map(|&b| Value::Number(b as f64))
+            } else {
+                s.chars().nth(idx).map(|c| Value::Number(c as u32 as f64))
+            };
+            Ok(code.unwrap_or(Value::Undefined))
         }
         "repeat" => {
-            let s = vm.to_display_string(&this);
-            let n = to_number(&arg(args, 0));
+            let s = value_as_cow_str(&this);
+            let n = to_number(args.first().unwrap_or(&Value::Undefined));
             if n < 0.0 || !n.is_finite() {
                 Err(vm.range_error("repeat count は非負の有限数である必要があります"))
             } else {
@@ -1702,23 +1949,35 @@ fn call_string_method(
             }
         }
         "padStart" => {
-            let s = vm.to_display_string(&this);
-            let target_len = to_number(&arg(args, 0)) as usize;
+            let s = value_as_cow_str(&this);
+            let target_len = to_number(args.first().unwrap_or(&Value::Undefined)) as usize;
             let pad = match args.get(1) {
-                Some(v) => vm.to_display_string(v),
-                None => " ".to_string(),
+                Some(v) => value_as_cow_str(v),
+                None => Cow::Borrowed(" "),
             };
-            let cur_len = s.chars().count();
-            if cur_len >= target_len || pad.is_empty() {
-                Ok(Value::str(s))
+            let cur_len = if s.is_ascii() {
+                s.len()
             } else {
-                let mut prefix = String::new();
-                let pad_chars: Vec<char> = pad.chars().collect();
-                while prefix.chars().count() < target_len - cur_len {
-                    prefix.extend(pad_chars.iter());
+                s.chars().count()
+            };
+            if cur_len >= target_len || pad.is_empty() {
+                if let Value::Str(rc) = &this {
+                    Ok(Value::Str(rc.clone()))
+                } else {
+                    Ok(Value::str(s.as_ref()))
                 }
-                let prefix: String = prefix.chars().take(target_len - cur_len).collect();
-                Ok(Value::str(format!("{prefix}{s}")))
+            } else {
+                let need = target_len - cur_len;
+                let mut out = String::with_capacity(need + s.len());
+                let pad_chars: Vec<char> = pad.chars().collect();
+                let mut written = 0usize;
+                while written < need {
+                    let take = (need - written).min(pad_chars.len());
+                    out.extend(&pad_chars[..take]);
+                    written += take;
+                }
+                out.push_str(&s);
+                Ok(Value::str(out))
             }
         }
         _ => return None,
@@ -2004,34 +2263,44 @@ fn regex_last_index(o: &ObjRef) -> usize {
 }
 
 fn set_last_index(o: &ObjRef, n: usize) {
-    o.borrow_mut()
-        .props
-        .set_value(Rc::from("lastIndex"), Value::Number(n as f64));
+    let key = KEY_LAST_INDEX.with(|k| k.clone());
+    o.borrow_mut().props.set_value(key, Value::Number(n as f64));
 }
 
 /// `RegExp.prototype.exec` の戻り値の配列（`index`/`input`/`groups` プロパティ
 /// 付き）を組み立てる。
-fn build_match_array(chars: &[char], mat: &crate::regex::RegexMatch, input: &str) -> Value {
-    let whole: String = chars[mat.start..mat.end].iter().collect();
-    let mut items = vec![Value::str(whole)];
+fn build_match_array(
+    vm: &Vm,
+    chars: &[char],
+    mat: &crate::regex::RegexMatch,
+    input: &str,
+) -> Value {
+    let mut whole = String::with_capacity(mat.end - mat.start);
+    whole.extend(&chars[mat.start..mat.end]);
+    let mut items = Vec::with_capacity(1 + mat.groups.len());
+    items.push(Value::str(whole));
     for g in &mat.groups {
         items.push(match g {
-            Some((a, b)) => Value::str(chars[*a..*b].iter().collect::<String>()),
+            Some((a, b)) => {
+                let mut gs = String::with_capacity(*b - *a);
+                gs.extend(&chars[*a..*b]);
+                Value::str(gs)
+            }
             None => Value::Undefined,
         });
     }
-    let arr = Value::new_array(items);
-    if let Value::Object(o) = &arr {
-        let mut b = o.borrow_mut();
-        b.props
-            .set_value(Rc::from("index"), Value::Number(mat.start as f64));
-        b.props
-            .set_value(Rc::from("input"), Value::str(input.to_string()));
-        // 名前付きキャプチャグループは未対応のため常に undefined（実 JS の
-        // 「名前付きグループが 1 つも無ければ undefined」という挙動と一致する）。
-        b.props.set_value(Rc::from("groups"), Value::Undefined);
-    }
-    arr
+    let mut obj = ObjData::new(ObjKind::Array(items));
+    obj.props.set_value(
+        KEY_INDEX.with(|k| k.clone()),
+        Value::Number(mat.start as f64),
+    );
+    obj.props
+        .set_value(KEY_INPUT.with(|k| k.clone()), Value::str(input));
+    // 名前付きキャプチャグループは未対応のため常に undefined（実 JS の
+    // 「名前付きグループが 1 つも無ければ undefined」という挙動と一致する）。
+    obj.props
+        .set_value(KEY_GROUPS.with(|k| k.clone()), Value::Undefined);
+    vm.alloc_obj(obj)
 }
 
 fn regex_method(name: &str) -> Option<Value> {
@@ -2054,7 +2323,7 @@ fn call_regex_method(
 ) -> Option<Result<Value, Value>> {
     Some(match name {
         "test" => (|| {
-            let s = vm.to_display_string(&arg(args, 0));
+            let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
             let Value::Object(o) = &this else {
                 return Ok(Value::Bool(false));
             };
@@ -2062,31 +2331,34 @@ fn call_regex_method(
                 ObjKind::Regex(r) => r.clone(),
                 _ => return Ok(Value::Bool(false)),
             };
-            let chars: Vec<char> = s.chars().collect();
-            let from = if re.global { regex_last_index(o) } else { 0 };
-            if from > chars.len() {
-                if re.global {
-                    set_last_index(o, 0);
-                }
-                return Ok(Value::Bool(false));
-            }
-            match re.search(&chars, from).map_err(|e| regex_err(vm, e))? {
-                Some(mat) => {
-                    if re.global {
-                        set_last_index(o, mat.end);
-                    }
-                    Ok(Value::Bool(true))
-                }
-                None => {
+            with_chars_buf(&s, |chars| {
+                let from = if re.global { regex_last_index(o) } else { 0 };
+                if from > chars.len() {
                     if re.global {
                         set_last_index(o, 0);
                     }
-                    Ok(Value::Bool(false))
+                    return Ok(Value::Bool(false));
                 }
-            }
+                match with_regex_scratch(|scratch| re.search_with_scratch(chars, from, scratch))
+                    .map_err(|e| regex_err(vm, e))?
+                {
+                    Some(mat) => {
+                        if re.global {
+                            set_last_index(o, mat.end);
+                        }
+                        Ok(Value::Bool(true))
+                    }
+                    None => {
+                        if re.global {
+                            set_last_index(o, 0);
+                        }
+                        Ok(Value::Bool(false))
+                    }
+                }
+            })
         })(),
         "exec" => (|| {
-            let s = vm.to_display_string(&arg(args, 0));
+            let s = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
             let Value::Object(o) = &this else {
                 return Err(vm.type_error("RegExp ではありません"));
             };
@@ -2094,28 +2366,31 @@ fn call_regex_method(
                 ObjKind::Regex(r) => r.clone(),
                 _ => return Err(vm.type_error("RegExp ではありません")),
             };
-            let chars: Vec<char> = s.chars().collect();
-            let from = if re.global { regex_last_index(o) } else { 0 };
-            if from > chars.len() {
-                if re.global {
-                    set_last_index(o, 0);
-                }
-                return Ok(Value::Null);
-            }
-            match re.search(&chars, from).map_err(|e| regex_err(vm, e))? {
-                Some(mat) => {
-                    if re.global {
-                        set_last_index(o, mat.end);
-                    }
-                    Ok(build_match_array(&chars, &mat, &s))
-                }
-                None => {
+            with_chars_buf(&s, |chars| {
+                let from = if re.global { regex_last_index(o) } else { 0 };
+                if from > chars.len() {
                     if re.global {
                         set_last_index(o, 0);
                     }
-                    Ok(Value::Null)
+                    return Ok(Value::Null);
                 }
-            }
+                match with_regex_scratch(|scratch| re.search_with_scratch(chars, from, scratch))
+                    .map_err(|e| regex_err(vm, e))?
+                {
+                    Some(mat) => {
+                        if re.global {
+                            set_last_index(o, mat.end);
+                        }
+                        Ok(build_match_array(vm, chars, &mat, &s))
+                    }
+                    None => {
+                        if re.global {
+                            set_last_index(o, 0);
+                        }
+                        Ok(Value::Null)
+                    }
+                }
+            })
         })(),
         "toString" => Ok(Value::str(vm.to_display_string(&this))),
         _ => return None,
@@ -2124,149 +2399,205 @@ fn call_regex_method(
 
 // ---------------- String.prototype.replace(All) の置換テンプレート ----------------
 
-/// `$&` `` $` `` `$'` `$1`〜 `$$` を展開する（コールバック関数でない、
-/// 文字列置換の場合）。`groups` は 1 番から順のキャプチャ文字列
-/// （`None` は未参加）。
-fn expand_replacement_template(
+/// `$&` `` $` `` `$'` `$1`〜 `$$` を `&mut String` へ直接展開する（正規表現マッチ版）。
+/// `chars` スライスから直接書き込むことで、中間 `String`・`Vec<char>`・`groups` の
+/// ヒープ確保を完全にゼロに抑える。
+fn expand_regex_template_into(
+    template: &str,
+    chars: &[char],
+    mat: &crate::regex::RegexMatch,
+    out: &mut String,
+) {
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    let mut chunk_start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            match next {
+                b'$' => {
+                    out.push_str(&template[chunk_start..i]);
+                    out.push('$');
+                    i += 2;
+                    chunk_start = i;
+                    continue;
+                }
+                b'&' => {
+                    out.push_str(&template[chunk_start..i]);
+                    out.extend(&chars[mat.start..mat.end]);
+                    i += 2;
+                    chunk_start = i;
+                    continue;
+                }
+                b'`' => {
+                    out.push_str(&template[chunk_start..i]);
+                    out.extend(&chars[..mat.start]);
+                    i += 2;
+                    chunk_start = i;
+                    continue;
+                }
+                b'\'' => {
+                    out.push_str(&template[chunk_start..i]);
+                    out.extend(&chars[mat.end..]);
+                    i += 2;
+                    chunk_start = i;
+                    continue;
+                }
+                b'0'..=b'9' => {
+                    let one = (next - b'0') as usize;
+                    let two = if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
+                        Some(one * 10 + (bytes[i + 2] - b'0') as usize)
+                    } else {
+                        None
+                    };
+                    if let Some(n2) = two {
+                        if n2 >= 1 && n2 <= mat.groups.len() {
+                            out.push_str(&template[chunk_start..i]);
+                            if let Some((a, b)) = mat.groups[n2 - 1] {
+                                out.extend(&chars[a..b]);
+                            }
+                            i += 3;
+                            chunk_start = i;
+                            continue;
+                        }
+                    }
+                    if one >= 1 && one <= mat.groups.len() {
+                        out.push_str(&template[chunk_start..i]);
+                        if let Some((a, b)) = mat.groups[one - 1] {
+                            out.extend(&chars[a..b]);
+                        }
+                        i += 2;
+                        chunk_start = i;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if chunk_start < bytes.len() {
+        out.push_str(&template[chunk_start..]);
+    }
+}
+
+/// 文字列パターン用の `$&` `` $` `` `$'` `$$` 展開を直接 `out` へ書き込む。
+fn expand_str_template_into(
     template: &str,
     matched: &str,
     before: &str,
     after: &str,
-    groups: &[Option<String>],
-) -> String {
-    let tchars: Vec<char> = template.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < tchars.len() {
-        if tchars[i] == '$' && i + 1 < tchars.len() {
-            match tchars[i + 1] {
-                '$' => {
+    out: &mut String,
+) {
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    let mut chunk_start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'$' => {
+                    out.push_str(&template[chunk_start..i]);
                     out.push('$');
                     i += 2;
+                    chunk_start = i;
                     continue;
                 }
-                '&' => {
+                b'&' => {
+                    out.push_str(&template[chunk_start..i]);
                     out.push_str(matched);
                     i += 2;
+                    chunk_start = i;
                     continue;
                 }
-                '`' => {
+                b'`' => {
+                    out.push_str(&template[chunk_start..i]);
                     out.push_str(before);
                     i += 2;
+                    chunk_start = i;
                     continue;
                 }
-                '\'' => {
+                b'\'' => {
+                    out.push_str(&template[chunk_start..i]);
                     out.push_str(after);
                     i += 2;
+                    chunk_start = i;
                     continue;
                 }
-                d if d.is_ascii_digit() => {
-                    let one = d.to_digit(10).unwrap() as usize;
-                    let two = if i + 2 < tchars.len() && tchars[i + 2].is_ascii_digit() {
-                        Some(one * 10 + tchars[i + 2].to_digit(10).unwrap() as usize)
-                    } else {
-                        None
-                    };
-                    // 2桁の番号が有効なキャプチャ番号ならそちらを優先する（JS 仕様）。
-                    if let Some(n2) = two {
-                        if n2 >= 1 && n2 <= groups.len() {
-                            if let Some(g) = groups.get(n2 - 1).and_then(|x| x.as_ref()) {
-                                out.push_str(g);
-                            }
-                            i += 3;
-                            continue;
-                        }
-                    }
-                    if one >= 1 && one <= groups.len() {
-                        if let Some(g) = groups.get(one - 1).and_then(|x| x.as_ref()) {
-                            out.push_str(g);
-                        }
-                        i += 2;
-                        continue;
-                    }
-                    out.push(tchars[i]);
-                    i += 1;
-                }
-                _ => {
-                    out.push(tchars[i]);
-                    i += 1;
-                }
+                _ => {}
             }
-        } else {
-            out.push(tchars[i]);
-            i += 1;
         }
+        i += 1;
     }
-    out
+    if chunk_start < bytes.len() {
+        out.push_str(&template[chunk_start..]);
+    }
 }
 
-/// 正規表現マッチ 1 件分の置換文字列を計算する（コールバック関数 or `$` 展開）。
-fn compute_replacement(
+/// 正規表現マッチ 1 件分のコールバック置換を実行して `out` へ追記する。
+fn call_regex_replace_cb_into(
     vm: &mut Vm,
     replacement: &Value,
     chars: &[char],
     mat: &crate::regex::RegexMatch,
-    matched: &str,
     whole_input: &str,
-) -> Result<String, Value> {
-    if is_callable(replacement) {
-        let mut cb_args = vec![Value::str(matched.to_string())];
-        for g in &mat.groups {
-            cb_args.push(match g {
-                Some((a, b)) => Value::str(chars[*a..*b].iter().collect::<String>()),
-                None => Value::Undefined,
-            });
-        }
-        cb_args.push(Value::Number(mat.start as f64));
-        cb_args.push(Value::str(whole_input.to_string()));
-        let r = vm.call_value(replacement.clone(), Value::Undefined, &cb_args)?;
-        Ok(vm.to_display_string(&r))
-    } else {
-        let template = vm.to_display_string(replacement);
-        let before: String = chars[..mat.start].iter().collect();
-        let after: String = chars[mat.end..].iter().collect();
-        let groups: Vec<Option<String>> = mat
-            .groups
-            .iter()
-            .map(|g| g.map(|(a, b)| chars[a..b].iter().collect()))
-            .collect();
-        Ok(expand_replacement_template(
-            &template, matched, &before, &after, &groups,
-        ))
+    out: &mut String,
+) -> Result<(), Value> {
+    let mut matched = String::with_capacity(mat.end - mat.start);
+    matched.extend(&chars[mat.start..mat.end]);
+    let mut cb_args = Vec::with_capacity(3 + mat.groups.len());
+    cb_args.push(Value::str(matched));
+    for g in &mat.groups {
+        cb_args.push(match g {
+            Some((a, b)) => {
+                let mut gs = String::with_capacity(*b - *a);
+                gs.extend(&chars[*a..*b]);
+                Value::str(gs)
+            }
+            None => Value::Undefined,
+        });
     }
+    cb_args.push(Value::Number(mat.start as f64));
+    cb_args.push(Value::str(whole_input));
+    let r = vm.call_value(replacement.clone(), Value::Undefined, &cb_args)?;
+    crate::vm::to_string_into(&r, out);
+    Ok(())
 }
 
-/// 文字列パターン（正規表現でない）の 1 件分の置換文字列を計算する
-/// （キャプチャグループは無い）。
-fn compute_replacement_str(
+/// 文字列パターン（正規表現でない）の 1 件分の置換文字列を `out` へ追記する。
+fn append_replacement_str(
     vm: &mut Vm,
     replacement: &Value,
     matched: &str,
     before: &str,
     after: &str,
     whole_input: &str,
-) -> Result<String, Value> {
+    out: &mut String,
+) -> Result<(), Value> {
     if is_callable(replacement) {
-        let idx = before.chars().count();
+        let idx = if before.is_ascii() {
+            before.len()
+        } else {
+            before.chars().count()
+        };
         let r = vm.call_value(
             replacement.clone(),
             Value::Undefined,
             &[
-                Value::str(matched.to_string()),
+                Value::str(matched),
                 Value::Number(idx as f64),
-                Value::str(whole_input.to_string()),
+                Value::str(whole_input),
             ],
         )?;
-        Ok(vm.to_display_string(&r))
+        crate::vm::to_string_into(&r, out);
+        Ok(())
     } else {
-        let template = vm.to_display_string(replacement);
-        Ok(expand_replacement_template(
-            &template,
-            matched,
-            before,
-            after,
-            &[],
-        ))
+        let template = value_as_cow_str(replacement);
+        if template.contains('$') {
+            expand_str_template_into(&template, matched, before, after, out);
+        } else {
+            out.push_str(&template);
+        }
+        Ok(())
     }
 }
 
@@ -2293,8 +2624,51 @@ fn string_replace(
             _ => unreachable!(),
         };
         let global = force_all || re.global;
+        let callable = is_callable(replacement);
+        if !callable {
+            let template = value_as_cow_str(replacement);
+            let has_dollar = template.contains('$');
+            return with_chars_buf(s, |chars| {
+                let mut out = String::with_capacity(s.len());
+                let mut pos = 0usize;
+                let mut search_from = 0usize;
+                with_regex_scratch(|scratch| -> Result<(), Value> {
+                    loop {
+                        if search_from > chars.len() {
+                            break;
+                        }
+                        let Some(mat) = re
+                            .search_with_scratch(chars, search_from, scratch)
+                            .map_err(|e| regex_err(vm, e))?
+                        else {
+                            break;
+                        };
+                        out.extend(&chars[pos..mat.start]);
+                        if has_dollar {
+                            expand_regex_template_into(&template, chars, &mat, &mut out);
+                        } else {
+                            out.push_str(&template);
+                        }
+                        pos = mat.end;
+                        search_from = if mat.end == mat.start {
+                            mat.end + 1
+                        } else {
+                            mat.end
+                        };
+                        if !global {
+                            break;
+                        }
+                    }
+                    Ok(())
+                })?;
+                out.extend(&chars[pos..]);
+                Ok(Value::str(out))
+            });
+        }
+        // コールバック関数は再入し得るためローカル `Vec<char>` と `RegexScratch` を使う
         let chars: Vec<char> = s.chars().collect();
-        let mut out = String::new();
+        let mut scratch = RegexScratch::default();
+        let mut out = String::with_capacity(s.len());
         let mut pos = 0usize;
         let mut search_from = 0usize;
         loop {
@@ -2302,15 +2676,13 @@ fn string_replace(
                 break;
             }
             let Some(mat) = re
-                .search(&chars, search_from)
+                .search_with_scratch(&chars, search_from, &mut scratch)
                 .map_err(|e| regex_err(vm, e))?
             else {
                 break;
             };
-            out.push_str(&chars[pos..mat.start].iter().collect::<String>());
-            let matched: String = chars[mat.start..mat.end].iter().collect();
-            let rep = compute_replacement(vm, replacement, &chars, &mat, &matched, s)?;
-            out.push_str(&rep);
+            out.extend(&chars[pos..mat.start]);
+            call_regex_replace_cb_into(vm, replacement, &chars, &mat, s, &mut out)?;
             pos = mat.end;
             search_from = if mat.end == mat.start {
                 mat.end + 1
@@ -2321,70 +2693,78 @@ fn string_replace(
                 break;
             }
         }
-        out.push_str(&chars[pos..].iter().collect::<String>());
+        out.extend(&chars[pos..]);
         Ok(Value::str(out))
     } else {
-        let needle = vm.to_display_string(pattern);
+        let needle = value_as_cow_str(pattern);
+        // 最も頻出する「文字列リテラル置換かつ `$` 展開なし」の高速パス
+        if !is_callable(replacement) {
+            let template = value_as_cow_str(replacement);
+            if !template.contains('$') {
+                if force_all {
+                    if needle.is_empty() {
+                        let mut out =
+                            String::with_capacity(s.len() + template.len() * (s.len() + 1));
+                        for c in s.chars() {
+                            out.push_str(&template);
+                            out.push(c);
+                        }
+                        out.push_str(&template);
+                        return Ok(Value::str(out));
+                    }
+                    return Ok(Value::str(s.replace(needle.as_ref(), template.as_ref())));
+                } else {
+                    return match s.find(needle.as_ref()) {
+                        Some(idx) => {
+                            let mut out =
+                                String::with_capacity(s.len() - needle.len() + template.len());
+                            out.push_str(&s[..idx]);
+                            out.push_str(&template);
+                            out.push_str(&s[idx + needle.len()..]);
+                            Ok(Value::str(out))
+                        }
+                        None => Ok(Value::str(s)),
+                    };
+                }
+            }
+        }
         if force_all {
             if needle.is_empty() {
                 // 空文字列パターンの replaceAll は各文字の間（先頭・末尾含む）に挿入する。
-                let mut out = String::new();
-                let chars: Vec<char> = s.chars().collect();
-                for (i, c) in chars.iter().enumerate() {
-                    let before: String = chars[..i].iter().collect();
-                    let after: String = chars[i..].iter().collect();
-                    out.push_str(&compute_replacement_str(
-                        vm,
-                        replacement,
-                        "",
-                        &before,
-                        &after,
-                        s,
-                    )?);
-                    out.push(*c);
+                let mut out = String::with_capacity(s.len() * 2);
+                for (byte_i, c) in s.char_indices() {
+                    let before = &s[..byte_i];
+                    let after = &s[byte_i..];
+                    append_replacement_str(vm, replacement, "", before, after, s, &mut out)?;
+                    out.push(c);
                 }
-                let before: String = chars.iter().collect();
-                out.push_str(&compute_replacement_str(
-                    vm,
-                    replacement,
-                    "",
-                    &before,
-                    "",
-                    s,
-                )?);
+                append_replacement_str(vm, replacement, "", s, "", s, &mut out)?;
                 return Ok(Value::str(out));
             }
-            let mut out = String::new();
-            let mut rest = s;
-            let mut consumed = String::new();
-            loop {
-                match rest.find(&needle) {
-                    Some(idx) => {
-                        out.push_str(&rest[..idx]);
-                        consumed.push_str(&rest[..idx]);
-                        let after = &rest[idx + needle.len()..];
-                        let rep =
-                            compute_replacement_str(vm, replacement, &needle, &consumed, after, s)?;
-                        out.push_str(&rep);
-                        consumed.push_str(&rest[idx..idx + needle.len()]);
-                        rest = after;
-                    }
-                    None => {
-                        out.push_str(rest);
-                        break;
-                    }
-                }
+            let mut out = String::with_capacity(s.len());
+            let mut pos = 0usize;
+            while let Some(rel) = s[pos..].find(needle.as_ref()) {
+                let abs = pos + rel;
+                out.push_str(&s[pos..abs]);
+                let before = &s[..abs];
+                let after = &s[abs + needle.len()..];
+                append_replacement_str(vm, replacement, &needle, before, after, s, &mut out)?;
+                pos = abs + needle.len();
             }
+            out.push_str(&s[pos..]);
             Ok(Value::str(out))
         } else {
-            match s.find(&needle) {
+            match s.find(needle.as_ref()) {
                 Some(idx) => {
                     let before = &s[..idx];
                     let after = &s[idx + needle.len()..];
-                    let rep = compute_replacement_str(vm, replacement, &needle, before, after, s)?;
-                    Ok(Value::str(format!("{before}{rep}{after}")))
+                    let mut out = String::with_capacity(s.len());
+                    out.push_str(before);
+                    append_replacement_str(vm, replacement, &needle, before, after, s, &mut out)?;
+                    out.push_str(after);
+                    Ok(Value::str(out))
                 }
-                None => Ok(Value::str(s.to_string())),
+                None => Ok(Value::str(s)),
             }
         }
     }
@@ -2398,61 +2778,70 @@ fn regex_split(
     s: &str,
     limit: usize,
 ) -> Result<Vec<Value>, Value> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.is_empty() {
-        let mut out = vec![];
-        if re
-            .search(&chars, 0)
-            .map_err(|e| regex_err(vm, e))?
-            .is_none()
-        {
-            out.push(Value::str(String::new()));
+    with_chars_buf(s, |chars| {
+        if chars.is_empty() {
+            let mut out = vec![];
+            if with_regex_scratch(|scratch| re.search_with_scratch(chars, 0, scratch))
+                .map_err(|e| regex_err(vm, e))?
+                .is_none()
+            {
+                out.push(Value::str(""));
+            }
+            out.truncate(limit);
+            return Ok(out);
+        }
+        let mut out: Vec<Value> = vec![];
+        let mut p = 0usize;
+        let mut search_from = 0usize;
+        with_regex_scratch(|scratch| -> Result<(), Value> {
+            loop {
+                if out.len() >= limit || search_from > chars.len() {
+                    break;
+                }
+                let Some(mat) = re
+                    .search_with_scratch(chars, search_from, scratch)
+                    .map_err(|e| regex_err(vm, e))?
+                else {
+                    break;
+                };
+                if mat.start >= chars.len() {
+                    break;
+                }
+                if mat.end == mat.start && mat.start == p {
+                    search_from = mat.start + 1;
+                    continue;
+                }
+                let mut piece = String::with_capacity(mat.start - p);
+                piece.extend(&chars[p..mat.start]);
+                out.push(Value::str(piece));
+                for g in &mat.groups {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(match g {
+                        Some((a, b)) => {
+                            let mut gs = String::with_capacity(*b - *a);
+                            gs.extend(&chars[*a..*b]);
+                            Value::str(gs)
+                        }
+                        None => Value::Undefined,
+                    });
+                }
+                p = mat.end;
+                search_from = if mat.end == mat.start {
+                    mat.end + 1
+                } else {
+                    mat.end
+                };
+            }
+            Ok(())
+        })?;
+        if out.len() < limit {
+            let mut tail = String::with_capacity(chars.len() - p);
+            tail.extend(&chars[p..]);
+            out.push(Value::str(tail));
         }
         out.truncate(limit);
-        return Ok(out);
-    }
-    let mut out: Vec<Value> = vec![];
-    let mut p = 0usize;
-    let mut search_from = 0usize;
-    loop {
-        if out.len() >= limit || search_from > chars.len() {
-            break;
-        }
-        let Some(mat) = re
-            .search(&chars, search_from)
-            .map_err(|e| regex_err(vm, e))?
-        else {
-            break;
-        };
-        if mat.start >= chars.len() {
-            break;
-        }
-        if mat.end == mat.start && mat.start == p {
-            // 直前の分割位置と同じ場所での空幅マッチはスキップする
-            // （そうしないと同じ位置で無限に分割してしまう）。
-            search_from = mat.start + 1;
-            continue;
-        }
-        out.push(Value::str(chars[p..mat.start].iter().collect::<String>()));
-        for g in &mat.groups {
-            if out.len() >= limit {
-                break;
-            }
-            out.push(match g {
-                Some((a, b)) => Value::str(chars[*a..*b].iter().collect::<String>()),
-                None => Value::Undefined,
-            });
-        }
-        p = mat.end;
-        search_from = if mat.end == mat.start {
-            mat.end + 1
-        } else {
-            mat.end
-        };
-    }
-    if out.len() < limit {
-        out.push(Value::str(chars[p..].iter().collect::<String>()));
-    }
-    out.truncate(limit);
-    Ok(out)
+        Ok(out)
+    })
 }

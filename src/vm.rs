@@ -574,8 +574,12 @@ impl Vm {
     }
 
     pub(crate) fn alloc_regex_value(&self, re: Rc<crate::regex::Regex>) -> Value {
+        thread_local! {
+            static KEY_LAST_INDEX: Rc<str> = Rc::from("lastIndex");
+        }
         let mut o = ObjData::new(ObjKind::Regex(re));
-        o.props.set_value(Rc::from("lastIndex"), Value::Number(0.0));
+        o.props
+            .set_value(KEY_LAST_INDEX.with(|k| k.clone()), Value::Number(0.0));
         self.alloc_obj(o)
     }
 

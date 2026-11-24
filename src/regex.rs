@@ -168,10 +168,51 @@ fn range_matches(lo: char, hi: char, c: char, ignore_case: bool) -> bool {
 struct CharClass {
     negate: bool,
     atoms: Vec<ClassAtom>,
+    /// 128 個の ASCII 文字（0..128）に対する事前計算ビットマップ（`negate`/`ignore_case` 反映済み）。
+    ascii_bits: [u64; 2],
+    /// 非 ASCII 文字に対して `atoms` を実際に走査する必要があるか。
+    has_non_ascii_atoms: bool,
 }
 
 impl CharClass {
+    fn new(negate: bool, atoms: Vec<ClassAtom>) -> Self {
+        CharClass {
+            negate,
+            atoms,
+            ascii_bits: [0; 2],
+            has_non_ascii_atoms: true,
+        }
+    }
+
+    fn compile_bitmap(&mut self, ignore_case: bool) {
+        let mut bits = [0u64; 2];
+        for b in 0u8..128 {
+            let c = b as char;
+            let hit = self.atoms.iter().any(|a| atom_matches(a, c, ignore_case));
+            if hit != self.negate {
+                bits[(b >> 6) as usize] |= 1u64 << (b & 63);
+            }
+        }
+        self.ascii_bits = bits;
+        self.has_non_ascii_atoms = self.atoms.iter().any(|a| match a {
+            ClassAtom::Char(x) => (*x as u32) >= 128,
+            ClassAtom::Range(_, hi) => (*hi as u32) >= 128,
+            ClassAtom::Digit | ClassAtom::Word => false,
+            ClassAtom::NotDigit | ClassAtom::NotWord | ClassAtom::Space | ClassAtom::NotSpace => {
+                true
+            }
+        });
+    }
+
+    #[inline]
     fn matches(&self, c: char, ignore_case: bool) -> bool {
+        let code = c as u32;
+        if code < 128 {
+            return ((self.ascii_bits[(code >> 6) as usize] >> (code & 63)) & 1) != 0;
+        }
+        if !self.has_non_ascii_atoms {
+            return self.negate;
+        }
         let hit = self.atoms.iter().any(|a| atom_matches(a, c, ignore_case));
         hit != self.negate
     }
@@ -507,30 +548,12 @@ impl Parser {
             .advance()
             .ok_or_else(|| RegexError("パターンがバックスラッシュで終わっています".to_string()))?;
         Ok(match c {
-            'd' => Ast::Class(CharClass {
-                negate: false,
-                atoms: vec![ClassAtom::Digit],
-            }),
-            'D' => Ast::Class(CharClass {
-                negate: false,
-                atoms: vec![ClassAtom::NotDigit],
-            }),
-            'w' => Ast::Class(CharClass {
-                negate: false,
-                atoms: vec![ClassAtom::Word],
-            }),
-            'W' => Ast::Class(CharClass {
-                negate: false,
-                atoms: vec![ClassAtom::NotWord],
-            }),
-            's' => Ast::Class(CharClass {
-                negate: false,
-                atoms: vec![ClassAtom::Space],
-            }),
-            'S' => Ast::Class(CharClass {
-                negate: false,
-                atoms: vec![ClassAtom::NotSpace],
-            }),
+            'd' => Ast::Class(CharClass::new(false, vec![ClassAtom::Digit])),
+            'D' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotDigit])),
+            'w' => Ast::Class(CharClass::new(false, vec![ClassAtom::Word])),
+            'W' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotWord])),
+            's' => Ast::Class(CharClass::new(false, vec![ClassAtom::Space])),
+            'S' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotSpace])),
             'b' => Ast::WordB(true),
             'B' => Ast::WordB(false),
             'n' => Ast::Char('\n'),
@@ -626,7 +649,7 @@ impl Parser {
                 }
             }
         }
-        Ok(Ast::Class(CharClass { negate, atoms }))
+        Ok(Ast::Class(CharClass::new(negate, atoms)))
     }
 
     /// `start` の直後が `-<終端>` の形なら範囲として、そうでなければ単独の
@@ -1148,6 +1171,27 @@ pub struct RegexMatch {
     pub groups: Vec<Option<(usize, usize)>>,
 }
 
+/// 正規表現実行時の再利用可能バッファ（`saved` / `trail` / `stack`）。
+/// `match`/`replace`/`split` のような繰り返し検索で毎回のヒープ確保を避けるために使う。
+#[derive(Default)]
+pub(crate) struct RegexScratch {
+    saved: Saved,
+    trail: Trail,
+    stack: Vec<BacktrackFrame>,
+}
+
+/// 検索開始位置の高速フィルタ（先頭 `Save` 列の直後にある最初の消費/アンカー命令）。
+#[derive(Clone)]
+enum StartFilter {
+    None,
+    /// `!multiline` かつ先頭が `^`（`s == 0` でのみマッチ可能）。
+    AnchoredStart,
+    /// `!ignore_case` かつ先頭が単一リテラル文字。
+    FirstChar(char),
+    /// 先頭が文字クラス（ASCII ビットマップで O(1) スキップ）。
+    FirstClass(CharClass),
+}
+
 pub struct Regex {
     pub source: String,
     pub flags: String,
@@ -1161,6 +1205,7 @@ pub struct Regex {
     /// 量指定子の進捗チェック用スクラッチスロット）。
     total_slots: usize,
     prog: Vec<Inst>,
+    start_filter: StartFilter,
 }
 
 impl Regex {
@@ -1207,6 +1252,23 @@ impl Regex {
         c.compile(&ast);
         c.emit(Inst::Save(1));
         c.emit(Inst::Match);
+        for inst in &mut c.prog {
+            if let Inst::Class(cc) = inst {
+                cc.compile_bitmap(ignore_case);
+            }
+        }
+        let start_filter = {
+            let mut idx = 0usize;
+            while matches!(c.prog.get(idx), Some(Inst::Save(_))) {
+                idx += 1;
+            }
+            match c.prog.get(idx) {
+                Some(Inst::Bol) if !multiline => StartFilter::AnchoredStart,
+                Some(Inst::Char(ch)) if !ignore_case => StartFilter::FirstChar(*ch),
+                Some(Inst::Class(cc)) => StartFilter::FirstClass(cc.clone()),
+                _ => StartFilter::None,
+            }
+        };
         let total_slots = 2 * (ncaptures + 1) + c.scratch_count;
         Ok(Regex {
             source: pattern.to_string(),
@@ -1219,6 +1281,7 @@ impl Regex {
             ncaptures,
             total_slots,
             prog: c.prog,
+            start_filter,
         })
     }
 
@@ -1229,6 +1292,19 @@ impl Regex {
     /// `from`（文字インデックス）以降の最初の一致を探す（非アンカーの部分
     /// 一致検索。実際の JS の `RegExp.prototype.exec` の挙動に相当）。
     pub fn search(&self, chars: &[char], from: usize) -> Result<Option<RegexMatch>, RegexError> {
+        let mut scratch = RegexScratch::default();
+        self.search_with_scratch(chars, from, &mut scratch)
+    }
+
+    pub(crate) fn search_with_scratch(
+        &self,
+        chars: &[char],
+        from: usize,
+        scratch: &mut RegexScratch,
+    ) -> Result<Option<RegexMatch>, RegexError> {
+        if matches!(self.start_filter, StartFilter::AnchoredStart) && from > 0 {
+            return Ok(None);
+        }
         let nslots = self.total_slots;
         let mut exec = Exec {
             prog: &self.prog,
@@ -1240,18 +1316,51 @@ impl Regex {
             max_steps: DEFAULT_MAX_STEPS,
             max_depth: DEFAULT_MAX_DEPTH,
         };
-        let mut saved: Saved = vec![None; nslots];
-        let mut trail: Trail = Vec::new();
-        let mut stack: Vec<BacktrackFrame> = Vec::new();
+        scratch.saved.clear();
+        scratch.saved.resize(nslots, None);
+        scratch.trail.clear();
+        scratch.stack.clear();
         let mut s = from;
         loop {
             if s > chars.len() {
                 return Ok(None);
             }
+            match &self.start_filter {
+                StartFilter::None => {}
+                StartFilter::AnchoredStart => {
+                    if s > 0 {
+                        return Ok(None);
+                    }
+                }
+                StartFilter::FirstChar(target) => {
+                    while s < chars.len() && chars[s] != *target {
+                        s += 1;
+                    }
+                    if s >= chars.len() {
+                        return Ok(None);
+                    }
+                }
+                StartFilter::FirstClass(cc) => {
+                    while s < chars.len() && !cc.matches(chars[s], self.ignore_case) {
+                        s += 1;
+                    }
+                    if s >= chars.len() {
+                        return Ok(None);
+                    }
+                }
+            }
             if exec
-                .run_from(0, s, &mut saved, &mut trail, &mut stack, 0)?
+                .run_from(
+                    0,
+                    s,
+                    &mut scratch.saved,
+                    &mut scratch.trail,
+                    &mut scratch.stack,
+                    0,
+                )?
                 .is_some()
             {
+                let saved = &scratch.saved;
                 let get = |i: usize| saved.get(i).copied().flatten();
                 let start = get(0).unwrap();
                 let end = get(1).unwrap();
@@ -1264,9 +1373,12 @@ impl Regex {
                 }
                 return Ok(Some(RegexMatch { start, end, groups }));
             }
-            debug_assert!(trail.is_empty());
-            debug_assert!(stack.is_empty());
-            debug_assert!(saved.iter().all(|v| v.is_none()));
+            debug_assert!(scratch.trail.is_empty());
+            debug_assert!(scratch.stack.is_empty());
+            debug_assert!(scratch.saved.iter().all(|v| v.is_none()));
+            if matches!(self.start_filter, StartFilter::AnchoredStart) {
+                return Ok(None);
+            }
             s += 1;
         }
     }
