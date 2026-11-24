@@ -363,6 +363,24 @@ impl Chunk {
             self.ic_slots = vec![Cell::new(IC_UNSET); self.code.len()];
         }
     }
+
+    #[inline]
+    pub(crate) fn ic_hint(&self, ip: usize) -> usize {
+        self.ic_slots
+            .get(ip)
+            .map_or(IC_UNSET as usize, |c| c.get() as usize)
+    }
+
+    #[inline]
+    pub(crate) fn set_ic_hint(&self, ip: usize, idx: usize) {
+        if idx < IC_UNSET as usize {
+            if let Some(slot) = self.ic_slots.get(ip) {
+                if slot.get() as usize != idx {
+                    slot.set(idx as u16);
+                }
+            }
+        }
+    }
 }
 
 /// 定数表からの読み出しヘルパー。
