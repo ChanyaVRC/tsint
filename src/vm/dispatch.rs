@@ -670,6 +670,11 @@ impl Vm {
         }
     }
 
+    #[inline]
+    fn cur_const_str(&self, cidx: ConstIdx) -> Rc<str> {
+        self.frames.last().unwrap().chunk.const_str(cidx)
+    }
+
     /// フレーム変更・VM 状態アクセス・低頻度命令を実行する外側ハンドラ。
     /// `run_until` のホットループから分離してコードサイズとレジスタ圧力を抑える。
     #[inline(never)]
@@ -707,7 +712,7 @@ impl Vm {
                 .exec_call_method(cidx as ConstIdx, argc as usize, op_ip)
                 .map(|()| None),
             OpCode::GetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let obj = self.pop();
                 self.get_prop_ic(&obj, &name, op_ip).map(|v| {
                     self.push(v);
@@ -715,7 +720,7 @@ impl Vm {
                 })
             }
             OpCode::SetProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let value = self.pop();
                 let obj = self.pop();
                 self.set_prop_rc(&obj, &name, value.clone()).map(|()| {
@@ -747,7 +752,7 @@ impl Vm {
                 Err(self.reference_error("変数が初期化される前にアクセスされました（TDZ）"))
             }
             OpCode::GetGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 match self.globals.get(&name) {
                     Some(cell) => {
                         let v = cell.borrow().clone();
@@ -764,7 +769,7 @@ impl Vm {
                 }
             }
             OpCode::SetGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let v = self.top().clone();
                 match self.globals.get(&name) {
                     Some(cell) => {
@@ -775,7 +780,7 @@ impl Vm {
                 }
             }
             OpCode::BindGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let v = self.pop();
                 self.globals.insert(name, Rc::new(RefCell::new(v)));
                 Ok(None)
@@ -792,7 +797,7 @@ impl Vm {
                 Ok(None)
             }
             OpCode::DeleteProp(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let obj = self.pop();
                 let ok = self.delete_prop(&obj, &name);
                 self.push(Value::Bool(ok));
@@ -837,7 +842,7 @@ impl Vm {
                 }
             }
             OpCode::TypeOfGlobal(cidx) => {
-                let name = self.frames.last().unwrap().chunk.const_str(cidx);
+                let name = self.cur_const_str(cidx);
                 let s = match self.globals.get(&name) {
                     Some(cell) => {
                         let v = cell.borrow().clone();
@@ -852,10 +857,7 @@ impl Vm {
                 self.push(Value::str(s));
                 Ok(None)
             }
-            OpCode::Throw => {
-                let v = self.pop();
-                Err(v)
-            }
+            OpCode::Throw => Err(self.pop()),
             OpCode::MakeClosure(cidx) => {
                 let tpl = self
                     .frames
@@ -892,26 +894,21 @@ impl Vm {
                     None
                 })
             }
-            OpCode::NewObject => {
-                let o = self.alloc_plain_object();
+            OpCode::NewObject | OpCode::NewObjectWithCap(_) => {
+                let o = match op {
+                    OpCode::NewObjectWithCap(cap) => self.alloc_plain_object_with_cap(cap as usize),
+                    _ => self.alloc_plain_object(),
+                };
                 self.push(o);
                 self.maybe_gc_if_top_level();
                 Ok(None)
             }
-            OpCode::NewObjectWithCap(cap) => {
-                let o = self.alloc_plain_object_with_cap(cap as usize);
-                self.push(o);
-                self.maybe_gc_if_top_level();
-                Ok(None)
-            }
-            OpCode::NewArray => {
-                let a = self.alloc_array(Vec::new());
-                self.push(a);
-                self.maybe_gc_if_top_level();
-                Ok(None)
-            }
-            OpCode::NewArrayWithCap(cap) => {
-                let a = self.alloc_array(Vec::with_capacity(cap as usize));
+            OpCode::NewArray | OpCode::NewArrayWithCap(_) => {
+                let items = match op {
+                    OpCode::NewArrayWithCap(cap) => Vec::with_capacity(cap as usize),
+                    _ => Vec::new(),
+                };
+                let a = self.alloc_array(items);
                 self.push(a);
                 self.maybe_gc_if_top_level();
                 Ok(None)

@@ -9,45 +9,46 @@ use super::expr::property_key_static_name;
 use super::{err, CResult, Compiler, FuncCtx, LocalVar};
 
 impl Compiler {
+    /// スタック最上位が `undefined` のときだけ `default` 式を評価して置き換える。
+    fn emit_default_if_undefined(&mut self, default: &Expr, line: u32) -> CResult<()> {
+        let j = self.emit_jump(OpCode::JumpIfNotUndefinedKeep, line);
+        self.compile_expr(default)?;
+        let after = self.cur_addr();
+        self.patch_jump(j, after);
+        Ok(())
+    }
+
+    /// オブジェクト分割代入の rest 要素（除外キー列を積んで `ObjectRestExclude` を発行）を出力する。
+    fn emit_object_rest_exclude(&mut self, used_keys: &[String], line: u32) {
+        self.emit(OpCode::Dup, line);
+        for k in used_keys {
+            let c = self.add_const_str(k);
+            self.emit(OpCode::LoadConst(c), line);
+        }
+        self.emit(OpCode::ObjectRestExclude(used_keys.len() as u16), line);
+    }
+
     // ---------------- 分割代入（宣言側: Pattern） ----------------
 
     pub(super) fn compile_bind_pattern(&mut self, pat: &Pattern, line: u32) -> CResult<()> {
         match pat {
             Pattern::Ident(name) => self.emit_bind_var(name, line),
             Pattern::Assign { left, right } => {
-                let j = self.emit_jump(OpCode::JumpIfNotUndefinedKeep, line);
-                self.compile_expr(right)?;
-                let after = self.cur_addr();
-                self.patch_jump(j, after);
+                self.emit_default_if_undefined(right, line)?;
                 self.compile_bind_pattern(left, line)?;
             }
             Pattern::Object { props, rest } => {
                 let mut used_keys: Vec<String> = Vec::new();
                 for p in props {
                     self.emit(OpCode::Dup, line);
-                    match &p.key {
-                        PropertyKey::Computed(ke) => {
-                            self.compile_expr(ke)?;
-                            self.emit(OpCode::GetIndex, line);
-                        }
-                        _ => {
-                            let name = property_key_static_name(&p.key);
-                            let c = self.add_const_str(&name);
-                            if rest.is_some() {
-                                used_keys.push(name.into_owned());
-                            }
-                            self.emit(OpCode::GetProp(c), line);
-                        }
+                    if rest.is_some() && !matches!(p.key, PropertyKey::Computed(_)) {
+                        used_keys.push(property_key_static_name(&p.key).into_owned());
                     }
+                    self.emit_get_prop_key(&p.key, line)?;
                     self.compile_bind_pattern(&p.value, line)?;
                 }
                 if let Some(rest) = rest {
-                    self.emit(OpCode::Dup, line);
-                    for k in &used_keys {
-                        let c = self.add_const_str(k);
-                        self.emit(OpCode::LoadConst(c), line);
-                    }
-                    self.emit(OpCode::ObjectRestExclude(used_keys.len() as u16), line);
+                    self.emit_object_rest_exclude(&used_keys, line);
                     self.compile_bind_pattern(rest, line)?;
                 }
                 self.emit(OpCode::Pop, line);
@@ -104,29 +105,14 @@ impl Compiler {
                     match p {
                         ObjectProp::KeyValue { key, value, .. } => {
                             self.emit(OpCode::Dup, line);
-                            match key {
-                                PropertyKey::Computed(ke) => {
-                                    self.compile_expr(ke)?;
-                                    self.emit(OpCode::GetIndex, line);
-                                }
-                                _ => {
-                                    let name = property_key_static_name(key);
-                                    let c = self.add_const_str(&name);
-                                    if has_spread {
-                                        used_keys.push(name.into_owned());
-                                    }
-                                    self.emit(OpCode::GetProp(c), line);
-                                }
+                            if has_spread && !matches!(key, PropertyKey::Computed(_)) {
+                                used_keys.push(property_key_static_name(key).into_owned());
                             }
+                            self.emit_get_prop_key(key, line)?;
                             self.compile_assign_target_leaf(value, line)?;
                         }
                         ObjectProp::Spread(inner) => {
-                            self.emit(OpCode::Dup, line);
-                            for k in &used_keys {
-                                let c = self.add_const_str(k);
-                                self.emit(OpCode::LoadConst(c), line);
-                            }
-                            self.emit(OpCode::ObjectRestExclude(used_keys.len() as u16), line);
+                            self.emit_object_rest_exclude(&used_keys, line);
                             self.compile_assign_target_expr(inner, line)?;
                         }
                         ObjectProp::Method { .. } => {
@@ -148,10 +134,7 @@ impl Compiler {
             value: default,
         } = &target.kind
         {
-            let j = self.emit_jump(OpCode::JumpIfNotUndefinedKeep, line);
-            self.compile_expr(default)?;
-            let after = self.cur_addr();
-            self.patch_jump(j, after);
+            self.emit_default_if_undefined(default, line)?;
             return self.compile_assign_target_leaf(inner_target, line);
         }
         match &target.kind {
@@ -231,10 +214,7 @@ impl Compiler {
             }
             self.emit(OpCode::GetArg(i as u16), line);
             if let Some(def) = &p.default {
-                let j = self.emit_jump(OpCode::JumpIfNotUndefinedKeep, line);
-                self.compile_expr(def)?;
-                let after = self.cur_addr();
-                self.patch_jump(j, after);
+                self.emit_default_if_undefined(def, line)?;
             }
             for name in pattern_names(&p.pattern) {
                 self.declare_local(name);

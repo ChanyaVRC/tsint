@@ -73,36 +73,27 @@ fn count_stmts_rec(list: &[Stmt], stmts: &mut usize, funcs: &mut usize) {
     }
 }
 
+fn count_func_rec(f: &Function, stmts: &mut usize, funcs: &mut usize) {
+    *funcs += 1;
+    if let Some(b) = &f.body {
+        count_stmts_rec(b, stmts, funcs);
+    }
+    if let Some(eb) = &f.expr_body {
+        count_expr_rec(eb, stmts, funcs);
+    }
+    for p in &f.params {
+        if let Some(d) = &p.default {
+            count_expr_rec(d, stmts, funcs);
+        }
+    }
+}
+
 fn count_stmt_rec(s: &Stmt, stmts: &mut usize, funcs: &mut usize) {
     *stmts += 1;
     match &s.kind {
-        StmtKind::Block(b) => count_stmts_rec(b, stmts, funcs),
-        StmtKind::VarDecl { decls, .. } => {
-            for d in decls {
-                if let Some(init) = &d.init {
-                    count_expr_rec(init, stmts, funcs);
-                }
-            }
-        }
-        StmtKind::Expr(e) => count_expr_rec(e, stmts, funcs),
-        StmtKind::FunctionDecl(f) => {
-            *funcs += 1;
-            if let Some(b) = &f.body {
-                count_stmts_rec(b, stmts, funcs);
-            }
-        }
+        StmtKind::Block(b) | StmtKind::TsModule { body: b, .. } => count_stmts_rec(b, stmts, funcs),
+        StmtKind::FunctionDecl(f) => count_func_rec(f, stmts, funcs),
         StmtKind::ClassDecl(c) => count_class_rec(c, stmts, funcs),
-        StmtKind::If { test, cons, alt } => {
-            count_expr_rec(test, stmts, funcs);
-            count_stmt_rec(cons, stmts, funcs);
-            if let Some(a) = alt {
-                count_stmt_rec(a, stmts, funcs);
-            }
-        }
-        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            count_expr_rec(test, stmts, funcs);
-            count_stmt_rec(body, stmts, funcs);
-        }
         StmtKind::For {
             init,
             test,
@@ -129,58 +120,22 @@ fn count_stmt_rec(s: &Stmt, stmts: &mut usize, funcs: &mut usize) {
             }
             count_stmt_rec(body, stmts, funcs);
         }
-        StmtKind::ForIn { right, body, .. } => {
-            count_expr_rec(right, stmts, funcs);
-            count_stmt_rec(body, stmts, funcs);
-        }
-        StmtKind::Switch { disc, cases } => {
-            count_expr_rec(disc, stmts, funcs);
-            for c in cases {
-                if let Some(t) = &c.test {
-                    count_expr_rec(t, stmts, funcs);
-                }
-                count_stmts_rec(&c.body, stmts, funcs);
-            }
-        }
-        StmtKind::Try {
-            block,
-            handler,
-            finalizer,
-        } => {
-            count_stmts_rec(block, stmts, funcs);
-            if let Some(h) = handler {
-                count_stmts_rec(&h.body, stmts, funcs);
-            }
-            if let Some(f) = finalizer {
-                count_stmts_rec(f, stmts, funcs);
-            }
-        }
-        StmtKind::Throw(e) => count_expr_rec(e, stmts, funcs),
-        StmtKind::Return(Some(e)) => count_expr_rec(e, stmts, funcs),
-        StmtKind::Labeled { body, .. } => count_stmt_rec(body, stmts, funcs),
         StmtKind::ExportDefault(d) => match d.as_ref() {
             DefaultExportable::Expr(e) => count_expr_rec(e, stmts, funcs),
-            DefaultExportable::Function(f) => {
-                *funcs += 1;
-                if let Some(b) = &f.body {
-                    count_stmts_rec(b, stmts, funcs);
-                }
-            }
+            DefaultExportable::Function(f) => count_func_rec(f, stmts, funcs),
             DefaultExportable::Class(c) => count_class_rec(c, stmts, funcs),
         },
-        StmtKind::ExportDecl(inner) => count_stmt_rec(inner, stmts, funcs),
-        StmtKind::TsModule { body, .. } => count_stmts_rec(body, stmts, funcs),
-        _ => {}
+        _ => {
+            s.for_each_child_expr(&mut |e| count_expr_rec(e, stmts, funcs));
+            s.for_each_child_stmt(&mut |c| count_stmt_rec(c, stmts, funcs));
+        }
     }
 }
 
 fn count_class_rec(c: &Class, stmts: &mut usize, funcs: &mut usize) {
     for m in &c.members {
         if let Some(f) = &m.function {
-            *funcs += 1;
-            if let Some(b) = &f.body {
-                count_stmts_rec(b, stmts, funcs);
-            }
+            count_func_rec(f, stmts, funcs);
         }
         if let Some(v) = &m.value {
             count_expr_rec(v, stmts, funcs);
@@ -190,38 +145,18 @@ fn count_class_rec(c: &Class, stmts: &mut usize, funcs: &mut usize) {
 
 fn count_expr_rec(e: &Expr, stmts: &mut usize, funcs: &mut usize) {
     match &e.kind {
-        ExprKind::Function(f) | ExprKind::Arrow(f) => {
-            *funcs += 1;
-            if let Some(b) = &f.body {
-                count_stmts_rec(b, stmts, funcs);
-            }
-            if let Some(eb) = &f.expr_body {
-                count_expr_rec(eb, stmts, funcs);
-            }
-            for p in &f.params {
-                if let Some(d) = &p.default {
-                    count_expr_rec(d, stmts, funcs);
-                }
-            }
-        }
+        ExprKind::Function(f) | ExprKind::Arrow(f) => count_func_rec(f, stmts, funcs),
         ExprKind::Class(c) => count_class_rec(c, stmts, funcs),
         ExprKind::ObjectLit(props) => {
             for p in props {
                 match p {
                     ObjectProp::KeyValue { value, .. } => count_expr_rec(value, stmts, funcs),
                     ObjectProp::Spread(e) => count_expr_rec(e, stmts, funcs),
-                    ObjectProp::Method { function, .. } => {
-                        *funcs += 1;
-                        if let Some(b) = &function.body {
-                            count_stmts_rec(b, stmts, funcs);
-                        }
-                    }
+                    ObjectProp::Method { function, .. } => count_func_rec(function, stmts, funcs),
                 }
             }
         }
-        _ => {
-            e.for_each_child(&mut |c| count_expr_rec(c, stmts, funcs));
-        }
+        _ => e.for_each_child(&mut |c| count_expr_rec(c, stmts, funcs)),
     }
 }
 

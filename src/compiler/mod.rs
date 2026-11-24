@@ -375,6 +375,12 @@ impl Compiler {
             .unwrap_or_else(|| panic!("patch_jump: ジャンプ命令ではありません: {op:?}"));
     }
 
+    pub(super) fn patch_all(&mut self, patches: impl IntoIterator<Item = usize>, target: u32) {
+        for idx in patches {
+            self.patch_jump(idx, target);
+        }
+    }
+
     pub(super) fn declare_local(&mut self, name: &str) -> LocalIdx {
         let slot = self.cur().alloc_slot();
         self.cur().locals.push(LocalVar {

@@ -19,6 +19,12 @@ pub(super) enum FnNameMode {
     Optional,
 }
 
+#[derive(Clone, Copy)]
+enum InfixOp {
+    Log(LogicalOp),
+    Bin(BinaryOp),
+}
+
 impl Parser {
     /// カンマ演算子を含む最上位の式。
     pub(super) fn parse_expr(&mut self) -> PResult<Expr> {
@@ -81,7 +87,7 @@ impl Parser {
 
     fn parse_conditional(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
-        let test = self.parse_nullish_or()?;
+        let test = self.parse_prec(1)?;
         if self.eat_punct(Punct::Question) {
             let cons = self.parse_assign_expr()?;
             self.expect_punct(Punct::Colon)?;
@@ -98,189 +104,72 @@ impl Parser {
         Ok(test)
     }
 
-    /// `||` と `??` は同じ優先順位段で扱う（本来は直接混在不可だが寛容にする）。
-    fn parse_nullish_or(&mut self) -> PResult<Expr> {
+    /// 現在トークンの中置演算子・優先順位（1..=11）・右結合フラグを返す。
+    /// `||` と `??` は同じ優先順位段（1）として寛容に扱う。
+    #[inline]
+    fn cur_infix_op(&self) -> Option<(InfixOp, u8, bool)> {
+        use BinaryOp::*;
+        use InfixOp::{Bin, Log};
+        use LogicalOp::*;
+        match &self.cur().kind {
+            TokenKind::Punct(p) => Some(match p {
+                Punct::PipePipe => (Log(Or), 1, false),
+                Punct::QuestionQuestion => (Log(Nullish), 1, false),
+                Punct::AmpAmp => (Log(And), 2, false),
+                Punct::Pipe => (Bin(BitOr), 3, false),
+                Punct::Caret => (Bin(BitXor), 4, false),
+                Punct::Amp => (Bin(BitAnd), 5, false),
+                Punct::EqEq => (Bin(Eq), 6, false),
+                Punct::NotEq => (Bin(NotEq), 6, false),
+                Punct::EqEqEq => (Bin(StrictEq), 6, false),
+                Punct::NotEqEq => (Bin(StrictNotEq), 6, false),
+                Punct::Lt => (Bin(Lt), 7, false),
+                Punct::Gt => (Bin(Gt), 7, false),
+                Punct::LtEq => (Bin(LtEq), 7, false),
+                Punct::GtEq => (Bin(GtEq), 7, false),
+                Punct::LtLt => (Bin(Shl), 8, false),
+                Punct::GtGt => (Bin(Shr), 8, false),
+                Punct::GtGtGt => (Bin(UShr), 8, false),
+                Punct::Plus => (Bin(Add), 9, false),
+                Punct::Minus => (Bin(Sub), 9, false),
+                Punct::Star => (Bin(Mul), 10, false),
+                Punct::Slash => (Bin(Div), 10, false),
+                Punct::Percent => (Bin(Mod), 10, false),
+                Punct::StarStar => (Bin(Pow), 11, true),
+                _ => return None,
+            }),
+            TokenKind::Ident(w) if w == "instanceof" => Some((Bin(Instanceof), 7, false)),
+            TokenKind::Ident(w) if w == "in" => Some((Bin(In), 7, false)),
+            _ => None,
+        }
+    }
+
+    /// Pratt 優先順位上昇法による論理/二項/べき乗式のパース。
+    fn parse_prec(&mut self, min_prec: u8) -> PResult<Expr> {
         let start = self.cur_span();
-        let mut left = self.parse_logical_and()?;
-        loop {
-            let op = if self.is_punct(Punct::PipePipe) {
-                LogicalOp::Or
-            } else if self.is_punct(Punct::QuestionQuestion) {
-                LogicalOp::Nullish
-            } else {
+        let mut left = self.parse_unary()?;
+        while let Some((op, prec, right_assoc)) = self.cur_infix_op() {
+            if prec < min_prec {
                 break;
-            };
+            }
             self.bump();
-            let right = self.parse_logical_and()?;
-            left = self.mk_expr(
-                start,
-                ExprKind::Logical {
+            let next_min = if right_assoc { prec } else { prec + 1 };
+            let right = self.parse_prec(next_min)?;
+            let kind = match op {
+                InfixOp::Log(op) => ExprKind::Logical {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
-            );
-        }
-        Ok(left)
-    }
-
-    fn parse_logical_and(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_bit_or()?;
-        while self.eat_punct(Punct::AmpAmp) {
-            let right = self.parse_bit_or()?;
-            left = self.mk_expr(
-                start,
-                ExprKind::Logical {
-                    op: LogicalOp::And,
+                InfixOp::Bin(op) => ExprKind::Binary {
+                    op,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
-            );
-        }
-        Ok(left)
-    }
-
-    fn parse_bit_or(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_bit_xor()?;
-        while self.is_punct(Punct::Pipe) {
-            self.bump();
-            let right = self.parse_bit_xor()?;
-            left = self.mk_bin(start, BinaryOp::BitOr, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_bit_xor(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_bit_and()?;
-        while self.is_punct(Punct::Caret) {
-            self.bump();
-            let right = self.parse_bit_and()?;
-            left = self.mk_bin(start, BinaryOp::BitXor, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_bit_and(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_equality()?;
-        while self.is_punct(Punct::Amp) {
-            self.bump();
-            let right = self.parse_equality()?;
-            left = self.mk_bin(start, BinaryOp::BitAnd, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_equality(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_relational()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::EqEq) => BinaryOp::Eq,
-                TokenKind::Punct(Punct::NotEq) => BinaryOp::NotEq,
-                TokenKind::Punct(Punct::EqEqEq) => BinaryOp::StrictEq,
-                TokenKind::Punct(Punct::NotEqEq) => BinaryOp::StrictNotEq,
-                _ => break,
             };
-            self.bump();
-            let right = self.parse_relational()?;
-            left = self.mk_bin(start, op, left, right);
+            left = self.mk_expr(start, kind);
         }
         Ok(left)
-    }
-
-    fn parse_relational(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_shift()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::Lt) => BinaryOp::Lt,
-                TokenKind::Punct(Punct::Gt) => BinaryOp::Gt,
-                TokenKind::Punct(Punct::LtEq) => BinaryOp::LtEq,
-                TokenKind::Punct(Punct::GtEq) => BinaryOp::GtEq,
-                TokenKind::Ident(w) if w == "instanceof" => BinaryOp::Instanceof,
-                TokenKind::Ident(w) if w == "in" => BinaryOp::In,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_shift()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_shift(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_additive()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::LtLt) => BinaryOp::Shl,
-                TokenKind::Punct(Punct::GtGt) => BinaryOp::Shr,
-                TokenKind::Punct(Punct::GtGtGt) => BinaryOp::UShr,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_additive()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_additive(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_multiplicative()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::Plus) => BinaryOp::Add,
-                TokenKind::Punct(Punct::Minus) => BinaryOp::Sub,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_multiplicative()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_multiplicative(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let mut left = self.parse_exponent()?;
-        loop {
-            let op = match &self.cur().kind {
-                TokenKind::Punct(Punct::Star) => BinaryOp::Mul,
-                TokenKind::Punct(Punct::Slash) => BinaryOp::Div,
-                TokenKind::Punct(Punct::Percent) => BinaryOp::Mod,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_exponent()?;
-            left = self.mk_bin(start, op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_exponent(&mut self) -> PResult<Expr> {
-        let start = self.cur_span();
-        let base = self.parse_unary()?;
-        if self.eat_punct(Punct::StarStar) {
-            let right = self.parse_exponent()?; // 右結合
-            return Ok(self.mk_bin(start, BinaryOp::Pow, base, right));
-        }
-        Ok(base)
-    }
-
-    fn mk_bin(&mut self, start: crate::ast::Span, op: BinaryOp, left: Expr, right: Expr) -> Expr {
-        self.mk_expr(
-            start,
-            ExprKind::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            },
-        )
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {

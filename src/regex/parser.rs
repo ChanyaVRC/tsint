@@ -279,21 +279,15 @@ impl Parser {
 
     fn parse_group(&mut self) -> Result<Ast, RegexError> {
         self.pos += 1; // '('
-        if self.eat('?') {
+        let wrap: Option<fn(Box<Ast>) -> Ast> = if self.eat('?') {
             if self.eat(':') {
-                let inner = self.parse_alt()?;
-                self.expect(')')?;
-                return Ok(Ast::NonCap(Box::new(inner)));
+                Some(Ast::NonCap)
             } else if self.eat('=') {
-                let inner = self.parse_alt()?;
-                self.expect(')')?;
-                return Ok(Ast::Look(Box::new(inner), LookaheadKind::Positive));
+                Some(|a| Ast::Look(a, LookaheadKind::Positive))
             } else if self.eat('!') {
-                let inner = self.parse_alt()?;
-                self.expect(')')?;
-                return Ok(Ast::Look(Box::new(inner), LookaheadKind::Negative));
+                Some(|a| Ast::Look(a, LookaheadKind::Negative))
             } else if self.peek() == Some('<') {
-                if self.peek_at(1) == Some('=') || self.peek_at(1) == Some('!') {
+                if matches!(self.peek_at(1), Some('=' | '!')) {
                     return Err(RegexError(
                         "後読み (lookbehind, (?<=...) / (?<!...)) は tsint の正規表現エンジンでは未対応です"
                             .to_string(),
@@ -308,12 +302,21 @@ impl Parser {
                     self.peek().unwrap_or(' ')
                 )));
             }
-        }
-        self.ncaptures += 1;
-        let idx = self.ncaptures;
-        let inner = self.parse_alt()?;
+        } else {
+            None
+        };
+        let cap_idx = if wrap.is_none() {
+            self.ncaptures += 1;
+            self.ncaptures
+        } else {
+            0
+        };
+        let inner = Box::new(self.parse_alt()?);
         self.expect(')')?;
-        Ok(Ast::Group(idx, Box::new(inner)))
+        Ok(match wrap {
+            Some(f) => f(inner),
+            None => Ast::Group(cap_idx, inner),
+        })
     }
 
     fn parse_hex_escape(&mut self, n: usize) -> Result<char, RegexError> {
@@ -346,27 +349,40 @@ impl Parser {
         }
     }
 
+    /// パターン本体と文字クラス内で共通するエスケープ（ショートハンド・制御文字・`\x`/`\u`）を解釈する。
+    fn parse_common_escape(&mut self, c: char) -> Result<Option<ClassEscape>, RegexError> {
+        Ok(Some(match c {
+            'd' => ClassEscape::Atom(ClassAtom::Digit),
+            'D' => ClassEscape::Atom(ClassAtom::NotDigit),
+            'w' => ClassEscape::Atom(ClassAtom::Word),
+            'W' => ClassEscape::Atom(ClassAtom::NotWord),
+            's' => ClassEscape::Atom(ClassAtom::Space),
+            'S' => ClassEscape::Atom(ClassAtom::NotSpace),
+            'n' => ClassEscape::Char('\n'),
+            'r' => ClassEscape::Char('\r'),
+            't' => ClassEscape::Char('\t'),
+            'v' => ClassEscape::Char('\u{000B}'),
+            'f' => ClassEscape::Char('\u{000C}'),
+            'x' => ClassEscape::Char(self.parse_hex_escape(2)?),
+            'u' => ClassEscape::Char(self.parse_unicode_escape()?),
+            _ => return Ok(None),
+        }))
+    }
+
     fn parse_escape(&mut self) -> Result<Ast, RegexError> {
         self.pos += 1; // '\'
         let c = self
             .advance()
             .ok_or_else(|| RegexError("パターンがバックスラッシュで終わっています".to_string()))?;
+        if let Some(esc) = self.parse_common_escape(c)? {
+            return Ok(match esc {
+                ClassEscape::Atom(a) => Ast::Class(CharClass::new(false, vec![a])),
+                ClassEscape::Char(ch) => Ast::Char(ch),
+            });
+        }
         Ok(match c {
-            'd' => Ast::Class(CharClass::new(false, vec![ClassAtom::Digit])),
-            'D' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotDigit])),
-            'w' => Ast::Class(CharClass::new(false, vec![ClassAtom::Word])),
-            'W' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotWord])),
-            's' => Ast::Class(CharClass::new(false, vec![ClassAtom::Space])),
-            'S' => Ast::Class(CharClass::new(false, vec![ClassAtom::NotSpace])),
             'b' => Ast::WordB(WordBoundary::Match),
             'B' => Ast::WordB(WordBoundary::NonMatch),
-            'n' => Ast::Char('\n'),
-            'r' => Ast::Char('\r'),
-            't' => Ast::Char('\t'),
-            'v' => Ast::Char('\u{000B}'),
-            'f' => Ast::Char('\u{000C}'),
-            'x' => Ast::Char(self.parse_hex_escape(2)?),
-            'u' => Ast::Char(self.parse_unicode_escape()?),
             'k' => {
                 return Err(RegexError(
                     "名前付き後方参照 \\k<...> は未対応です".to_string(),
@@ -409,22 +425,12 @@ impl Parser {
         let c = self
             .advance()
             .ok_or_else(|| RegexError("パターンがバックスラッシュで終わっています".to_string()))?;
+        if let Some(esc) = self.parse_common_escape(c)? {
+            return Ok(esc);
+        }
         Ok(match c {
-            'd' => ClassEscape::Atom(ClassAtom::Digit),
-            'D' => ClassEscape::Atom(ClassAtom::NotDigit),
-            'w' => ClassEscape::Atom(ClassAtom::Word),
-            'W' => ClassEscape::Atom(ClassAtom::NotWord),
-            's' => ClassEscape::Atom(ClassAtom::Space),
-            'S' => ClassEscape::Atom(ClassAtom::NotSpace),
             'b' => ClassEscape::Char('\u{0008}'), // クラス内の \b はバックスペース
-            'n' => ClassEscape::Char('\n'),
-            'r' => ClassEscape::Char('\r'),
-            't' => ClassEscape::Char('\t'),
-            'v' => ClassEscape::Char('\u{000B}'),
-            'f' => ClassEscape::Char('\u{000C}'),
             '0' => ClassEscape::Char('\0'),
-            'x' => ClassEscape::Char(self.parse_hex_escape(2)?),
-            'u' => ClassEscape::Char(self.parse_unicode_escape()?),
             other => ClassEscape::Char(other),
         })
     }

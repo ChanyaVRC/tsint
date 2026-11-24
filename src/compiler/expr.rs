@@ -198,9 +198,7 @@ impl Compiler {
                 let mut patches = Vec::new();
                 self.compile_chain(e, &mut patches)?;
                 let end = self.cur_addr();
-                for p in patches {
-                    self.patch_jump(p, end);
-                }
+                self.patch_all(patches, end);
             }
             ExprKind::New { callee, args } => self.compile_new(callee, args, line)?,
             ExprKind::Sequence(list) => {
@@ -588,6 +586,22 @@ impl Compiler {
         Ok(())
     }
 
+    /// スタック最上位のオブジェクトに対して `prop`（静的/計算プロパティ）の読み出し命令を発行する。
+    pub(super) fn emit_get_prop_key(&mut self, prop: &PropertyKey, line: u32) -> CResult<()> {
+        match prop {
+            PropertyKey::Computed(ke) => {
+                self.compile_expr(ke)?;
+                self.emit(OpCode::GetIndex, line);
+            }
+            _ => {
+                let name = property_key_static_name(prop);
+                let c = self.add_const_str(&name);
+                self.emit(OpCode::GetProp(c), line);
+            }
+        }
+        Ok(())
+    }
+
     fn compile_chain(&mut self, e: &Expr, patches: &mut Vec<usize>) -> CResult<()> {
         let line = e.span.start.line;
         match &e.kind {
@@ -601,17 +615,7 @@ impl Compiler {
                     let j = self.emit_jump(OpCode::JumpIfNullish, line);
                     patches.push(j);
                 }
-                match prop {
-                    PropertyKey::Computed(ke) => {
-                        self.compile_expr(ke)?;
-                        self.emit(OpCode::GetIndex, line);
-                    }
-                    _ => {
-                        let name = property_key_static_name(prop);
-                        let c = self.add_const_str(&name);
-                        self.emit(OpCode::GetProp(c), line);
-                    }
-                }
+                self.emit_get_prop_key(prop, line)?;
             }
             ExprKind::Call {
                 callee,
@@ -656,17 +660,7 @@ impl Compiler {
                         patches.push(j);
                     }
                     self.emit(OpCode::Dup, line);
-                    match prop {
-                        PropertyKey::Computed(ke) => {
-                            self.compile_expr(ke)?;
-                            self.emit(OpCode::GetIndex, line);
-                        }
-                        _ => {
-                            let name = property_key_static_name(prop);
-                            let c = self.add_const_str(&name);
-                            self.emit(OpCode::GetProp(c), line);
-                        }
-                    }
+                    self.emit_get_prop_key(prop, line)?;
                 } else if is_chain_callee {
                     self.emit(OpCode::LoadUndefined, line);
                     self.compile_chain_or_base(callee, patches)?;
@@ -792,29 +786,6 @@ pub(super) fn property_key_static_name(key: &PropertyKey) -> Cow<'_, str> {
 pub(super) fn expr_contains_closure(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Function(_) | ExprKind::Arrow(_) | ExprKind::Class(_) => true,
-        ExprKind::Unary { arg, .. }
-        | ExprKind::Update { arg, .. }
-        | ExprKind::Spread(arg)
-        | ExprKind::Await(arg)
-        | ExprKind::TsAs(arg)
-        | ExprKind::TsNonNull(arg) => expr_contains_closure(arg),
-        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
-            expr_contains_closure(left) || expr_contains_closure(right)
-        }
-        ExprKind::Assign { target, value, .. } => {
-            expr_contains_closure(target) || expr_contains_closure(value)
-        }
-        ExprKind::Conditional { test, cons, alt } => {
-            expr_contains_closure(test) || expr_contains_closure(cons) || expr_contains_closure(alt)
-        }
-        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args } => {
-            expr_contains_closure(callee) || args.iter().any(expr_contains_closure)
-        }
-        ExprKind::Member { obj, prop, .. } => {
-            expr_contains_closure(obj)
-                || matches!(prop, PropertyKey::Computed(k) if expr_contains_closure(k))
-        }
-        ExprKind::ArrayLit(els) => els.iter().flatten().any(expr_contains_closure),
         ExprKind::ObjectLit(props) => props.iter().any(|p| match p {
             ObjectProp::KeyValue { key, value, .. } => {
                 expr_contains_closure(value)
@@ -823,10 +794,15 @@ pub(super) fn expr_contains_closure(e: &Expr) -> bool {
             ObjectProp::Method { .. } => true,
             ObjectProp::Spread(s) => expr_contains_closure(s),
         }),
-        ExprKind::TemplateLit { exprs, .. } | ExprKind::Sequence(exprs) => {
-            exprs.iter().any(expr_contains_closure)
+        _ => {
+            let mut found = false;
+            e.for_each_child(&mut |c| {
+                if !found && expr_contains_closure(c) {
+                    found = true;
+                }
+            });
+            found
         }
-        _ => false,
     }
 }
 
