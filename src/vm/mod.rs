@@ -229,6 +229,14 @@ pub(super) enum CallOutcome {
     FramePushed,
 }
 
+/// 呼び出し元オペランドスタック上に `callee` スロットが積まれているか
+/// （`OpCode::Call` は `[this, callee, args...]`、`OpCode::CallMethod` は `[obj, args...]`）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StackCalleeSlot {
+    Present,
+    Omitted,
+}
+
 pub struct Vm {
     pub frames: Vec<Frame>,
     pub globals: HashMap<Rc<str>, Rc<RefCell<Value>>>,
@@ -378,7 +386,7 @@ impl Vm {
         &mut self,
         fo: &Rc<FunctionObj>,
         argc: usize,
-        has_callee_slot: bool,
+        callee_slot: StackCalleeSlot,
     ) {
         let needs_raw = fo.chunk.needs_raw_args && argc > 0;
         let mut frame = if let Some(mut frame) = self.frame_pool.pop() {
@@ -438,7 +446,7 @@ impl Vm {
                     frame.locals[param_base + i].set(Value::Undefined);
                 }
             }
-            if has_callee_slot {
+            if callee_slot == StackCalleeSlot::Present {
                 caller.stack.pop(); // callee
             }
             caller.stack.pop().unwrap() // this
@@ -600,6 +608,10 @@ impl Vm {
 
     pub fn reference_error(&self, msg: impl Into<String>) -> Value {
         self.make_error("ReferenceError", msg.into())
+    }
+
+    pub fn syntax_error(&self, msg: impl Into<String>) -> Value {
+        self.make_error("SyntaxError", msg.into())
     }
 }
 

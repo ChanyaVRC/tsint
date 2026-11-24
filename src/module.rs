@@ -100,6 +100,18 @@ impl std::fmt::Display for ModuleError {
     }
 }
 
+impl std::error::Error for ModuleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ModuleError::Parse { source, .. } => Some(source),
+            ModuleError::Compile { source, .. } => Some(source),
+            ModuleError::Resolve { .. }
+            | ModuleError::Load { .. }
+            | ModuleError::Runtime { .. } => None,
+        }
+    }
+}
+
 /// `Interpreter::run_module_graph` の戻り値。
 #[derive(Debug)]
 pub enum ModuleOutcome {

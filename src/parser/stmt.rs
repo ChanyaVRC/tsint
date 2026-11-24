@@ -1,9 +1,15 @@
 //! 文のパース: 宣言・制御構造・class・import/export・TS のアンビエント宣言。
 
-use super::expr::is_keyword_like;
+use super::expr::{is_keyword_like, FnNameMode};
 use super::{PResult, Parser};
 use crate::ast::*;
 use crate::lexer::{Punct, TokenKind};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopJumpKind {
+    Break,
+    Continue,
+}
 
 impl Parser {
     pub(super) fn parse_stmt(&mut self) -> PResult<Stmt> {
@@ -23,13 +29,13 @@ impl Parser {
             "var" | "let" | "const" => self.parse_var_decl_stmt(),
             "function" => {
                 self.bump();
-                let f = self.parse_function_tail(false, false)?;
+                let f = self.parse_function_tail(false, FnNameMode::Required)?;
                 Ok(self.mk_stmt(start, StmtKind::FunctionDecl(Box::new(f))))
             }
             "async" if self.peek_word_is(1, "function") && !self.peek_kind_newline(1) => {
                 self.bump();
                 self.bump();
-                let f = self.parse_function_tail(true, false)?;
+                let f = self.parse_function_tail(true, FnNameMode::Required)?;
                 Ok(self.mk_stmt(start, StmtKind::FunctionDecl(Box::new(f))))
             }
             "class" => {
@@ -44,8 +50,8 @@ impl Parser {
             "try" => self.parse_try_stmt(),
             "throw" => self.parse_throw_stmt(),
             "return" => self.parse_return_stmt(),
-            "break" => self.parse_break_continue(true),
-            "continue" => self.parse_break_continue(false),
+            "break" => self.parse_break_continue(LoopJumpKind::Break),
+            "continue" => self.parse_break_continue(LoopJumpKind::Continue),
             "import" => self.parse_import_stmt(),
             "export" => self.parse_export_stmt(),
             "interface" => {
@@ -412,7 +418,7 @@ impl Parser {
         Ok(self.mk_stmt(start, StmtKind::Return(arg)))
     }
 
-    fn parse_break_continue(&mut self, is_break: bool) -> PResult<Stmt> {
+    fn parse_break_continue(&mut self, jump: LoopJumpKind) -> PResult<Stmt> {
         let start = self.cur_span();
         self.bump(); // break/continue
         let label = if !self.cur().newline_before {
@@ -428,10 +434,9 @@ impl Parser {
             None
         };
         self.consume_semi()?;
-        let kind = if is_break {
-            StmtKind::Break(label)
-        } else {
-            StmtKind::Continue(label)
+        let kind = match jump {
+            LoopJumpKind::Break => StmtKind::Break(label),
+            LoopJumpKind::Continue => StmtKind::Continue(label),
         };
         Ok(self.mk_stmt(start, kind))
     }
@@ -746,7 +751,7 @@ impl Parser {
     fn parse_export_default(&mut self, start: Span) -> PResult<Stmt> {
         if self.is_word("function") {
             self.bump();
-            let f = self.parse_function_tail(false, true)?;
+            let f = self.parse_function_tail(false, FnNameMode::Optional)?;
             return Ok(self.mk_stmt(
                 start,
                 StmtKind::ExportDefault(Box::new(DefaultExportable::Function(Box::new(f)))),
@@ -755,7 +760,7 @@ impl Parser {
         if self.is_word("async") && self.peek_word_is(1, "function") {
             self.bump();
             self.bump();
-            let f = self.parse_function_tail(true, true)?;
+            let f = self.parse_function_tail(true, FnNameMode::Optional)?;
             return Ok(self.mk_stmt(
                 start,
                 StmtKind::ExportDefault(Box::new(DefaultExportable::Function(Box::new(f)))),

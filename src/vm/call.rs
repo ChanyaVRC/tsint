@@ -6,7 +6,7 @@ use crate::bytecode::*;
 use crate::value::*;
 
 use super::props::kind_tag_of;
-use super::{CallOutcome, KindTag, RunOutcome, Vm};
+use super::{CallOutcome, KindTag, RunOutcome, StackCalleeSlot, Vm};
 
 impl Vm {
     pub(super) fn build_closure(&self, tpl: &Rc<FunctionTemplate>) -> Rc<FunctionObj> {
@@ -113,13 +113,17 @@ impl Vm {
 
     /// 呼び出しフレームのスタックから `argc` 個の引数と（任意で callee スロットを捨てて）`this` を取り出す。
     #[inline]
-    fn pop_call_args_and_this(&mut self, argc: usize, drop_callee: bool) -> (Value, Vec<Value>) {
+    fn pop_call_args_and_this(
+        &mut self,
+        argc: usize,
+        callee_slot: StackCalleeSlot,
+    ) -> (Value, Vec<Value>) {
         let mut args = self.take_args_buf();
         let this = {
             let caller = self.frames.last_mut().unwrap();
             let n = caller.stack.len();
             args.extend(caller.stack.drain(n - argc..));
-            if drop_callee {
+            if callee_slot == StackCalleeSlot::Present {
                 caller.stack.pop(); // callee
             }
             caller.stack.pop().unwrap() // this / receiver
@@ -173,17 +177,17 @@ impl Vm {
         match kind {
             Ok(fo) => {
                 if fo.is_async {
-                    let (this, args) = self.pop_call_args_and_this(argc, true);
+                    let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Present);
                     let promise = self.spawn_async_task_from_function(&fo, this, &args);
                     self.put_args_buf(args);
                     self.push(promise);
                     return Ok(());
                 }
-                self.push_frame_from_caller_stack(&fo, argc, true);
+                self.push_frame_from_caller_stack(&fo, argc, StackCalleeSlot::Present);
                 Ok(())
             }
             Err(nf) => {
-                let (this, args) = self.pop_call_args_and_this(argc, true);
+                let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Present);
                 let res = nf(self, this, &args);
                 self.put_args_buf(args);
                 let v = res?;
@@ -252,7 +256,7 @@ impl Vm {
 
         match target {
             MethodTarget::Builtin(tag) => {
-                let (obj, args) = self.pop_call_args_and_this(argc, false);
+                let (obj, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);
                 if let Some(res) =
                     crate::builtins::call_builtin_method(self, tag, obj.clone(), &key, &args)
                 {
@@ -266,17 +270,17 @@ impl Vm {
             }
             MethodTarget::Function(fo) => {
                 if fo.is_async {
-                    let (this, args) = self.pop_call_args_and_this(argc, false);
+                    let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);
                     let promise = self.spawn_async_task_from_function(&fo, this, &args);
                     self.put_args_buf(args);
                     self.push(promise);
                     return Ok(());
                 }
-                self.push_frame_from_caller_stack(&fo, argc, false);
+                self.push_frame_from_caller_stack(&fo, argc, StackCalleeSlot::Omitted);
                 Ok(())
             }
             MethodTarget::Native(nf) => {
-                let (this, args) = self.pop_call_args_and_this(argc, false);
+                let (this, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);
                 let res = nf(self, this, &args);
                 self.put_args_buf(args);
                 let v = res?;
@@ -285,7 +289,7 @@ impl Vm {
                 Ok(())
             }
             MethodTarget::Fallback => {
-                let (obj, args) = self.pop_call_args_and_this(argc, false);
+                let (obj, args) = self.pop_call_args_and_this(argc, StackCalleeSlot::Omitted);
                 self.finish_method_fallback(obj, &key, args)
             }
         }

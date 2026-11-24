@@ -9,6 +9,12 @@ use super::expr::expr_contains_closure;
 use super::pattern::pattern_names;
 use super::{err, CResult, Compiler, Ctrl};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JumpControl {
+    Break,
+    Continue,
+}
+
 impl Compiler {
     /// ブロック（文リスト）を新しいレキシカルスコープでコンパイルする。
     pub(super) fn compile_block_new_scope(&mut self, stmts: &[Stmt]) -> CResult<()> {
@@ -497,10 +503,11 @@ impl Compiler {
     /// コントロールスタックを逆順に辿り、対象エントリの位置と通過した `finally` 節を収集する。
     fn unwind_control_to(
         &mut self,
-        is_break: bool,
+        kind: JumpControl,
         label: Option<&str>,
         line: u32,
     ) -> CResult<usize> {
+        let is_break = kind == JumpControl::Break;
         let mut finallies: Vec<(usize, Rc<[Stmt]>)> = Vec::new();
         let mut target_idx = None;
         for i in (0..self.cur().control.len()).rev() {
@@ -527,10 +534,9 @@ impl Compiler {
         let target = target_idx.ok_or_else(|| {
             err(
                 line,
-                if is_break {
-                    "break の対象が見つかりません"
-                } else {
-                    "continue の対象が見つかりません"
+                match kind {
+                    JumpControl::Break => "break の対象が見つかりません",
+                    JumpControl::Continue => "continue の対象が見つかりません",
                 },
             )
         })?;
@@ -541,7 +547,7 @@ impl Compiler {
     }
 
     fn compile_break(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
-        let target_idx = self.unwind_control_to(true, label, line)?;
+        let target_idx = self.unwind_control_to(JumpControl::Break, label, line)?;
         let jidx = self.emit_jump(OpCode::Jump, line);
         match &mut self.cur().control[target_idx] {
             Ctrl::Loop { break_patches, .. }
@@ -553,7 +559,7 @@ impl Compiler {
     }
 
     fn compile_continue(&mut self, label: Option<&str>, line: u32) -> CResult<()> {
-        let target_idx = self.unwind_control_to(false, label, line)?;
+        let target_idx = self.unwind_control_to(JumpControl::Continue, label, line)?;
         let jidx = self.emit_jump(OpCode::Jump, line);
         if let Ctrl::Loop {
             continue_patches, ..

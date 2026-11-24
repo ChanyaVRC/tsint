@@ -32,6 +32,8 @@ impl std::fmt::Display for CompileError {
     }
 }
 
+impl std::error::Error for CompileError {}
+
 pub(super) type CResult<T> = Result<T, CompileError>;
 
 pub(super) fn err(line: u32, msg: impl Into<String>) -> CompileError {

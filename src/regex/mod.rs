@@ -56,8 +56,16 @@ use compiler::{Compiler, Inst};
 use engine::{BacktrackFrame, Exec, Saved, Trail, DEFAULT_MAX_DEPTH, DEFAULT_MAX_STEPS};
 use parser::{count_capturing_groups, Parser};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegexError(pub String);
+
+impl std::fmt::Display for RegexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RegexError {}
 
 /// マッチ結果。位置はすべて文字（Unicode スカラ値）インデックス。
 #[derive(Debug, Clone)]

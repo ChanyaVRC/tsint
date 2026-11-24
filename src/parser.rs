@@ -23,6 +23,8 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+impl std::error::Error for ParseError {}
+
 impl From<LexError> for ParseError {
     fn from(e: LexError) -> Self {
         ParseError {

@@ -57,6 +57,28 @@ impl std::fmt::Display for InterpError {
     }
 }
 
+impl std::error::Error for InterpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InterpError::Parse(e) => Some(e),
+            InterpError::Compile(e) => Some(e),
+            InterpError::Runtime(_) => None,
+        }
+    }
+}
+
+impl From<ParseError> for InterpError {
+    fn from(e: ParseError) -> Self {
+        InterpError::Parse(e)
+    }
+}
+
+impl From<compiler::CompileError> for InterpError {
+    fn from(e: compiler::CompileError) -> Self {
+        InterpError::Compile(e)
+    }
+}
+
 /// `tsint` の公開エントリポイント。`Interpreter::new()` → `register_native` /
 /// `register_native_async` → `run_module` / `run_module_graph` の順で使う。
 pub struct Interpreter {
@@ -147,8 +169,8 @@ impl Interpreter {
         source: &str,
         name: &str,
     ) -> Result<Vec<(Rc<str>, value::Value)>, InterpError> {
-        let module = parse_module(source, name).map_err(InterpError::Parse)?;
-        let chunk = compiler::compile_module(&module).map_err(InterpError::Compile)?;
+        let module = parse_module(source, name)?;
+        let chunk = compiler::compile_module(&module)?;
         self.vm
             .run_module(chunk)
             .map_err(|thrown| InterpError::Runtime(self.vm.to_display_string(&thrown)))

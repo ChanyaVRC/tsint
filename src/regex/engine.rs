@@ -2,6 +2,7 @@
 
 use super::charclass::{char_eq, is_line_terminator, is_word};
 use super::compiler::Inst;
+use super::parser::{LookaheadKind, WordBoundary};
 use super::RegexError;
 
 /// 壊滅的バックトラック対策のデフォルト上限。超過時は `RegexError` を返す。
@@ -177,10 +178,11 @@ impl<'a> Exec<'a> {
                         false
                     }
                 }
-                Inst::WordB(want) => {
+                Inst::WordB(wb) => {
                     let before = sp > 0 && is_word(self.chars[sp - 1]);
                     let after = sp < self.chars.len() && is_word(self.chars[sp]);
-                    if (before != after) == *want {
+                    let want_boundary = *wb == WordBoundary::Match;
+                    if (before != after) == want_boundary {
                         pc += 1;
                         true
                     } else {
@@ -217,14 +219,18 @@ impl<'a> Exec<'a> {
                 Inst::Look {
                     sub_pc,
                     after_pc,
-                    negate,
+                    kind,
                 } => {
-                    let (sub_pc, after_pc, negate) = (*sub_pc, *after_pc, *negate);
+                    let (sub_pc, after_pc, kind) = (*sub_pc, *after_pc, *kind);
                     let look_trail_mark = trail.len();
                     let matched = self
                         .run_from(sub_pc, sp, saved, trail, stack, look_depth + 1)?
                         .is_some();
-                    if matched != negate {
+                    let ok = match kind {
+                        LookaheadKind::Positive => matched,
+                        LookaheadKind::Negative => !matched,
+                    };
+                    if ok {
                         pc = after_pc;
                         true
                     } else {

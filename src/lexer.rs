@@ -121,6 +121,8 @@ impl std::fmt::Display for LexError {
     }
 }
 
+impl std::error::Error for LexError {}
+
 /// テンプレートリテラルの `${` によって開かれたブレース文脈か、
 /// 通常の `{` かを区別するためのスタック要素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,18 @@ enum BraceCtx {
     Block,
     Template,
 }
+
+/// テンプレートリテラル断片の開始位置。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TemplatePartPos {
+    /// 先頭バッククォート直後（`NoSubTemplate` / `TemplateHead`）。
+    Head,
+    /// `${...}` を閉じた `}` の直後（`TemplateTail` / `TemplateMiddle`）。
+    Continuation,
+}
+
+/// `f64` で厳密に表現できる 10 進整数桁数の高速パス上限。
+const FAST_INT_MAX_DIGITS: usize = 15;
 
 /// 正規表現リテラルが許されるかどうかを、直前の意味のあるトークンから判定する。
 /// 「識別子・数値・文字列・`)` `]` `++` `--` の直後」は除算、それ以外は正規表現。
@@ -399,11 +413,11 @@ impl<'a> Lexer<'a> {
         let kind = if b < 0x80 {
             if b == b'`' {
                 self.advance_ascii();
-                self.read_template_part(true)?
+                self.read_template_part(TemplatePartPos::Head)?
             } else if b == b'}' && self.brace_stack.last() == Some(&BraceCtx::Template) {
                 self.brace_stack.pop();
                 self.advance_ascii();
-                self.read_template_part(false)?
+                self.read_template_part(TemplatePartPos::Continuation)?
             } else if b.is_ascii_digit()
                 || (b == b'.' && self.peek_byte_at(1).is_some_and(|d| d.is_ascii_digit()))
             {
@@ -508,7 +522,7 @@ impl<'a> Lexer<'a> {
 
         while let Some(b) = self.peek_byte() {
             if b.is_ascii_digit() {
-                if int_digits < 15 {
+                if int_digits < FAST_INT_MAX_DIGITS {
                     int_acc = int_acc * 10 + (b - b'0') as i64;
                 }
                 int_digits += 1;
@@ -551,7 +565,7 @@ impl<'a> Lexer<'a> {
         let end = self.pos;
         self.eat_byte(b'n'); // BigInt サフィックス
 
-        if !is_float && int_digits > 0 && int_digits <= 15 {
+        if !is_float && int_digits > 0 && int_digits <= FAST_INT_MAX_DIGITS {
             return Ok(TokenKind::Number(int_acc as f64));
         }
         let v: f64 = if !has_sep {
@@ -690,9 +704,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// テンプレートリテラルの断片を 1 つ読む。
-    /// `is_head` が true ならバッククォート直後（Head/NoSub）、false なら
-    /// `}` 直後（Middle/Tail）の読み取り。
-    fn read_template_part(&mut self, is_head: bool) -> Result<TokenKind, LexError> {
+    fn read_template_part(&mut self, part_pos: TemplatePartPos) -> Result<TokenKind, LexError> {
         let start = self.pos;
         let bytes = self.bytes;
         let mut s: Option<String> = None;
@@ -709,10 +721,9 @@ impl<'a> Lexer<'a> {
                         None => self.src[chunk_start..self.pos].to_owned(),
                     };
                     self.advance_ascii();
-                    return Ok(if is_head {
-                        TokenKind::NoSubTemplate(result)
-                    } else {
-                        TokenKind::TemplateTail(result)
+                    return Ok(match part_pos {
+                        TemplatePartPos::Head => TokenKind::NoSubTemplate(result),
+                        TemplatePartPos::Continuation => TokenKind::TemplateTail(result),
                     });
                 }
                 Some(b'$') if bytes.get(self.pos + 1) == Some(&b'{') => {
@@ -726,10 +737,9 @@ impl<'a> Lexer<'a> {
                     self.pos += 2;
                     self.col += 2;
                     self.brace_stack.push(BraceCtx::Template);
-                    return Ok(if is_head {
-                        TokenKind::TemplateHead(result)
-                    } else {
-                        TokenKind::TemplateMiddle(result)
+                    return Ok(match part_pos {
+                        TemplatePartPos::Head => TokenKind::TemplateHead(result),
+                        TemplatePartPos::Continuation => TokenKind::TemplateMiddle(result),
                     });
                 }
                 Some(b'\\') => {

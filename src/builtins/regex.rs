@@ -44,7 +44,7 @@ pub(super) fn install_regexp(vm: &mut Vm) {
             };
             match crate::regex::Regex::compile(&pattern, &flags) {
                 Ok(re) => Ok(vm.alloc_regex_value(Rc::new(re))),
-                Err(e) => Err(vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0))),
+                Err(e) => Err(vm.syntax_error(format!("不正な正規表現です: {e}"))),
             }
         }),
     );
@@ -58,11 +58,11 @@ pub(super) fn coerce_to_regex(vm: &mut Vm, v: &Value) -> Result<Rc<crate::regex:
     let pattern = vm.to_display_string(v);
     crate::regex::Regex::compile(&pattern, "")
         .map(Rc::new)
-        .map_err(|e| vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0)))
+        .map_err(|e| vm.syntax_error(format!("不正な正規表現です: {e}")))
 }
 
 pub(super) fn regex_err(vm: &Vm, e: crate::regex::RegexError) -> Value {
-    vm.range_error(format!("正規表現の実行中にエラーが発生しました: {}", e.0))
+    vm.range_error(format!("正規表現の実行中にエラーが発生しました: {e}"))
 }
 
 fn regex_last_index(o: &ObjRef) -> usize {

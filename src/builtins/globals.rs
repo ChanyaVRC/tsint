@@ -349,7 +349,7 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
                     });
                     Ok(vm.alloc_obj(ObjData::new(ObjKind::Function(fo))))
                 }
-                Err(e) => Err(vm.make_error("SyntaxError", e.to_string())),
+                Err(e) => Err(vm.syntax_error(e.to_string())),
             }
         }),
     );

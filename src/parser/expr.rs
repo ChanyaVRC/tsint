@@ -12,6 +12,13 @@ use crate::lexer::{Punct, TokenKind};
 /// アロー関数本体: ブロック文本体か、単一の式本体か。
 type ArrowBody = (Option<Vec<Stmt>>, Option<Box<Expr>>);
 
+/// 関数構文で関数名が必須（宣言）か省略可能（式・default export・メソッド）か。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FnNameMode {
+    Required,
+    Optional,
+}
+
 impl Parser {
     /// カンマ演算子を含む最上位の式。
     pub(super) fn parse_expr(&mut self) -> PResult<Expr> {
@@ -964,17 +971,16 @@ impl Parser {
     /// `function` キーワードの後ろから読む関数式。
     pub(super) fn parse_function_expr(&mut self, is_async: bool) -> PResult<Expr> {
         let start = self.cur_span();
-        let func = self.parse_function_tail(is_async, true)?;
+        let func = self.parse_function_tail(is_async, FnNameMode::Optional)?;
         Ok(self.mk_expr(start, ExprKind::Function(Box::new(func))))
     }
 
     /// `function` の次のトークン（関数名の可能性がある識別子、または `(`）から、
     /// ジェネリクス・引数リスト・戻り値型・本体までを読む共通処理。
-    /// `name_optional` は式（無名可）か宣言（有名前提）かの違いに使う。
     pub(super) fn parse_function_tail(
         &mut self,
         is_async: bool,
-        name_optional: bool,
+        name_mode: FnNameMode,
     ) -> PResult<Function> {
         let start = self.cur_span();
         self.eat_punct(Punct::Star); // generator の '*' は読み飛ばす（非対応）
@@ -989,7 +995,7 @@ impl Parser {
         } else {
             None
         };
-        if name.is_none() && !name_optional {
+        if name.is_none() && name_mode == FnNameMode::Required {
             return Err(self.err("関数名が必要です"));
         }
         self.skip_type_params()?;
@@ -1023,7 +1029,7 @@ impl Parser {
     }
 
     fn parse_method_function(&mut self, is_async: bool) -> PResult<Function> {
-        self.parse_function_tail(is_async, true)
+        self.parse_function_tail(is_async, FnNameMode::Optional)
     }
 
     /// クラスメンバ/オブジェクトメソッドなど、名前を呼び出し元がすでに

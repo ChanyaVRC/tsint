@@ -7,12 +7,18 @@ use super::{arg, arg_ref, native};
 use crate::value::*;
 use crate::vm::{is_callable, Vm};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettleMode {
+    Resolve,
+    Reject,
+}
+
 pub(super) fn install_promise(vm: &mut Vm) {
     let ctor = native("Promise", 1, |vm, _this, args| {
         let executor = arg(args, 0);
         let (promise_val, promise_obj) = vm.new_pending_promise();
-        let resolve_fn = settle_forward_fn(vm, promise_obj.clone(), false);
-        let reject_fn = settle_forward_fn(vm, promise_obj.clone(), true);
+        let resolve_fn = settle_forward_fn(vm, promise_obj.clone(), SettleMode::Resolve);
+        let reject_fn = settle_forward_fn(vm, promise_obj.clone(), SettleMode::Reject);
         if let Err(e) = vm.call_value(executor, Value::Undefined, &[resolve_fn, reject_fn]) {
             vm.settle_promise(promise_obj, Err(e));
         }
@@ -40,8 +46,8 @@ pub(super) fn install_promise(vm: &mut Vm) {
         let (_, dummy) = vm.new_pending_promise();
         for item in items {
             let p = vm.coerce_to_promise(item);
-            let on_fulfilled = settle_forward_fn(vm, result_obj.clone(), false);
-            let on_rejected = settle_forward_fn(vm, result_obj.clone(), true);
+            let on_fulfilled = settle_forward_fn(vm, result_obj.clone(), SettleMode::Resolve);
+            let on_rejected = settle_forward_fn(vm, result_obj.clone(), SettleMode::Reject);
             vm.add_promise_reaction(
                 &p,
                 PromiseReaction::Then {
@@ -87,7 +93,7 @@ pub(super) fn install_promise(vm: &mut Vm) {
                     Ok(Value::Undefined)
                 }),
             );
-            let on_rejected = settle_forward_fn(vm, result_obj.clone(), true);
+            let on_rejected = settle_forward_fn(vm, result_obj.clone(), SettleMode::Reject);
             vm.add_promise_reaction(
                 &p,
                 PromiseReaction::Then {
@@ -110,8 +116,8 @@ pub(super) fn install_promise(vm: &mut Vm) {
 }
 
 /// 引数の値/例外で `target` を確定させ、戻り値は捨てるネイティブ関数を生成する
-/// （`new Promise` の resolve/reject および `Promise.race` で共通利用）。
-fn settle_forward_fn(vm: &Vm, target: ObjRef, is_reject: bool) -> Value {
+/// （`new Promise` の resolve/reject および `Promise.race` / `Promise.all` で共通利用）。
+fn settle_forward_fn(vm: &Vm, target: ObjRef, mode: SettleMode) -> Value {
     let weak = Rc::downgrade(&target);
     vm.alloc_native_with_captures(
         "",
@@ -120,10 +126,9 @@ fn settle_forward_fn(vm: &Vm, target: ObjRef, is_reject: bool) -> Value {
         Rc::new(move |vm, _this, args| {
             if let Some(t) = weak.upgrade() {
                 let v = arg(args, 0);
-                if is_reject {
-                    vm.settle_promise(t, Err(v));
-                } else {
-                    vm.resolve_promise(t, v);
+                match mode {
+                    SettleMode::Resolve => vm.resolve_promise(t, v),
+                    SettleMode::Reject => vm.settle_promise(t, Err(v)),
                 }
             }
             Ok(Value::Undefined)
