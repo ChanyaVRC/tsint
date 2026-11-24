@@ -27,6 +27,9 @@ pub type LocalIdx = u16;
 pub type UpvalueIdx = u16;
 pub type JumpAddr = u32;
 
+/// 未学習インラインキャッシュスロットのセンチネル値。
+pub(crate) const IC_UNSET: u16 = u16::MAX;
+
 #[derive(Debug, Clone, Copy)]
 pub enum OpCode {
     // --- スタック操作 ---
@@ -350,7 +353,15 @@ impl Chunk {
 
     pub(crate) fn finalize(&mut self) {
         self.has_captured_locals = self.captured_locals.iter().any(|&c| c);
-        self.ic_slots = vec![Cell::new(u16::MAX); self.code.len()];
+        let has_ic_ops = self.code.iter().any(|op| {
+            matches!(
+                op,
+                OpCode::GetProp(_) | OpCode::SetProp(_) | OpCode::CallMethod(_, _)
+            )
+        });
+        if has_ic_ops {
+            self.ic_slots = vec![Cell::new(IC_UNSET); self.code.len()];
+        }
     }
 }
 
