@@ -88,6 +88,7 @@ pub struct Interpreter {
 }
 
 impl Interpreter {
+    /// 組み込みオブジェクト一式を備えた新しいインタプリタを生成する。
     pub fn new() -> Self {
         Interpreter { vm: vm::Vm::new() }
     }
@@ -154,6 +155,7 @@ impl Interpreter {
         self.vm.run_event_loop()
     }
 
+    /// 内部の [`vm::Vm`] への可変参照を返す。
     pub fn vm(&mut self) -> &mut vm::Vm {
         &mut self.vm
     }

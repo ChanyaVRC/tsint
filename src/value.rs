@@ -8,7 +8,7 @@
 //!   統一する。`ObjKind` で実体の種類を分岐する。
 //! - ローカル変数スロットは内側クロージャから捕捉されるものだけを
 //!   `Rc<RefCell<Value>>`（`LocalSlot::Boxed`）で持ち、非キャプチャ変数は
-//!   ヒープ確保なしの `LocalSlot::Direct(Value)` として保持する（`vm.rs` 参照）。
+//!   ヒープ確保なしの `LocalSlot::Direct(Value)` として保持する（`crate::vm` 参照）。
 //! - `Value::Uninit` は TDZ 判定専用の内部マーカー。JS コードから直接
 //!   観測されることはない。
 
@@ -419,7 +419,7 @@ pub struct FunctionObj {
     pub is_arrow: bool,
     /// `async function`/`async () => {}`/`async` メソッド。呼び出すと本体を
     /// 即座には実行せず、専用のフレーム列（タスク）で駆動して Promise を返す
-    /// （`vm.rs` の `spawn_async_task_from_function` 参照）。
+    /// （`crate::vm` の `spawn_async_task_from_function` 参照）。
     pub is_async: bool,
 }
 
@@ -645,7 +645,7 @@ pub enum ObjKind {
     Set(SetData),
     /// Error 系オブジェクト（`message`/`name` は props に格納。マーカーのみ）。
     Error,
-    /// 正規表現（T4 本実装。`src/regex.rs` 参照）。
+    /// 正規表現（T4 本実装。`crate::regex` 参照）。
     Regex(Rc<crate::regex::Regex>),
     /// Promise（T3）。状態と pending 中の反応（reaction）を保持する。
     Promise(PromiseData),

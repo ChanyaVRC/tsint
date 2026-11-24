@@ -216,9 +216,12 @@ pub struct HostPromise {
 }
 
 impl HostPromise {
+    /// 紐づく JS `Promise` を指定値で解決（fulfill）する。
     pub fn resolve(&self, vm: &mut Vm, value: Value) {
         vm.settle_host_promise(self.promise.clone(), Ok(value));
     }
+
+    /// 紐づく JS `Promise` を指定値で棄却（reject）する。
     pub fn reject(&self, vm: &mut Vm, value: Value) {
         vm.settle_host_promise(self.promise.clone(), Err(value));
     }

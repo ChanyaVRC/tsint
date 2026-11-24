@@ -648,7 +648,7 @@ impl Compiler {
 
         let unwind_addr = if let Some(fin) = &finally_rc {
             let addr = self.cur_addr();
-            let exc_slot = self.cur().get_or_make_exc_slot();
+            let exc_slot = self.cur().exc_slot();
             self.emit(OpCode::BindLocal(exc_slot), line);
             self.compile_block_new_scope(fin)?;
             self.emit(OpCode::GetLocal(exc_slot), line);

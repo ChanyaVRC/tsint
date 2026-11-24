@@ -56,6 +56,7 @@ use compiler::{Compiler, Inst};
 use engine::{BacktrackFrame, Exec, Saved, Trail, DEFAULT_MAX_DEPTH, DEFAULT_MAX_STEPS};
 use parser::{count_capturing_groups, Parser};
 
+/// 正規表現のコンパイルまたは実行時に発生するエラー。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegexError(pub String);
 
@@ -98,6 +99,7 @@ enum StartFilter {
     FirstClass(CharClass),
 }
 
+/// コンパイル済み正規表現。
 pub struct Regex {
     pub source: String,
     pub flags: String,
@@ -115,6 +117,7 @@ pub struct Regex {
 }
 
 impl Regex {
+    /// パターン文字列とフラグ（`g` / `i` / `m` / `s` / `u`）から正規表現をコンパイルする。
     pub fn compile(pattern: &str, flags: &str) -> Result<Regex, RegexError> {
         let mut global = false;
         let mut ignore_case = false;
@@ -171,6 +174,7 @@ impl Regex {
         })
     }
 
+    /// キャプチャグループ数を返す。
     pub fn ncaptures(&self) -> usize {
         self.ncaptures
     }
@@ -268,6 +272,7 @@ impl Regex {
         }
     }
 
+    /// 文字列 `s` のいずれかの位置にマッチするかを判定する。
     pub fn test(&self, s: &str) -> Result<bool, RegexError> {
         let chars: Vec<char> = s.chars().collect();
         Ok(self.search(&chars, 0)?.is_some())

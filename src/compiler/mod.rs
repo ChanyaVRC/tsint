@@ -123,7 +123,7 @@ impl FuncCtx {
             .map(|l| l.slot)
     }
 
-    pub(super) fn get_or_make_exc_slot(&mut self) -> LocalIdx {
+    pub(super) fn exc_slot(&mut self) -> LocalIdx {
         if let Some(s) = self.exc_slot {
             return s;
         }

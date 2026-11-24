@@ -1,7 +1,7 @@
 //! T5a: ES モジュールシステム。
 //!
 //! 設計方針:
-//! - VM/コンパイラ本体（`vm.rs`/`compiler.rs`/`bytecode.rs`）にはほぼ手を
+//! - VM/コンパイラ本体（`crate::vm`/`crate::compiler`/`crate::bytecode`）にはほぼ手を
 //!   入れない。`import`/`export ... from` を含む AST を、依存モジュールの
 //!   評価が終わった後に「名前空間オブジェクトを保持するグローバル変数から
 //!   `const` で読み出す」形へ **AST レベルで書き換えてから**
@@ -24,7 +24,6 @@
 //!   Noiria のコーパスの前提の下、`Vm::run_module` と同じ「完全に解決する
 //!   はず」経路で評価する。解決しなければ `ModuleError::Runtime` になる。
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{
@@ -32,6 +31,7 @@ use crate::ast::{
     VarDeclarator, VarKind,
 };
 use crate::compiler::{self, CompileError};
+use crate::hash::FastHashMap;
 use crate::value::Value;
 use crate::vm::ModuleTaskState;
 use crate::{parse_module, Interpreter, ParseError};
@@ -188,9 +188,9 @@ struct Loader<'i, 'h> {
     interp: &'i mut Interpreter,
     host: &'h dyn ModuleHost,
     /// resolved specifier -> 名前空間オブジェクトを保持するグローバル変数名。
-    cache: HashMap<String, Rc<str>>,
+    cache: FastHashMap<String, Rc<str>>,
     /// resolved specifier -> export 名一覧（`export * from` 用）。
-    export_names: HashMap<String, Vec<Rc<str>>>,
+    export_names: FastHashMap<String, Vec<Rc<str>>>,
     next_id: u32,
 }
 
@@ -412,8 +412,8 @@ impl Interpreter {
         let mut loader = Loader {
             interp: self,
             host,
-            cache: HashMap::new(),
-            export_names: HashMap::new(),
+            cache: FastHashMap::default(),
+            export_names: FastHashMap::default(),
             next_id: 0,
         };
         let resolved = loader.resolve(entry_specifier, "<entry>")?;
