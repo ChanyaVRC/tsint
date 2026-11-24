@@ -196,15 +196,15 @@ pub fn to_string_basic(v: &Value) -> String {
                 ObjKind::Class(c) => format!("class {} {{ }}", c.name),
                 ObjKind::Error => {
                     let name = match b.props.get("name") {
-                        Some(PropSlot::Value(Value::Str(s))) => s.to_string(),
-                        _ => "Error".to_string(),
+                        Some(PropSlot::Value(Value::Str(s))) => &**s,
+                        _ => "Error",
                     };
                     let msg = match b.props.get("message") {
-                        Some(PropSlot::Value(Value::Str(s))) => s.to_string(),
-                        _ => String::new(),
+                        Some(PropSlot::Value(Value::Str(s))) => &**s,
+                        _ => "",
                     };
                     if msg.is_empty() {
-                        name
+                        name.to_string()
                     } else {
                         format!("{name}: {msg}")
                     }

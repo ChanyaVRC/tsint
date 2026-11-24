@@ -195,20 +195,28 @@ pub fn compile_module(module: &Module) -> CResult<Rc<Chunk>> {
 }
 
 fn collect_exports(c: &mut Compiler, s: &Stmt) -> CResult<()> {
+    let line = s.span.start.line;
     match &s.kind {
-        StmtKind::ExportDecl(inner) => {
-            let names: Vec<String> = match &inner.kind {
-                StmtKind::VarDecl { decls, .. } => {
-                    decls.iter().flat_map(|d| pattern_names(&d.name)).collect()
+        StmtKind::ExportDecl(inner) => match &inner.kind {
+            StmtKind::VarDecl { decls, .. } => {
+                for d in decls {
+                    for n in pattern_names(&d.name) {
+                        register_export(c, n, n, line)?;
+                    }
                 }
-                StmtKind::FunctionDecl(f) => f.name.clone().into_iter().collect(),
-                StmtKind::ClassDecl(cl) => cl.name.clone().into_iter().collect(),
-                _ => Vec::new(),
-            };
-            for n in names {
-                register_export(c, &n, &n, s.span.start.line)?;
             }
-        }
+            StmtKind::FunctionDecl(f) => {
+                if let Some(n) = f.name.as_deref() {
+                    register_export(c, n, n, line)?;
+                }
+            }
+            StmtKind::ClassDecl(cl) => {
+                if let Some(n) = cl.name.as_deref() {
+                    register_export(c, n, n, line)?;
+                }
+            }
+            _ => {}
+        },
         StmtKind::ExportNamed {
             specifiers,
             source: None,
@@ -216,10 +224,10 @@ fn collect_exports(c: &mut Compiler, s: &Stmt) -> CResult<()> {
         } => {
             for spec in specifiers {
                 let ExportSpecifier::Named { local, exported } = spec;
-                register_export(c, local, exported, s.span.start.line)?;
+                register_export(c, local, exported, line)?;
             }
         }
-        StmtKind::ExportDefault(_) => register_export(c, "default", "default", s.span.start.line)?,
+        StmtKind::ExportDefault(_) => register_export(c, "default", "default", line)?,
         _ => {}
     }
     Ok(())

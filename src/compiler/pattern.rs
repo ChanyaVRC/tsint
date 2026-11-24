@@ -98,6 +98,7 @@ impl Compiler {
                 self.emit(OpCode::Pop, line);
             }
             ExprKind::ObjectLit(props) => {
+                let has_spread = props.iter().any(|p| matches!(p, ObjectProp::Spread(_)));
                 let mut used_keys = Vec::new();
                 for p in props {
                     match p {
@@ -111,7 +112,9 @@ impl Compiler {
                                 _ => {
                                     let name = property_key_static_name(key);
                                     let c = self.add_const_str(&name);
-                                    used_keys.push(name.into_owned());
+                                    if has_spread {
+                                        used_keys.push(name.into_owned());
+                                    }
                                     self.emit(OpCode::GetProp(c), line);
                                 }
                             }
@@ -221,7 +224,7 @@ impl Compiler {
                 has_rest = true;
                 self.emit(OpCode::GetRestArgs(i as u16), line);
                 for name in pattern_names(&p.pattern) {
-                    self.declare_local(&name);
+                    self.declare_local(name);
                 }
                 self.compile_bind_pattern(&p.pattern, line)?;
                 continue;
@@ -234,7 +237,7 @@ impl Compiler {
                 self.patch_jump(j, after);
             }
             for name in pattern_names(&p.pattern) {
-                self.declare_local(&name);
+                self.declare_local(name);
             }
             self.compile_bind_pattern(&p.pattern, line)?;
         }
@@ -274,10 +277,7 @@ impl Compiler {
                 "class の extends は T2 では未対応です（コーパスに無いため省略）",
             ));
         }
-        let name = c
-            .name
-            .clone()
-            .unwrap_or_else(|| "<anonymous class>".to_string());
+        let name = c.name.as_deref().unwrap_or("<anonymous class>");
         let mut ctor_tpl: Option<Rc<FunctionTemplate>> = None;
         let mut methods = Vec::new();
         let mut accessors = Vec::new();
@@ -330,7 +330,7 @@ impl Compiler {
         }
 
         let template = ClassTemplate {
-            name: Rc::from(name.as_str()),
+            name: Rc::from(name),
             ctor: ctor_tpl,
             methods,
             accessors,
@@ -365,15 +365,15 @@ impl Compiler {
     }
 }
 
-pub(super) fn pattern_names(pat: &Pattern) -> Vec<String> {
+pub(super) fn pattern_names(pat: &Pattern) -> Vec<&str> {
     let mut out = Vec::new();
     collect_pattern_names(pat, &mut out);
     out
 }
 
-fn collect_pattern_names(pat: &Pattern, out: &mut Vec<String>) {
+fn collect_pattern_names<'a>(pat: &'a Pattern, out: &mut Vec<&'a str>) {
     match pat {
-        Pattern::Ident(n) => out.push(n.clone()),
+        Pattern::Ident(n) => out.push(n.as_str()),
         Pattern::Assign { left, .. } => collect_pattern_names(left, out),
         Pattern::Object { props, rest } => {
             for p in props {

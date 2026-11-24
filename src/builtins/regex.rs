@@ -14,6 +14,17 @@ thread_local! {
     static KEY_GROUPS: Rc<str> = Rc::from("groups");
 }
 
+/// `Value` が `ObjKind::Regex` であればコンパイル済み正規表現の `Rc` を返す。
+#[inline]
+pub(super) fn as_regex(v: &Value) -> Option<Rc<crate::regex::Regex>> {
+    if let Value::Object(o) = v {
+        if let ObjKind::Regex(r) = &o.borrow().kind {
+            return Some(r.clone());
+        }
+    }
+    None
+}
+
 /// `new RegExp(...)` / `RegExp(...)` の実装。
 pub(super) fn install_regexp(vm: &mut Vm) {
     vm.register_native(
@@ -21,14 +32,10 @@ pub(super) fn install_regexp(vm: &mut Vm) {
         2,
         Rc::new(|vm, _this, args| {
             let (pattern, default_flags) = match args.first() {
-                Some(Value::Object(o)) if matches!(o.borrow().kind, ObjKind::Regex(_)) => {
-                    let re = match &o.borrow().kind {
-                        ObjKind::Regex(r) => r.clone(),
-                        _ => unreachable!(),
-                    };
-                    (re.source.clone(), re.flags.clone())
-                }
-                Some(v) => (vm.to_display_string(v), String::new()),
+                Some(v) => match as_regex(v) {
+                    Some(re) => (re.source.clone(), re.flags.clone()),
+                    None => (vm.to_display_string(v), String::new()),
+                },
                 None => (String::new(), String::new()),
             };
             let flags = match args.get(1) {
@@ -36,7 +43,7 @@ pub(super) fn install_regexp(vm: &mut Vm) {
                 Some(v) => vm.to_display_string(v),
             };
             match crate::regex::Regex::compile(&pattern, &flags) {
-                Ok(re) => Ok(crate::vm::new_regex_value(Rc::new(re))),
+                Ok(re) => Ok(vm.alloc_regex_value(Rc::new(re))),
                 Err(e) => Err(vm.make_error("SyntaxError", format!("不正な正規表現です: {}", e.0))),
             }
         }),
@@ -45,10 +52,8 @@ pub(super) fn install_regexp(vm: &mut Vm) {
 
 /// 文字列引数またはコンパイル済み正規表現を `Rc<Regex>` に統一する。
 pub(super) fn coerce_to_regex(vm: &mut Vm, v: &Value) -> Result<Rc<crate::regex::Regex>, Value> {
-    if let Value::Object(o) = v {
-        if let ObjKind::Regex(re) = &o.borrow().kind {
-            return Ok(re.clone());
-        }
+    if let Some(re) = as_regex(v) {
+        return Ok(re);
     }
     let pattern = vm.to_display_string(v);
     crate::regex::Regex::compile(&pattern, "")

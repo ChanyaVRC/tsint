@@ -1034,23 +1034,29 @@ impl Vm {
                 let src = self.pop();
                 let obj = self.top().clone();
                 if let (Value::Object(dst), Value::Object(src_o)) = (&obj, &src) {
-                    let entries: Vec<(Rc<str>, Value)> = src_o
-                        .borrow()
-                        .props
-                        .iter()
-                        .filter_map(|(k, s)| match s {
-                            PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                            PropSlot::Accessor { .. } => None,
-                        })
-                        .collect();
+                    let (entries, arr_items) = {
+                        let sb = src_o.borrow();
+                        let entries: Vec<(Rc<str>, Value)> = sb
+                            .props
+                            .iter()
+                            .filter_map(|(k, s)| match s {
+                                PropSlot::Value(v) => Some((k.clone(), v.clone())),
+                                PropSlot::Accessor { .. } => None,
+                            })
+                            .collect();
+                        let arr_items = match &sb.kind {
+                            ObjKind::Array(items) => Some(items.clone()),
+                            _ => None,
+                        };
+                        (entries, arr_items)
+                    };
+                    let mut db = dst.borrow_mut();
                     for (k, v) in entries {
-                        dst.borrow_mut().props.set_value(k, v);
+                        db.props.set_value(k, v);
                     }
-                    if let ObjKind::Array(items) = &src_o.borrow().kind {
-                        for (i, it) in items.iter().enumerate() {
-                            dst.borrow_mut()
-                                .props
-                                .set_value(Rc::from(i.to_string().as_str()), it.clone());
+                    if let Some(items) = arr_items {
+                        for (i, it) in items.into_iter().enumerate() {
+                            db.props.set_value(Rc::from(i.to_string().as_str()), it);
                         }
                     }
                 }

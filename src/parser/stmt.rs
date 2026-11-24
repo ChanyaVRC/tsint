@@ -609,7 +609,8 @@ impl Parser {
     fn parse_import_stmt(&mut self) -> PResult<Stmt> {
         let start = self.cur_span();
         self.expect_word("import")?;
-        if let TokenKind::Str(s) = self.cur().kind.clone() {
+        if let TokenKind::Str(s) = &self.cur().kind {
+            let s = s.clone();
             self.bump();
             self.consume_semi()?;
             return Ok(self.mk_stmt(
@@ -793,8 +794,9 @@ impl Parser {
     }
 
     fn expect_string_lit(&mut self) -> PResult<String> {
-        match self.cur().kind.clone() {
+        match &self.cur().kind {
             TokenKind::Str(s) => {
+                let s = s.clone();
                 self.bump();
                 Ok(s)
             }
@@ -809,7 +811,8 @@ impl Parser {
         self.expect_word("declare")?;
         if self.is_word("module") || self.is_word("namespace") || self.is_word("global") {
             self.bump();
-            let name = if let TokenKind::Str(s) = self.cur().kind.clone() {
+            let name = if let TokenKind::Str(s) = &self.cur().kind {
+                let s = s.clone();
                 self.bump();
                 s
             } else if self.ident_name().is_some() {

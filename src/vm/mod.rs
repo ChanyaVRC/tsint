@@ -328,16 +328,19 @@ impl Vm {
             frame.upvalues = f.upvalues.clone();
             frame.stack.clear();
             if needs_raw {
-                if Rc::ptr_eq(&frame.raw_args, &self.empty_args)
-                    || Rc::strong_count(&frame.raw_args) != 1
-                {
+                if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
+                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                        v.clear();
+                        v.extend_from_slice(args);
+                    } else {
+                        let mut v = self.take_args_buf();
+                        v.extend_from_slice(args);
+                        frame.raw_args = Rc::new(v);
+                    }
+                } else {
                     let mut v = self.take_args_buf();
                     v.extend_from_slice(args);
                     frame.raw_args = Rc::new(v);
-                } else {
-                    let v = Rc::get_mut(&mut frame.raw_args).unwrap();
-                    v.clear();
-                    v.extend_from_slice(args);
                 }
             } else if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
                 v.clear();
@@ -400,16 +403,18 @@ impl Vm {
             let n = caller.stack.len();
             let arg_start = n - argc;
             if needs_raw {
-                if Rc::ptr_eq(&frame.raw_args, &self.empty_args)
-                    || Rc::strong_count(&frame.raw_args) != 1
-                {
+                let mut reused = false;
+                if !Rc::ptr_eq(&frame.raw_args, &self.empty_args) {
+                    if let Some(v) = Rc::get_mut(&mut frame.raw_args) {
+                        v.clear();
+                        v.extend(caller.stack.drain(arg_start..));
+                        reused = true;
+                    }
+                }
+                if !reused {
                     let mut v = self.args_pool.pop().unwrap_or_default();
                     v.extend(caller.stack.drain(arg_start..));
                     frame.raw_args = Rc::new(v);
-                } else {
-                    let v = Rc::get_mut(&mut frame.raw_args).unwrap();
-                    v.clear();
-                    v.extend(caller.stack.drain(arg_start..));
                 }
                 for i in 0..sp {
                     let val = frame.raw_args.get(i).cloned().unwrap_or(Value::Undefined);
@@ -519,7 +524,7 @@ impl Vm {
     }
 
     pub fn start_module_task(&mut self, chunk: Rc<Chunk>) -> Result<ModuleTaskState, Value> {
-        let frame = Frame::new(chunk, Rc::new(Vec::new()), Rc::new(Vec::new()));
+        let frame = Frame::new(chunk, self.empty_upvalues.clone(), self.empty_args.clone());
         self.frames = vec![frame];
         let (_, owner) = self.new_pending_promise();
         self.drive_current_task(owner.clone());

@@ -3,9 +3,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{arg, native};
+use super::{arg, arg_ref, native, value_as_cow_str};
 use crate::value::*;
-use crate::vm::{own_enumerable_keys, to_number, Vm};
+use crate::vm::{own_enumerable_keys, to_number, to_string_into, Vm};
 
 // =====================================================================
 // console
@@ -14,8 +14,13 @@ use crate::vm::{own_enumerable_keys, to_number, Vm};
 pub(super) fn install_console(vm: &mut Vm) {
     let console = Value::new_plain_object();
     let log = native("log", 0, |vm, _this, args| {
-        let parts: Vec<String> = args.iter().map(|a| vm.to_display_string(a)).collect();
-        let line = parts.join(" ");
+        let mut line = String::new();
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                line.push(' ');
+            }
+            to_string_into(a, &mut line);
+        }
         (vm.on_log)(&line);
         Ok(Value::Undefined)
     });
@@ -35,15 +40,14 @@ pub(super) fn install_console(vm: &mut Vm) {
 
 pub(super) fn install_object(vm: &mut Vm) {
     let object_global = Value::new_plain_object();
-    let keys = native("keys", 1, |_vm, _this, args| {
-        Ok(Value::new_array(own_enumerable_keys(&arg(args, 0))))
+    let keys = native("keys", 1, |vm, _this, args| {
+        Ok(vm.alloc_array(own_enumerable_keys(arg_ref(args, 0))))
     });
-    let values = native("values", 1, |_vm, _this, args| {
-        Ok(Value::new_array(own_enumerable_values(&arg(args, 0))))
+    let values = native("values", 1, |vm, _this, args| {
+        Ok(vm.alloc_array(own_enumerable_values(arg_ref(args, 0))))
     });
     let entries = native("entries", 1, |vm, _this, args| {
-        let obj = arg(args, 0);
-        let pairs = own_enumerable_entries(vm, &obj);
+        let pairs = own_enumerable_entries(vm, arg_ref(args, 0));
         Ok(vm.alloc_array(pairs))
     });
     let assign = native("assign", 2, |_vm, _this, args| {
@@ -53,6 +57,9 @@ pub(super) fn install_object(vm: &mut Vm) {
         };
         for src in &args[1.min(args.len())..] {
             if let Value::Object(s) = src {
+                if Rc::ptr_eq(t, s) {
+                    continue;
+                }
                 let entries: Vec<(Rc<str>, Value)> = s
                     .borrow()
                     .props
@@ -62,8 +69,9 @@ pub(super) fn install_object(vm: &mut Vm) {
                         PropSlot::Accessor { .. } => None,
                     })
                     .collect();
+                let mut tb = t.borrow_mut();
                 for (k, v) in entries {
-                    t.borrow_mut().props.set_value(k, v);
+                    tb.props.set_value(k, v);
                 }
             }
         }
@@ -134,7 +142,7 @@ pub(super) fn install_math(vm: &mut Vm) {
     macro_rules! unary {
         ($name:literal, $f:expr) => {
             native($name, 1, |_vm, _this, args| {
-                Ok(Value::Number($f(to_number(&arg(args, 0)))))
+                Ok(Value::Number($f(to_number(arg_ref(args, 0)))))
             })
         };
     }
@@ -170,7 +178,7 @@ pub(super) fn install_math(vm: &mut Vm) {
     });
     let pow = native("pow", 2, |_vm, _this, args| {
         Ok(Value::Number(
-            to_number(&arg(args, 0)).powf(to_number(&arg(args, 1))),
+            to_number(arg_ref(args, 0)).powf(to_number(arg_ref(args, 1))),
         ))
     });
     let random = native("random", 0, |_vm, _this, _args| Ok(Value::Number(0.0)));
@@ -196,11 +204,11 @@ pub(super) fn install_math(vm: &mut Vm) {
 
 pub(super) fn install_number(vm: &mut Vm) {
     let number = native("Number", 1, |_vm, _this, args| {
-        Ok(Value::Number(to_number(&arg(args, 0))))
+        Ok(Value::Number(to_number(arg_ref(args, 0))))
     });
     let is_finite = native("isFinite", 1, |_vm, _this, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Number(n) if n.is_finite()),
+            matches!(arg_ref(args, 0), Value::Number(n) if n.is_finite()),
         ))
     });
     if let Value::Object(o) = &number {
@@ -225,10 +233,10 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
     vm.register_native(
         "parseInt",
         2,
-        Rc::new(|vm, _this, args| {
-            let s = vm.to_display_string(&arg(args, 0));
-            let radix = match arg(args, 1) {
-                Value::Number(n) if n as u32 != 0 => n as u32,
+        Rc::new(|_vm, _this, args| {
+            let s = value_as_cow_str(arg_ref(args, 0));
+            let radix = match arg_ref(args, 1) {
+                Value::Number(n) if *n as u32 != 0 => *n as u32,
                 _ => 10,
             };
             let t = s.trim();
@@ -246,7 +254,11 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
             } else {
                 t
             };
-            let end = t.chars().take_while(|c| c.is_digit(radix)).count();
+            let end = t
+                .char_indices()
+                .take_while(|(_, c)| c.is_digit(radix))
+                .last()
+                .map_or(0, |(i, c)| i + c.len_utf8());
             if end == 0 {
                 return Ok(Value::Number(f64::NAN));
             }
@@ -257,59 +269,59 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
     vm.register_native(
         "parseFloat",
         1,
-        Rc::new(|vm, _this, args| {
-            let s = vm.to_display_string(&arg(args, 0));
+        Rc::new(|_vm, _this, args| {
+            let s = value_as_cow_str(arg_ref(args, 0));
             let t = s.trim();
+            let bytes = t.as_bytes();
             let mut end = 0usize;
-            let bytes: Vec<char> = t.chars().collect();
-            if end < bytes.len() && (bytes[end] == '-' || bytes[end] == '+') {
+            if matches!(bytes.first(), Some(b'-' | b'+')) {
                 end += 1;
             }
             let mut seen_dot = false;
             let mut seen_digit = false;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_digit() || (!seen_dot && bytes[end] == '.'))
-            {
-                if bytes[end] == '.' {
-                    seen_dot = true;
-                } else {
+            while let Some(&b) = bytes.get(end) {
+                if b.is_ascii_digit() {
                     seen_digit = true;
+                    end += 1;
+                } else if !seen_dot && b == b'.' {
+                    seen_dot = true;
+                    end += 1;
+                } else {
+                    break;
                 }
-                end += 1;
             }
             if !seen_digit {
                 return Ok(Value::Number(f64::NAN));
             }
-            let n: String = bytes[..end].iter().collect();
-            Ok(Value::Number(n.parse::<f64>().unwrap_or(f64::NAN)))
+            Ok(Value::Number(t[..end].parse::<f64>().unwrap_or(f64::NAN)))
         }),
     );
     vm.register_native(
         "String",
         1,
-        Rc::new(|vm, _this, args| Ok(Value::str(vm.to_display_string(&arg(args, 0))))),
+        Rc::new(|vm, _this, args| Ok(Value::str(vm.to_display_string(arg_ref(args, 0))))),
     );
     vm.register_native(
         "Boolean",
         1,
-        Rc::new(|_vm, _this, args| Ok(Value::Bool(arg(args, 0).to_bool()))),
+        Rc::new(|_vm, _this, args| Ok(Value::Bool(arg_ref(args, 0).to_bool()))),
     );
     vm.register_native(
         "isNaN",
         1,
-        Rc::new(|_vm, _this, args| Ok(Value::Bool(to_number(&arg(args, 0)).is_nan()))),
+        Rc::new(|_vm, _this, args| Ok(Value::Bool(to_number(arg_ref(args, 0)).is_nan()))),
     );
-    let array_global = native("Array", 0, |_vm, _this, args| {
+    let array_global = native("Array", 0, |vm, _this, args| {
         if args.len() == 1 {
             if let Value::Number(n) = args[0] {
-                return Ok(Value::new_array(vec![Value::Undefined; n as usize]));
+                return Ok(vm.alloc_array(vec![Value::Undefined; n as usize]));
             }
         }
-        Ok(Value::new_array(args.to_vec()))
+        Ok(vm.alloc_array(args.to_vec()))
     });
     let array_is_array = native("isArray", 1, |_vm, _this, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Object(o) if matches!(o.borrow().kind, ObjKind::Array(_))),
+            matches!(arg_ref(args, 0), Value::Object(o) if matches!(o.borrow().kind, ObjKind::Array(_))),
         ))
     });
     if let Value::Object(o) = &array_global {
@@ -325,11 +337,7 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
         0,
         Rc::new(|vm, _this, args| {
             let mut strs: Vec<String> = args.iter().map(|v| vm.to_display_string(v)).collect();
-            let body = if strs.is_empty() {
-                String::new()
-            } else {
-                strs.pop().unwrap()
-            };
+            let body = strs.pop().unwrap_or_default();
             match crate::compiler::compile_dynamic_function(&strs, &body) {
                 Ok(chunk) => {
                     let fo = Rc::new(FunctionObj {
@@ -339,9 +347,7 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
                         is_arrow: false,
                         is_async: false,
                     });
-                    Ok(Value::Object(Rc::new(RefCell::new(ObjData::new(
-                        ObjKind::Function(fo),
-                    )))))
+                    Ok(vm.alloc_obj(ObjData::new(ObjKind::Function(fo))))
                 }
                 Err(e) => Err(vm.make_error("SyntaxError", e.to_string())),
             }
@@ -357,7 +363,6 @@ pub(super) fn install_errors(vm: &mut Vm) {
         "SyntaxError",
         "ReferenceError",
     ] {
-        let nm = name.to_string();
         vm.register_native(
             name,
             1,
@@ -367,7 +372,7 @@ pub(super) fn install_errors(vm: &mut Vm) {
                 } else {
                     vm.to_display_string(&args[0])
                 };
-                Ok(vm.make_error(&nm, msg))
+                Ok(vm.make_error(name, msg))
             }),
         );
     }
@@ -413,7 +418,7 @@ pub(super) fn install_date(vm: &mut Vm) {
         Rc::new(move |vm, _this, args| {
             let t = if let Some(Value::Number(n)) = args.first() {
                 *n
-            } else if let Some(now) = vm.now_fn.clone() {
+            } else if let Some(now) = &vm.now_fn {
                 now()
             } else {
                 0.0
@@ -424,7 +429,7 @@ pub(super) fn install_date(vm: &mut Vm) {
                 proto: Some(proto_for_ctor.clone()),
             };
             inst.props.set_value(Rc::from("%time"), Value::Number(t));
-            Ok(Value::Object(Rc::new(RefCell::new(inst))))
+            Ok(vm.alloc_obj(inst))
         }),
     );
 }

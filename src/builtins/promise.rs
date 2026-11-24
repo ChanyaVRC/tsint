@@ -1,9 +1,9 @@
 //! Promise コンストラクタ・静的メソッドおよび `Promise.prototype` メソッド（T3）。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use super::{arg, native};
+use super::{arg, arg_ref, native};
 use crate::value::*;
 use crate::vm::{is_callable, Vm};
 
@@ -35,7 +35,7 @@ pub(super) fn install_promise(vm: &mut Vm) {
         Ok(v)
     });
     let race = native("race", 1, |vm, _this, args| {
-        let items = vm.materialize_iter_array(&arg(args, 0))?;
+        let items = vm.materialize_iter_array(arg_ref(args, 0))?;
         let (result_val, result_obj) = vm.new_pending_promise();
         let (_, dummy) = vm.new_pending_promise();
         for item in items {
@@ -54,35 +54,40 @@ pub(super) fn install_promise(vm: &mut Vm) {
         Ok(result_val)
     });
     let all = native("all", 1, |vm, _this, args| {
-        let items = vm.materialize_iter_array(&arg(args, 0))?;
+        let items = vm.materialize_iter_array(arg_ref(args, 0))?;
         let (result_val, result_obj) = vm.new_pending_promise();
         if items.is_empty() {
-            vm.resolve_promise(result_obj, Value::new_array(Vec::new()));
+            let empty = vm.alloc_array(Vec::new());
+            vm.resolve_promise(result_obj, empty);
             return Ok(result_val);
         }
         let total = items.len();
         let results: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(vec![Value::Undefined; total]));
-        let remaining: Rc<RefCell<usize>> = Rc::new(RefCell::new(total));
+        let remaining = Rc::new(Cell::new(total));
         let (_, dummy) = vm.new_pending_promise();
         for (i, item) in items.into_iter().enumerate() {
             let p = vm.coerce_to_promise(item);
             let results_c = results.clone();
             let remaining_c = remaining.clone();
-            let result_obj_c = result_obj.clone();
-            let on_fulfilled = native("", 1, move |vm, _this, args| {
-                results_c.borrow_mut()[i] = arg(args, 0);
-                *remaining_c.borrow_mut() -= 1;
-                if *remaining_c.borrow() == 0 {
-                    let arr = Value::new_array(results_c.borrow().clone());
-                    vm.resolve_promise(result_obj_c.clone(), arr);
-                }
-                Ok(Value::Undefined)
-            });
-            let result_obj_r = result_obj.clone();
-            let on_rejected = native("", 1, move |vm, _this, args| {
-                vm.settle_promise(result_obj_r.clone(), Err(arg(args, 0)));
-                Ok(Value::Undefined)
-            });
+            let result_weak = Rc::downgrade(&result_obj);
+            let on_fulfilled = vm.alloc_native_with_captures(
+                "",
+                1,
+                vec![result_obj.clone()],
+                Rc::new(move |vm, _this, args| {
+                    results_c.borrow_mut()[i] = arg(args, 0);
+                    let rem = remaining_c.get().saturating_sub(1);
+                    remaining_c.set(rem);
+                    if rem == 0 {
+                        if let Some(target) = result_weak.upgrade() {
+                            let arr = vm.alloc_array(std::mem::take(&mut *results_c.borrow_mut()));
+                            vm.resolve_promise(target, arr);
+                        }
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            let on_rejected = settle_forward_fn(vm, result_obj.clone(), true);
             vm.add_promise_reaction(
                 &p,
                 PromiseReaction::Then {

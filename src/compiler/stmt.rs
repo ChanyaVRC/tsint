@@ -49,7 +49,7 @@ impl Compiler {
             StmtKind::VarDecl { decls, .. } => {
                 for d in decls {
                     for name in pattern_names(&d.name) {
-                        self.declare_local(&name);
+                        self.declare_local(name);
                     }
                 }
             }
@@ -240,7 +240,7 @@ impl Compiler {
                 ForInit::VarDecl(kind, decls) => {
                     for d in decls {
                         for name in pattern_names(&d.name) {
-                            let slot = self.declare_local(&name);
+                            let slot = self.declare_local(name);
                             if *kind != ast::VarKind::Var {
                                 per_iter_slots.push(slot);
                             }
@@ -336,7 +336,7 @@ impl Compiler {
             ForInit::VarDecl(_, decls) => {
                 let pat = &decls[0].name;
                 for name in pattern_names(pat) {
-                    self.declare_local(&name);
+                    self.declare_local(name);
                 }
                 self.compile_bind_pattern(pat, line)?;
             }
@@ -420,18 +420,16 @@ impl Compiler {
     fn compile_switch(&mut self, disc: &Expr, cases: &[SwitchCase], line: u32) -> CResult<()> {
         self.compile_expr(disc)?;
         let saved_len = self.cur().locals.len();
-        let mut all_stmts: Vec<&Stmt> = Vec::new();
         for c in cases {
             for s in &c.body {
-                all_stmts.push(s);
+                self.hoist_stmt_names(s)?;
             }
         }
-        for s in &all_stmts {
-            self.hoist_stmt_names(s)?;
-        }
-        for s in &all_stmts {
-            if let StmtKind::FunctionDecl(f) = &s.kind {
-                self.compile_function_decl_value(f, s.span.start.line)?;
+        for c in cases {
+            for s in &c.body {
+                if let StmtKind::FunctionDecl(f) = &s.kind {
+                    self.compile_function_decl_value(f, s.span.start.line)?;
+                }
             }
         }
 
@@ -623,7 +621,7 @@ impl Compiler {
             let saved_len = self.cur().locals.len();
             if let Some(pat) = &h.param {
                 for name in pattern_names(pat) {
-                    self.declare_local(&name);
+                    self.declare_local(name);
                 }
                 self.compile_bind_pattern(pat, line)?;
             } else {

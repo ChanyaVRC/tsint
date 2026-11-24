@@ -176,11 +176,11 @@ pub(super) fn call_array_method(
             let items = array_values(&this);
             let cb = arg(args, 0);
             let mut out = Vec::with_capacity(items.len());
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 out.push(vm.call_value(
                     cb.clone(),
                     Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
+                    &[it, Value::Number(i as f64), this.clone()],
                 )?);
             }
             Ok(vm.alloc_array(out))
@@ -189,14 +189,14 @@ pub(super) fn call_array_method(
             let items = array_values(&this);
             let cb = arg(args, 0);
             let mut out = Vec::new();
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 let keep = vm.call_value(
                     cb.clone(),
                     Value::Undefined,
                     &[it.clone(), Value::Number(i as f64), this.clone()],
                 )?;
                 if keep.to_bool() {
-                    out.push(it.clone());
+                    out.push(it);
                 }
             }
             Ok(vm.alloc_array(out))
@@ -204,11 +204,11 @@ pub(super) fn call_array_method(
         "forEach" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 vm.call_value(
                     cb.clone(),
                     Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
+                    &[it, Value::Number(i as f64), this.clone()],
                 )?;
             }
             Ok(Value::Undefined)
@@ -216,14 +216,14 @@ pub(super) fn call_array_method(
         "find" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 let hit = vm.call_value(
                     cb.clone(),
                     Value::Undefined,
                     &[it.clone(), Value::Number(i as f64), this.clone()],
                 )?;
                 if hit.to_bool() {
-                    return Ok(it.clone());
+                    return Ok(it);
                 }
             }
             Ok(Value::Undefined)
@@ -232,11 +232,11 @@ pub(super) fn call_array_method(
             let items = array_values(&this);
             let cb = arg(args, 0);
             let mut out = Vec::new();
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 let r = vm.call_value(
                     cb.clone(),
                     Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
+                    &[it, Value::Number(i as f64), this.clone()],
                 )?;
                 if let Value::Object(o) = &r {
                     if let ObjKind::Array(sub) = &o.borrow().kind {
@@ -251,11 +251,11 @@ pub(super) fn call_array_method(
         "some" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 let hit = vm.call_value(
                     cb.clone(),
                     Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
+                    &[it, Value::Number(i as f64), this.clone()],
                 )?;
                 if hit.to_bool() {
                     return Ok(Value::Bool(true));
@@ -266,11 +266,11 @@ pub(super) fn call_array_method(
         "every" => (|| {
             let items = array_values(&this);
             let cb = arg(args, 0);
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in items.into_iter().enumerate() {
                 let hit = vm.call_value(
                     cb.clone(),
                     Value::Undefined,
-                    &[it.clone(), Value::Number(i as f64), this.clone()],
+                    &[it, Value::Number(i as f64), this.clone()],
                 )?;
                 if !hit.to_bool() {
                     return Ok(Value::Bool(false));

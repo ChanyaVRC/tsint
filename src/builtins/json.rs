@@ -212,7 +212,9 @@ impl<'a> JsonParser<'a> {
             if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
                 self.pos += 1;
             } else if b >= 0x80 {
-                let ch = self.src[self.pos..].chars().next().unwrap();
+                let Some(ch) = self.src[self.pos..].chars().next() else {
+                    break;
+                };
                 if ch.is_whitespace() {
                     self.pos += ch.len_utf8();
                 } else {
