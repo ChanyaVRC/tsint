@@ -314,8 +314,8 @@ impl Parser {
                 ));
             }
         }
-        if let Some(word) = self.ident_name() {
-            let op = match word.as_str() {
+        if let Some(word) = self.cur_ident() {
+            let op = match word {
                 "typeof" => Some(UnaryOp::Typeof),
                 "void" => Some(UnaryOp::Void),
                 "delete" => Some(UnaryOp::Delete),
@@ -591,16 +591,19 @@ impl Parser {
 
     fn parse_primary(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
-        match self.cur().kind.clone() {
+        match &self.cur().kind {
             TokenKind::Number(n) => {
+                let n = *n;
                 self.bump();
                 Ok(self.mk_expr(start, ExprKind::NumberLit(n)))
             }
             TokenKind::Str(s) => {
+                let s = s.clone();
                 self.bump();
                 Ok(self.mk_expr(start, ExprKind::StringLit(s)))
             }
             TokenKind::NoSubTemplate(s) => {
+                let s = s.clone();
                 self.bump();
                 Ok(self.mk_expr(
                     start,
@@ -611,20 +614,20 @@ impl Parser {
                 ))
             }
             TokenKind::TemplateHead(s) => {
+                let mut quasis = vec![s.clone()];
                 self.bump();
-                let mut quasis = vec![s];
                 let mut exprs = Vec::new();
                 loop {
                     let e = self.parse_expr()?;
                     exprs.push(e);
-                    match self.cur().kind.clone() {
+                    match &self.cur().kind {
                         TokenKind::TemplateMiddle(s2) => {
+                            quasis.push(s2.clone());
                             self.bump();
-                            quasis.push(s2);
                         }
                         TokenKind::TemplateTail(s2) => {
+                            quasis.push(s2.clone());
                             self.bump();
-                            quasis.push(s2);
                             break;
                         }
                         _ => return Err(self.err("テンプレートリテラルが不正です")),
@@ -633,6 +636,8 @@ impl Parser {
                 Ok(self.mk_expr(start, ExprKind::TemplateLit { quasis, exprs }))
             }
             TokenKind::Regex { pattern, flags } => {
+                let pattern = pattern.clone();
+                let flags = flags.clone();
                 self.bump();
                 Ok(self.mk_expr(start, ExprKind::RegexLit { pattern, flags }))
             }
@@ -644,14 +649,18 @@ impl Parser {
             }
             TokenKind::Punct(Punct::LBracket) => self.parse_array_lit(),
             TokenKind::Punct(Punct::LBrace) => self.parse_object_lit(),
-            TokenKind::Ident(name) => self.parse_ident_primary(name),
-            other => Err(self.err(format!("式が必要ですが {other:?} が見つかりました"))),
+            TokenKind::Ident(_) => self.parse_ident_primary(),
+            other => {
+                let msg = format!("式が必要ですが {other:?} が見つかりました");
+                Err(self.err(msg))
+            }
         }
     }
 
-    fn parse_ident_primary(&mut self, name: String) -> PResult<Expr> {
+    fn parse_ident_primary(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
-        match name.as_str() {
+        let word = self.cur_ident().unwrap();
+        match word {
             "function" => {
                 self.bump();
                 self.parse_function_expr(false)
@@ -687,6 +696,7 @@ impl Parser {
                 Ok(self.mk_expr(start, ExprKind::UndefinedLit))
             }
             _ => {
+                let name = word.to_owned();
                 self.bump();
                 Ok(self.mk_expr(start, ExprKind::Ident(name)))
             }
@@ -821,39 +831,53 @@ impl Parser {
 
     /// アロー関数を投機的に解析する。マッチしなければ None を返し位置を戻す。
     pub(super) fn try_parse_arrow(&mut self) -> PResult<Option<Expr>> {
+        // 大半の式は `(` / `async` / `ident =>` ではないため最速で弾く。
+        let quick_possible = match &self.cur().kind {
+            TokenKind::Punct(Punct::LParen) => true,
+            TokenKind::Ident(s) => s == "async" || self.peek_is_punct(1, Punct::Arrow),
+            _ => false,
+        };
+        if !quick_possible {
+            return Ok(None);
+        }
         let mark = self.save();
         let start = self.cur_span();
         let mut is_async = false;
-        let async_arrow_head = self.peek_is_punct(1, Punct::LParen)
-            || (matches!(self.peek_kind(1), TokenKind::Ident(_))
-                && self.peek_is_punct(2, Punct::Arrow));
-        if self.is_word("async") && !self.peek_kind_newline(1) && async_arrow_head {
-            self.bump();
-            is_async = true;
+        if self.is_word("async") && !self.peek_kind_newline(1) {
+            let async_arrow_head = self.peek_is_punct(1, Punct::LParen)
+                || (matches!(self.peek_kind(1), TokenKind::Ident(_))
+                    && self.peek_is_punct(2, Punct::Arrow));
+            if async_arrow_head {
+                self.bump();
+                is_async = true;
+            }
         }
 
         // 裸パラメータ 1 個: x => ...
-        if let TokenKind::Ident(name) = self.cur().kind.clone() {
-            if !is_keyword_like(&name) && self.peek_is_punct(1, Punct::Arrow) {
-                self.bump();
-                self.bump(); // =>
-                let param = Param {
-                    pattern: Pattern::Ident(name),
-                    default: None,
-                    rest: false,
-                };
-                let (body, expr_body) = self.parse_arrow_body()?;
-                let func = Function {
-                    id: self.fresh_id(),
-                    span: Span::new(start.start, self.prev_end()),
-                    name: None,
-                    params: vec![param],
-                    body,
-                    expr_body,
-                    is_async,
-                    is_arrow: true,
-                };
-                return Ok(Some(self.mk_expr(start, ExprKind::Arrow(Box::new(func)))));
+        if self.peek_is_punct(1, Punct::Arrow) {
+            if let Some(word) = self.cur_ident() {
+                if !is_keyword_like(word) {
+                    let name = word.to_owned();
+                    self.bump();
+                    self.bump(); // =>
+                    let param = Param {
+                        pattern: Pattern::Ident(name),
+                        default: None,
+                        rest: false,
+                    };
+                    let (body, expr_body) = self.parse_arrow_body()?;
+                    let func = Function {
+                        id: self.fresh_id(),
+                        span: Span::new(start.start, self.prev_end()),
+                        name: None,
+                        params: vec![param],
+                        body,
+                        expr_body,
+                        is_async,
+                        is_arrow: true,
+                    };
+                    return Ok(Some(self.mk_expr(start, ExprKind::Arrow(Box::new(func)))));
+                }
             }
         }
 

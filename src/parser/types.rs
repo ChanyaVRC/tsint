@@ -120,7 +120,7 @@ impl Parser {
                         // ドット区切りの修飾名 (`api.Page` など)。
                         while self.is_punct(Punct::Dot) {
                             self.bump();
-                            if self.ident_name().is_some() {
+                            if self.cur_ident().is_some() {
                                 self.bump();
                             } else {
                                 break;
@@ -198,7 +198,11 @@ impl Parser {
             }
             // 稀な `const T` 修飾子。
             self.eat_word("const");
-            self.parse_binding_ident()?;
+            if self.cur_ident().is_some() {
+                self.bump();
+            } else {
+                return Err(self.err("識別子を期待しました"));
+            }
             if self.is_word("extends") {
                 self.bump();
                 self.skip_type()?;

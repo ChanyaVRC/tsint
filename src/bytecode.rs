@@ -17,6 +17,7 @@
 //!   「例外時に例外テーブルを引いて catch へジャンプする」以外の
 //!   特別な制御構造を持たずに済む。
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::value::Value;
@@ -25,6 +26,9 @@ pub type ConstIdx = u32;
 pub type LocalIdx = u16;
 pub type UpvalueIdx = u16;
 pub type JumpAddr = u32;
+
+/// 未学習インラインキャッシュスロットのセンチネル値。
+pub(crate) const IC_UNSET: u16 = u16::MAX;
 
 #[derive(Debug, Clone, Copy)]
 pub enum OpCode {
@@ -36,6 +40,8 @@ pub enum OpCode {
 
     // --- 定数・リテラル ---
     LoadConst(ConstIdx),
+    /// 定数表を引かずに即値整数を `Value::Number` として push する高速命令。
+    LoadSmallInt(i32),
     LoadUndefined,
     LoadNull,
     LoadTrue,
@@ -48,6 +54,10 @@ pub enum OpCode {
     SetLocal(LocalIdx),
     /// 宣言（let/const/var/パラメータ/分割代入の束縛）用。pop して書き込み、push し直さない。
     BindLocal(LocalIdx),
+    /// 文レベルの `i++` / `++i`（結果値不要）用インプレース +1 命令。
+    IncLocal(LocalIdx),
+    /// 文レベルの `i--` / `--i`（結果値不要）用インプレース -1 命令。
+    DecLocal(LocalIdx),
     /// `for (let i ...)` の per-iteration 束縛用: このスロットの現在値を
     /// コピーした「新しいセル」に差し替える（既存のセルを指すクロージャは
     /// 古い値を保持したまま、以後の書き込みからは切り離される）。
@@ -118,6 +128,8 @@ pub enum OpCode {
     TypeOfGlobal(ConstIdx),
     /// ToString（テンプレートリテラルの連結に使用）。
     ToStringOp,
+    /// スタック上位 N 個の値を単一バッファへ文字列連結して 1 個の `Value::Str` を push。
+    ConcatStrings(u16),
     /// void 演算子（オペランドを評価して捨て undefined を push）は
     /// コンパイラ側で Pop+LoadUndefined に展開するため専用命令は無い。
     // --- 論理短絡（値を保持したままジャンプ or pop して継続） ---
@@ -132,6 +144,13 @@ pub enum OpCode {
     Jump(JumpAddr),
     JumpIfFalse(JumpAddr),
     JumpIfTrue(JumpAddr),
+    /// 比較 + 条件ジャンプの融合命令（`Value::Bool` の push/pop を省く）。
+    LtJumpIfFalse(JumpAddr),
+    LtEqJumpIfFalse(JumpAddr),
+    GtJumpIfFalse(JumpAddr),
+    GtEqJumpIfFalse(JumpAddr),
+    StrictEqJumpIfFalse(JumpAddr),
+    StrictNotEqJumpIfFalse(JumpAddr),
     Return,
     /// 例外送出。スタック最上位を投げる（finally からの再送出も
     /// `GetLocal`(保持しておいた例外値) + `Throw` として表現され、
@@ -143,6 +162,10 @@ pub enum OpCode {
     MakeClosure(ConstIdx),
     /// `stack: [callee(this の下), callee, arg0..argN-1] -> [result]`
     Call(u16),
+    /// 直接メソッド呼び出し（`obj.method(arg0..argN-1)` の高速パス）。
+    /// 引数: `(定数表メソッド名インデックス, 引数個数)`。
+    /// `stack: [obj, arg0..argN-1] -> [result]`
+    CallMethod(u16, u16),
     /// 引数を単一の配列値（スプレッド展開込み）として渡す呼び出し。
     /// `stack: [this, callee, argsArray] -> [result]`
     CallSpread,
@@ -297,6 +320,16 @@ pub struct Chunk {
     /// 深さだけに頼らず判定するためのマーカー。async 関数呼び出しも
     /// 専用のフレーム列を新規に持つため、深さだけでは区別できない）。
     pub is_module: bool,
+    /// `captured_locals` に 1 つでも `true` が含まれるか（フレーム初期化の高速パス判定用）。
+    pub(crate) has_captured_locals: bool,
+    /// フレーム生成時に直接 `locals` へ束縛できる先頭の単純識別子パラメータ個数。
+    /// `is_arrow == false` の関数はスロット `1..1+simple_param_count`、
+    /// `is_arrow == true` の関数はスロット `0..simple_param_count` に直接配置される。
+    pub(crate) simple_param_count: u16,
+    /// `GetArg`/`GetRestArgs` のために `Frame::raw_args` を埋める必要があるか。
+    pub(crate) needs_raw_args: bool,
+    /// 命令アドレス `ip` ごとのインラインキャッシュ（`PropMap` スロットヒント。`u16::MAX` は未学習）。
+    pub(crate) ic_slots: Vec<Cell<u16>>,
 }
 
 impl Chunk {
@@ -311,12 +344,48 @@ impl Chunk {
             captured_locals: Vec::new(),
             exports: Vec::new(),
             is_module: false,
+            has_captured_locals: false,
+            simple_param_count: 0,
+            needs_raw_args: false,
+            ic_slots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn finalize(&mut self) {
+        self.has_captured_locals = self.captured_locals.iter().any(|&c| c);
+        let has_ic_ops = self.code.iter().any(|op| {
+            matches!(
+                op,
+                OpCode::GetProp(_) | OpCode::SetProp(_) | OpCode::CallMethod(_, _)
+            )
+        });
+        if has_ic_ops {
+            self.ic_slots = vec![Cell::new(IC_UNSET); self.code.len()];
+        }
+    }
+
+    #[inline]
+    pub(crate) fn ic_hint(&self, ip: usize) -> usize {
+        self.ic_slots
+            .get(ip)
+            .map_or(IC_UNSET as usize, |c| c.get() as usize)
+    }
+
+    #[inline]
+    pub(crate) fn set_ic_hint(&self, ip: usize, idx: usize) {
+        if idx < IC_UNSET as usize {
+            if let Some(slot) = self.ic_slots.get(ip) {
+                if slot.get() as usize != idx {
+                    slot.set(idx as u16);
+                }
+            }
         }
     }
 }
 
 /// 定数表からの読み出しヘルパー。
 impl Chunk {
+    #[inline]
     pub fn const_str(&self, idx: ConstIdx) -> Rc<str> {
         match &self.consts[idx as usize] {
             Const::Str(s) => s.clone(),
@@ -324,6 +393,15 @@ impl Chunk {
         }
     }
 
+    #[inline]
+    pub(crate) fn const_str_ref(&self, idx: ConstIdx) -> &Rc<str> {
+        match &self.consts[idx as usize] {
+            Const::Str(s) => s,
+            _ => panic!("定数 {idx} は文字列ではありません"),
+        }
+    }
+
+    #[inline]
     pub fn const_value(&self, idx: ConstIdx) -> Value {
         match &self.consts[idx as usize] {
             Const::Number(n) => Value::Number(*n),

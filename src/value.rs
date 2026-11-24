@@ -13,11 +13,11 @@
 //!   観測されることはない。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::bytecode::Chunk;
+use crate::hash::FastHashMap;
 
 /// ネイティブ関数。`this` と引数を受け取り、戻り値または例外(throw)値を返す。
 pub type NativeFn = Rc<dyn Fn(&mut crate::vm::Vm, Value, &[Value]) -> Result<Value, Value>>;
@@ -146,7 +146,7 @@ pub struct PropMap {
     // Keep `PropMap` compact (1 pointer width when `None`) for small objects below
     // `PROP_MAP_LINEAR_THRESHOLD`, which make up the vast majority of JS objects.
     #[allow(clippy::box_collection)]
-    index: Option<Box<HashMap<Rc<str>, usize>>>,
+    index: Option<Box<FastHashMap<Rc<str>, usize>>>,
 }
 
 impl PropMap {
@@ -154,6 +154,7 @@ impl PropMap {
         Self::default()
     }
 
+    #[inline]
     fn find_index(&self, key: &str) -> Option<usize> {
         if let Some(ref idx_map) = self.index {
             idx_map.get(key).copied()
@@ -164,8 +165,58 @@ impl PropMap {
         }
     }
 
+    #[inline]
+    pub(crate) fn find_index_rc(&self, key: &Rc<str>) -> Option<usize> {
+        if let Some(ref idx_map) = self.index {
+            idx_map.get(&**key).copied()
+        } else {
+            let key_str: &str = key;
+            self.entries
+                .iter()
+                .position(|e| matches!(e, Some((k, _)) if Rc::ptr_eq(k, key) || &**k == key_str))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_with_hint(&self, key: &Rc<str>, hint: usize) -> Option<(usize, &PropSlot)> {
+        if let Some(Some((k, slot))) = self.entries.get(hint) {
+            if Rc::ptr_eq(k, key) || **k == **key {
+                return Some((hint, slot));
+            }
+        }
+        let idx = self.find_index_rc(key)?;
+        self.entries[idx].as_ref().map(|(_, v)| (idx, v))
+    }
+
+    #[inline]
+    pub(crate) fn get_mut_with_hint(
+        &mut self,
+        key: &Rc<str>,
+        hint: usize,
+    ) -> Option<(usize, &mut PropSlot)> {
+        if let Some(Some((k, _))) = self.entries.get(hint) {
+            if Rc::ptr_eq(k, key) || **k == **key {
+                return self.entries[hint].as_mut().map(|(_, v)| (hint, v));
+            }
+        }
+        let idx = self.find_index_rc(key)?;
+        self.entries[idx].as_mut().map(|(_, v)| (idx, v))
+    }
+
+    #[inline]
+    pub(crate) fn set_value_returning_idx(&mut self, key: Rc<str>, value: Value) -> usize {
+        if let Some(idx) = self.find_index_rc(&key) {
+            if let Some((_, slot)) = &mut self.entries[idx] {
+                *slot = PropSlot::Value(value);
+            }
+            idx
+        } else {
+            self.push_new(key, PropSlot::Value(value))
+        }
+    }
+
     fn build_index(&mut self) {
-        let mut map = HashMap::with_capacity(self.live_len * 2);
+        let mut map = FastHashMap::with_capacity_and_hasher(self.live_len * 2, Default::default());
         for (i, entry) in self.entries.iter().enumerate() {
             if let Some((k, _)) = entry {
                 map.insert(k.clone(), i);
@@ -174,7 +225,7 @@ impl PropMap {
         self.index = Some(Box::new(map));
     }
 
-    fn push_new(&mut self, key: Rc<str>, slot: PropSlot) {
+    fn push_new(&mut self, key: Rc<str>, slot: PropSlot) -> usize {
         let new_idx = self.entries.len();
         if let Some(ref mut idx_map) = self.index {
             idx_map.insert(key.clone(), new_idx);
@@ -187,6 +238,7 @@ impl PropMap {
                 self.build_index();
             }
         }
+        new_idx
     }
 
     fn maybe_compact(&mut self) {
@@ -214,49 +266,58 @@ impl PropMap {
         }
     }
 
+    #[inline]
     pub fn get(&self, key: &str) -> Option<&PropSlot> {
         let idx = self.find_index(key)?;
         self.entries[idx].as_ref().map(|(_, v)| v)
     }
 
+    #[inline]
     pub fn get_mut(&mut self, key: &str) -> Option<&mut PropSlot> {
         let idx = self.find_index(key)?;
         self.entries[idx].as_mut().map(|(_, v)| v)
     }
 
+    #[inline]
     pub fn set_value(&mut self, key: Rc<str>, value: Value) {
-        if let Some(slot) = self.get_mut(&key) {
-            *slot = PropSlot::Value(value);
+        if let Some(idx) = self.find_index_rc(&key) {
+            if let Some((_, slot)) = &mut self.entries[idx] {
+                *slot = PropSlot::Value(value);
+            }
         } else {
             self.push_new(key, PropSlot::Value(value));
         }
     }
 
     pub fn set_slot(&mut self, key: Rc<str>, slot: PropSlot) {
-        if let Some(existing) = self.get_mut(&key) {
-            *existing = slot;
+        if let Some(idx) = self.find_index_rc(&key) {
+            if let Some((_, existing)) = &mut self.entries[idx] {
+                *existing = slot;
+            }
         } else {
             self.push_new(key, slot);
         }
     }
 
     pub fn define_accessor(&mut self, key: Rc<str>, is_get: bool, f: Value) {
-        if let Some(slot) = self.get_mut(&key) {
-            match slot {
-                PropSlot::Accessor { get, set } => {
-                    if is_get {
-                        *get = Some(f);
-                    } else {
-                        *set = Some(f);
+        if let Some(idx) = self.find_index_rc(&key) {
+            if let Some((_, slot)) = &mut self.entries[idx] {
+                match slot {
+                    PropSlot::Accessor { get, set } => {
+                        if is_get {
+                            *get = Some(f);
+                        } else {
+                            *set = Some(f);
+                        }
                     }
-                }
-                _ => {
-                    let (get, set) = if is_get {
-                        (Some(f), None)
-                    } else {
-                        (None, Some(f))
-                    };
-                    *slot = PropSlot::Accessor { get, set };
+                    _ => {
+                        let (get, set) = if is_get {
+                            (Some(f), None)
+                        } else {
+                            (None, Some(f))
+                        };
+                        *slot = PropSlot::Accessor { get, set };
+                    }
                 }
             }
             return;
@@ -304,10 +365,12 @@ impl PropMap {
             .filter_map(|e| e.as_ref().map(|(k, v)| (k, v)))
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.live_len
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.live_len == 0
     }
@@ -360,28 +423,214 @@ pub struct FunctionObj {
     pub is_async: bool,
 }
 
-/// Map/Set はコーパスで使う分の操作を素朴な Vec で実装する（挿入順保持）。
+/// `MapData`/`SetData` が線形探索からハッシュ索引へ切り替える要素数の閾値。
+const MAP_LINEAR_THRESHOLD: usize = 16;
+
+/// `same_value_zero` と 100% 同じ等価性を持つ `MapData`/`SetData` 索引キー。
+/// オブジェクトは生ポインタ (`Rc::as_ptr`) のみを保持するため、`Rc::strong_count`
+/// を増やさず循環参照 GC と一切干渉しない（実体の強参照は `entries`/`values` 側が保持）。
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum MapKey {
+    Undefined,
+    Null,
+    Bool(bool),
+    /// `-0.0` は `+0.0` に正規化し、すべての `NaN` は単一のビット表現に正規化する。
+    Number(u64),
+    Str(Rc<str>),
+    Object(usize),
+    Uninit,
+}
+
+impl MapKey {
+    #[inline]
+    fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Undefined => MapKey::Undefined,
+            Value::Null => MapKey::Null,
+            Value::Bool(b) => MapKey::Bool(*b),
+            Value::Number(n) => {
+                let bits = if n.is_nan() {
+                    f64::NAN.to_bits()
+                } else if *n == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    n.to_bits()
+                };
+                MapKey::Number(bits)
+            }
+            Value::Str(s) => MapKey::Str(s.clone()),
+            Value::Object(o) => MapKey::Object(Rc::as_ptr(o) as usize),
+            Value::Uninit => MapKey::Uninit,
+        }
+    }
+}
+
+/// 挿入順を保持する Map ストレージ。要素数が少ない間は線形探索のみで追加確保ゼロ、
+/// 閾値を超えると遅延ハッシュ索引を構築して `find`/`set`/`has` を O(1) 化する。
 #[derive(Default)]
 pub struct MapData {
     pub entries: Vec<(Value, Value)>,
+    #[allow(clippy::box_collection)]
+    index: Option<Box<FastHashMap<MapKey, usize>>>,
 }
 
 impl MapData {
+    #[inline]
     pub fn find(&self, key: &Value) -> Option<usize> {
+        if let Some(ref idx_map) = self.index {
+            if idx_map.len() == self.entries.len() {
+                return idx_map.get(&MapKey::from_value(key)).copied();
+            }
+        }
         self.entries
             .iter()
             .position(|(k, _)| same_value_zero(k, key))
     }
+
+    fn build_index(&mut self) {
+        let mut map =
+            FastHashMap::with_capacity_and_hasher(self.entries.len() * 2, Default::default());
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            map.insert(MapKey::from_value(k), i);
+        }
+        self.index = Some(Box::new(map));
+    }
+
+    pub fn set(&mut self, key: Value, val: Value) {
+        if let Some(ref mut idx_map) = self.index {
+            if idx_map.len() != self.entries.len() {
+                self.build_index();
+            }
+        }
+        if let Some(ref mut idx_map) = self.index {
+            let mk = MapKey::from_value(&key);
+            if let Some(&i) = idx_map.get(&mk) {
+                self.entries[i].1 = val;
+            } else {
+                let idx = self.entries.len();
+                self.entries.push((key, val));
+                idx_map.insert(mk, idx);
+            }
+            return;
+        }
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|(k, _)| same_value_zero(k, &key))
+        {
+            self.entries[i].1 = val;
+        } else {
+            self.entries.push((key, val));
+            if self.entries.len() > MAP_LINEAR_THRESHOLD {
+                self.build_index();
+            }
+        }
+    }
+
+    pub fn delete(&mut self, key: &Value) -> bool {
+        let Some(idx) = self.find(key) else {
+            return false;
+        };
+        self.entries.remove(idx);
+        if self.entries.len() <= MAP_LINEAR_THRESHOLD / 2 {
+            self.index = None;
+        } else if let Some(ref mut idx_map) = self.index {
+            if idx_map.len() == self.entries.len() + 1 {
+                idx_map.remove(&MapKey::from_value(key));
+                for v in idx_map.values_mut() {
+                    if *v > idx {
+                        *v -= 1;
+                    }
+                }
+            } else {
+                self.build_index();
+            }
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.index = None;
+    }
 }
 
+/// 挿入順を保持する Set ストレージ。閾値超過時は遅延ハッシュ索引で O(1) 探索する。
 #[derive(Default)]
 pub struct SetData {
     pub values: Vec<Value>,
+    #[allow(clippy::box_collection)]
+    index: Option<Box<FastHashMap<MapKey, usize>>>,
 }
 
 impl SetData {
+    #[inline]
     pub fn find(&self, v: &Value) -> Option<usize> {
+        if let Some(ref idx_map) = self.index {
+            if idx_map.len() == self.values.len() {
+                return idx_map.get(&MapKey::from_value(v)).copied();
+            }
+        }
         self.values.iter().position(|x| same_value_zero(x, v))
+    }
+
+    fn build_index(&mut self) {
+        let mut map =
+            FastHashMap::with_capacity_and_hasher(self.values.len() * 2, Default::default());
+        for (i, v) in self.values.iter().enumerate() {
+            map.insert(MapKey::from_value(v), i);
+        }
+        self.index = Some(Box::new(map));
+    }
+
+    pub fn add(&mut self, v: Value) {
+        if let Some(ref mut idx_map) = self.index {
+            if idx_map.len() != self.values.len() {
+                self.build_index();
+            }
+        }
+        if let Some(ref mut idx_map) = self.index {
+            let mk = MapKey::from_value(&v);
+            if let std::collections::hash_map::Entry::Vacant(e) = idx_map.entry(mk) {
+                let idx = self.values.len();
+                self.values.push(v);
+                e.insert(idx);
+            }
+            return;
+        }
+        if !self.values.iter().any(|x| same_value_zero(x, &v)) {
+            self.values.push(v);
+            if self.values.len() > MAP_LINEAR_THRESHOLD {
+                self.build_index();
+            }
+        }
+    }
+
+    pub fn delete(&mut self, v: &Value) -> bool {
+        let Some(idx) = self.find(v) else {
+            return false;
+        };
+        self.values.remove(idx);
+        if self.values.len() <= MAP_LINEAR_THRESHOLD / 2 {
+            self.index = None;
+        } else if let Some(ref mut idx_map) = self.index {
+            if idx_map.len() == self.values.len() + 1 {
+                idx_map.remove(&MapKey::from_value(v));
+                for pos in idx_map.values_mut() {
+                    if *pos > idx {
+                        *pos -= 1;
+                    }
+                }
+            } else {
+                self.build_index();
+            }
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.index = None;
     }
 }
 
@@ -717,5 +966,69 @@ mod tests {
             };
             assert_eq!(num_of(m.get(&format!("prop_{i}"))), Some(want));
         }
+    }
+
+    #[test]
+    fn map_and_set_indexed_same_value_zero_and_order() {
+        let mut map = MapData::default();
+        let mut set = SetData::default();
+        let obj1 = Value::new_plain_object();
+        let obj2 = Value::new_plain_object();
+
+        for i in 0..100 {
+            let k = Value::str(format!("k{i}"));
+            map.set(k.clone(), Value::Number(i as f64));
+            set.add(k);
+        }
+        assert!(map.index.is_some());
+        assert!(set.index.is_some());
+
+        // SameValueZero: -0.0 === +0.0, NaN === NaN, object identity
+        map.set(Value::Number(-0.0), Value::Number(1.0));
+        map.set(Value::Number(0.0), Value::Number(2.0));
+        map.set(Value::Number(f64::NAN), Value::Number(42.0));
+        map.set(obj1.clone(), Value::Number(7.0));
+        assert_eq!(
+            map.find(&Value::Number(0.0))
+                .map(|i| match map.entries[i].1 {
+                    Value::Number(n) => n,
+                    _ => -1.0,
+                }),
+            Some(2.0)
+        );
+        assert_eq!(
+            map.find(&Value::Number(f64::NAN))
+                .map(|i| match map.entries[i].1 {
+                    Value::Number(n) => n,
+                    _ => -1.0,
+                }),
+            Some(42.0)
+        );
+        assert!(map.find(&obj1).is_some());
+        assert!(map.find(&obj2).is_none());
+
+        // Delete & re-insert moves to end
+        assert!(map.delete(&Value::str("k10")));
+        assert!(!map.delete(&Value::str("k10")));
+        assert!(map.find(&Value::str("k10")).is_none());
+        map.set(Value::str("k10"), Value::Number(999.0));
+        assert_eq!(map.find(&Value::str("k10")), Some(map.entries.len() - 1));
+
+        // Set SameValueZero & delete
+        set.add(Value::Number(-0.0));
+        set.add(Value::Number(0.0));
+        set.add(Value::Number(f64::NAN));
+        set.add(Value::Number(f64::NAN));
+        assert!(set.find(&Value::Number(0.0)).is_some());
+        assert!(set.find(&Value::Number(f64::NAN)).is_some());
+        let len_before = set.values.len();
+        assert!(set.delete(&Value::str("k5")));
+        assert_eq!(set.values.len(), len_before - 1);
+        assert!(set.find(&Value::str("k5")).is_none());
+
+        map.clear();
+        set.clear();
+        assert!(map.entries.is_empty() && map.index.is_none());
+        assert!(set.values.is_empty() && set.index.is_none());
     }
 }

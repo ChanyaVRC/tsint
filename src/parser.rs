@@ -64,30 +64,35 @@ impl Parser {
 
     // ---------- トークン操作 ----------
 
+    #[inline]
     fn cur(&self) -> &Token {
         &self.tokens[self.pos.min(self.tokens.len() - 1)]
     }
 
+    #[inline]
     fn cur_span(&self) -> Span {
         self.cur().span
     }
 
+    #[inline]
     fn is_eof(&self) -> bool {
         matches!(self.cur().kind, TokenKind::Eof)
     }
 
-    fn bump(&mut self) -> Token {
-        let t = self.tokens[self.pos.min(self.tokens.len() - 1)].clone();
+    /// 現在トークンを 1 つ進める（トークンのクローンを一切行わない）。
+    #[inline]
+    fn bump(&mut self) {
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
         }
-        t
     }
 
+    #[inline]
     fn save(&self) -> usize {
         self.pos
     }
 
+    #[inline]
     fn restore(&mut self, mark: usize) {
         self.pos = mark;
     }
@@ -99,19 +104,23 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn peek_kind(&self, offset: usize) -> &TokenKind {
         let idx = (self.pos + offset).min(self.tokens.len() - 1);
         &self.tokens[idx].kind
     }
 
+    #[inline]
     fn peek_is_punct(&self, offset: usize, p: Punct) -> bool {
         matches!(self.peek_kind(offset), TokenKind::Punct(q) if *q == p)
     }
 
+    #[inline]
     fn is_punct(&self, p: Punct) -> bool {
         matches!(&self.cur().kind, TokenKind::Punct(q) if *q == p)
     }
 
+    #[inline]
     fn eat_punct(&mut self, p: Punct) -> bool {
         if self.is_punct(p) {
             self.bump();
@@ -121,9 +130,12 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn expect_punct(&mut self, p: Punct) -> PResult<Span> {
         if self.is_punct(p) {
-            Ok(self.bump().span)
+            let span = self.cur_span();
+            self.bump();
+            Ok(span)
         } else {
             Err(self.err(format!(
                 "{:?} を期待しましたが {:?} が見つかりました",
@@ -137,10 +149,12 @@ impl Parser {
     /// 文字列と一致するかどうか。TS の文脈依存キーワード（interface, type,
     /// declare, as, of, get, set, async, from ...）はすべて Ident として
     /// レックスされているため、この関数で判定する。
+    #[inline]
     fn is_word(&self, word: &str) -> bool {
         matches!(&self.cur().kind, TokenKind::Ident(s) if s == word)
     }
 
+    #[inline]
     fn eat_word(&mut self, word: &str) -> bool {
         if self.is_word(word) {
             self.bump();
@@ -150,11 +164,20 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn expect_word(&mut self, word: &str) -> PResult<()> {
         if self.eat_word(word) {
             Ok(())
         } else {
             Err(self.err(format!("キーワード '{word}' を期待しました")))
+        }
+    }
+
+    #[inline]
+    fn cur_ident(&self) -> Option<&str> {
+        match &self.cur().kind {
+            TokenKind::Ident(s) => Some(s.as_str()),
+            _ => None,
         }
     }
 
