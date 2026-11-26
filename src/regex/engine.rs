@@ -1,7 +1,7 @@
 //! 正規表現実行器（明示スタック＋アンドゥログによるバックトラッキング）。
 
 use super::charclass::{char_eq, is_line_terminator, is_word, CharClass};
-use super::compiler::Inst;
+use super::compiler::{AtomMatcher, Inst};
 use super::parser::{LookaheadKind, WordBoundary};
 use super::RegexError;
 
@@ -20,6 +20,8 @@ pub(super) struct BacktrackFrame {
     pc: usize,
     sp: usize,
     trail_mark: usize,
+    /// `GreedyAtomRepeat` のバックトラック下限（通常の `Split` は `usize::MAX`）。
+    repeat_min_sp: usize,
 }
 
 #[inline]
@@ -72,11 +74,32 @@ impl<'a> Exec<'a> {
         self.steps += 1;
         if self.steps > self.max_steps {
             return Err(RegexError(
-                "正規表現の実行ステップ数上限を超えました（壊滅的バックトラックの可能性があります）"
+                "正規表現の実行ステップ数上限を超えました（入力またはバックトラック量が大きすぎます）"
                     .to_string(),
             ));
         }
         Ok(())
+    }
+
+    #[inline]
+    fn charge_steps(&mut self, count: u64) -> Result<(), RegexError> {
+        self.steps = self.steps.saturating_add(count);
+        if self.steps > self.max_steps {
+            return Err(RegexError(
+                "正規表現の実行ステップ数上限を超えました（入力またはバックトラック量が大きすぎます）"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn match_atom(&self, atom: AtomMatcher, ch: char) -> bool {
+        match atom {
+            AtomMatcher::Char(c) => char_eq(ch, c, self.ignore_case),
+            AtomMatcher::Any => self.dot_all || !is_line_terminator(ch),
+            AtomMatcher::Class(idx) => self.classes[idx as usize].matches(ch, self.ignore_case),
+        }
     }
 
     pub(super) fn run_from(
@@ -130,6 +153,39 @@ impl<'a> Exec<'a> {
                         false
                     }
                 }
+                Inst::GreedyAtomRepeat { atom, min } => {
+                    let mut cur = sp;
+                    while cur < self.chars.len() && self.match_atom(atom, self.chars[cur]) {
+                        cur += 1;
+                    }
+                    let consumed = cur - sp;
+                    if consumed > 0 {
+                        self.charge_steps(consumed as u64)?;
+                    }
+                    let min_count = min as usize;
+                    if consumed < min_count {
+                        false
+                    } else {
+                        let min_sp = sp + min_count;
+                        if cur > min_sp {
+                            if stack.len() >= self.max_depth {
+                                return Err(RegexError(
+                                    "正規表現の再帰の深さ上限を超えました（パターンまたは入力が大きすぎます）"
+                                        .to_string(),
+                                ));
+                            }
+                            stack.push(BacktrackFrame {
+                                pc: pc + 1,
+                                sp: cur - 1,
+                                trail_mark: trail.len(),
+                                repeat_min_sp: min_sp,
+                            });
+                        }
+                        sp = cur;
+                        pc += 1;
+                        true
+                    }
+                }
                 Inst::Save(slot) => {
                     let slot = slot as usize;
                     let prev = saved[slot];
@@ -155,6 +211,7 @@ impl<'a> Exec<'a> {
                         pc: b as usize,
                         sp,
                         trail_mark: trail.len(),
+                        repeat_min_sp: usize::MAX,
                     });
                     pc = a as usize;
                     true
@@ -255,10 +312,14 @@ impl<'a> Exec<'a> {
 
             if !ok {
                 if stack.len() > stack_base {
-                    let frame = stack.pop().unwrap();
+                    let mut frame = stack.pop().unwrap();
                     rewind_trail(saved, trail, frame.trail_mark);
                     pc = frame.pc;
                     sp = frame.sp;
+                    if frame.repeat_min_sp != usize::MAX && frame.sp > frame.repeat_min_sp {
+                        frame.sp -= 1;
+                        stack.push(frame);
+                    }
                 } else {
                     rewind_trail(saved, trail, base_trail_mark);
                     return Ok(None);

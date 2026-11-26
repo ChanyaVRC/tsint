@@ -62,6 +62,10 @@ pub enum OpCode {
     /// コピーした「新しいセル」に差し替える（既存のセルを指すクロージャは
     /// 古い値を保持したまま、以後の書き込みからは切り離される）。
     RebindLocal(LocalIdx),
+    /// ループ本体・`for...of`/`for...in` の per-iteration 束縛およびスロット再利用用:
+    /// `Boxed` スロットは新しい `Value::Uninit` セルへ差し替え、`Direct` スロットは
+    /// `Value::Uninit` へリセットする（TDZ も復元される）。
+    FreshLocal(LocalIdx),
     GetUpvalue(UpvalueIdx),
     SetUpvalue(UpvalueIdx),
     /// グローバル（モジュールトップレベル・ビルトイン）変数の参照/代入。
@@ -191,6 +195,9 @@ pub enum OpCode {
     /// `stack: [obj, funcValue] -> [obj]`（getter/setter 定義）
     ObjectDefineGetter(ConstIdx),
     ObjectDefineSetter(ConstIdx),
+    /// `stack: [obj, key, funcValue] -> [obj]`（computed getter/setter 定義）
+    ObjectDefineGetterComputed,
+    ObjectDefineSetterComputed,
     /// `stack: [obj, src] -> [obj]`（オブジェクトスプレッド）
     ObjectSpread,
     /// 値を反復可能な配列へ実体化する（Array はそのまま、String は文字配列、

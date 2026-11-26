@@ -5,7 +5,10 @@ use std::rc::Rc;
 
 use super::{arg, arg_ref, define_props_obj, native, set_props, value_as_cow_str};
 use crate::value::*;
-use crate::vm::{own_enumerable_keys, to_number, to_string_into, Vm};
+use crate::vm::{
+    is_internal_prop_key, own_enumerable_keys, to_int32, to_number, to_string_into, Vm,
+    MAX_ARRAY_LEN,
+};
 
 // =====================================================================
 // console
@@ -40,9 +43,20 @@ pub(super) fn install_console(vm: &mut Vm) {
 // =====================================================================
 
 pub(super) fn install_object(vm: &mut Vm) {
-    define_props_obj(
-        vm,
+    let obj_ctor = Value::native_ctor(
         "Object",
+        1,
+        BuiltinCtorTag::Object,
+        Rc::new(|vm, _this, args| {
+            if let Some(v @ Value::Object(_)) = args.first() {
+                Ok(v.clone())
+            } else {
+                Ok(vm.alloc_plain_object())
+            }
+        }),
+    );
+    set_props(
+        &obj_ctor,
         [
             (
                 "keys",
@@ -80,8 +94,10 @@ pub(super) fn install_object(vm: &mut Vm) {
                                 .props
                                 .iter()
                                 .filter_map(|(k, slot)| match slot {
-                                    PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                                    PropSlot::Accessor(_) => None,
+                                    PropSlot::Value(v) if !is_internal_prop_key(k) => {
+                                        Some((k.clone(), v.clone()))
+                                    }
+                                    _ => None,
                                 })
                                 .collect();
                             let mut tb = t.borrow_mut();
@@ -95,6 +111,7 @@ pub(super) fn install_object(vm: &mut Vm) {
             ),
         ],
     );
+    vm.define_global("Object", obj_ctor);
 }
 
 fn own_enumerable_entries(vm: &Vm, v: &Value) -> Vec<Value> {
@@ -111,10 +128,10 @@ fn own_enumerable_entries(vm: &Vm, v: &Value) -> Vec<Value> {
                     .props
                     .iter()
                     .filter_map(|(k, s)| match s {
-                        PropSlot::Value(val) => {
+                        PropSlot::Value(val) if !is_internal_prop_key(k) => {
                             Some(vm.alloc_array(vec![Value::Str(k.clone()), val.clone()]))
                         }
-                        PropSlot::Accessor(_) => None,
+                        _ => None,
                     })
                     .collect(),
             }
@@ -132,9 +149,9 @@ fn own_enumerable_values(v: &Value) -> Vec<Value> {
                 _ => b
                     .props
                     .iter()
-                    .filter_map(|(_, s)| match s {
-                        PropSlot::Value(v) => Some(v.clone()),
-                        PropSlot::Accessor(_) => None,
+                    .filter_map(|(k, s)| match s {
+                        PropSlot::Value(v) if !is_internal_prop_key(k) => Some(v.clone()),
+                        _ => None,
                     })
                     .collect(),
             }
@@ -202,7 +219,9 @@ pub(super) fn install_math(vm: &mut Vm) {
             ),
             (
                 "random",
-                native("random", 0, |_vm, _this, _args| Ok(Value::Number(0.0))),
+                native("random", 0, |vm, _this, _args| {
+                    Ok(Value::Number(vm.next_random()))
+                }),
             ),
             ("PI", Value::Number(std::f64::consts::PI)),
         ],
@@ -246,11 +265,7 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
         2,
         Rc::new(|_vm, _this, args| {
             let s = value_as_cow_str(arg_ref(args, 0));
-            let radix = match arg_ref(args, 1) {
-                Value::Number(n) if *n as u32 != 0 => *n as u32,
-                _ => 10,
-            };
-            let t = s.trim();
+            let t = s.trim_start();
             let (neg, t) = if let Some(r) = t.strip_prefix('-') {
                 (true, r)
             } else if let Some(r) = t.strip_prefix('+') {
@@ -258,23 +273,40 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
             } else {
                 (false, t)
             };
-            let t = if radix == 16 {
-                t.strip_prefix("0x")
-                    .or_else(|| t.strip_prefix("0X"))
-                    .unwrap_or(t)
+            let radix_raw = to_int32(arg_ref(args, 1));
+            let (radix, t) = if radix_raw == 0 {
+                if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                    (16u32, hex)
+                } else {
+                    (10u32, t)
+                }
+            } else if !(2..=36).contains(&radix_raw) {
+                return Ok(Value::Number(f64::NAN));
             } else {
-                t
+                let r = radix_raw as u32;
+                let t = if r == 16 {
+                    t.strip_prefix("0x")
+                        .or_else(|| t.strip_prefix("0X"))
+                        .unwrap_or(t)
+                } else {
+                    t
+                };
+                (r, t)
             };
-            let end = t
-                .char_indices()
-                .take_while(|(_, c)| c.is_digit(radix))
-                .last()
-                .map_or(0, |(i, c)| i + c.len_utf8());
-            if end == 0 {
+            let mut acc = 0.0f64;
+            let mut any = false;
+            let base = radix as f64;
+            for c in t.chars() {
+                let Some(d) = c.to_digit(radix) else {
+                    break;
+                };
+                any = true;
+                acc = acc * base + d as f64;
+            }
+            if !any {
                 return Ok(Value::Number(f64::NAN));
             }
-            let n = i64::from_str_radix(&t[..end], radix).unwrap_or(0) as f64;
-            Ok(Value::Number(if neg { -n } else { n }))
+            Ok(Value::Number(if neg { -acc } else { acc }))
         }),
     );
     vm.register_native(
@@ -322,14 +354,28 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
         1,
         Rc::new(|_vm, _this, args| Ok(Value::Bool(to_number(arg_ref(args, 0)).is_nan()))),
     );
-    let array_global = native("Array", 0, |vm, _this, args| {
-        if args.len() == 1 {
-            if let Value::Number(n) = args[0] {
-                return Ok(vm.alloc_array(vec![Value::Undefined; n as usize]));
+    let array_global = Value::native_ctor(
+        "Array",
+        1,
+        BuiltinCtorTag::Array,
+        Rc::new(|vm, _this, args| {
+            if args.len() == 1 {
+                if let Value::Number(n) = args[0] {
+                    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > (u32::MAX as f64) {
+                        return Err(vm.range_error("Invalid array length"));
+                    }
+                    let len = n as usize;
+                    if len > MAX_ARRAY_LEN {
+                        return Err(vm.range_error(format!(
+                            "Invalid array length: 上限 ({MAX_ARRAY_LEN}) を超えています"
+                        )));
+                    }
+                    return Ok(vm.alloc_array(vec![Value::Undefined; len]));
+                }
             }
-        }
-        Ok(vm.alloc_array(args.to_vec()))
-    });
+            Ok(vm.alloc_array(args.to_vec()))
+        }),
+    );
     let array_is_array = native("isArray", 1, |_vm, _this, args| {
         Ok(Value::Bool(
             matches!(arg_ref(args, 0), Value::Object(o) if matches!(o.borrow().kind, ObjKind::Array(_))),
@@ -339,9 +385,10 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
     vm.define_global("Array", array_global);
 
     // `new Function(...args, body)`: 実行時に自前パーサでコンパイルする。
-    vm.register_native(
+    let fn_ctor = Value::native_ctor(
         "Function",
-        0,
+        1,
+        BuiltinCtorTag::Function,
         Rc::new(|vm, _this, args| {
             let mut strs: Vec<String> = args.iter().map(|v| vm.to_display_string(v)).collect();
             let body = strs.pop().unwrap_or_default();
@@ -360,19 +407,21 @@ pub(super) fn install_globals_misc(vm: &mut Vm) {
             }
         }),
     );
+    vm.define_global("Function", fn_ctor);
 }
 
 pub(super) fn install_errors(vm: &mut Vm) {
-    for name in [
-        "Error",
-        "TypeError",
-        "RangeError",
-        "SyntaxError",
-        "ReferenceError",
+    for (name, tag) in [
+        ("Error", BuiltinCtorTag::Error),
+        ("TypeError", BuiltinCtorTag::TypeError),
+        ("RangeError", BuiltinCtorTag::RangeError),
+        ("SyntaxError", BuiltinCtorTag::SyntaxError),
+        ("ReferenceError", BuiltinCtorTag::ReferenceError),
     ] {
-        vm.register_native(
+        let ctor = Value::native_ctor(
             name,
             1,
+            tag,
             Rc::new(move |vm, _this, args| {
                 let msg = if args.is_empty() {
                     String::new()
@@ -382,6 +431,7 @@ pub(super) fn install_errors(vm: &mut Vm) {
                 Ok(vm.make_error(name, msg))
             }),
         );
+        vm.define_global(name, ctor);
     }
 }
 
@@ -416,9 +466,10 @@ pub(super) fn install_date(vm: &mut Vm) {
     );
 
     let proto_for_ctor = proto.clone();
-    vm.register_native(
+    let date_ctor = Value::native_ctor(
         "Date",
         0,
+        BuiltinCtorTag::Date,
         Rc::new(move |vm, _this, args| {
             let t = if let Some(Value::Number(n)) = args.first() {
                 *n
@@ -436,6 +487,8 @@ pub(super) fn install_date(vm: &mut Vm) {
             Ok(vm.alloc_obj(inst))
         }),
     );
+    set_props(&date_ctor, [("prototype", Value::Object(proto))]);
+    vm.define_global("Date", date_ctor);
 }
 
 /// エポックミリ秒を `YYYY-MM-DD HH:MM:SS` へ変換する（グレゴリオ暦・UTC、

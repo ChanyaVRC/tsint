@@ -72,7 +72,10 @@ impl Parser {
         };
         if let Some(op) = op {
             self.bump();
-            let value = self.parse_assign_expr()?;
+            self.enter_depth()?;
+            let value = self.parse_assign_expr();
+            self.leave_depth();
+            let value = value?;
             return Ok(self.mk_expr(
                 start,
                 ExprKind::Assign {
@@ -89,17 +92,22 @@ impl Parser {
         let start = self.cur_span();
         let test = self.parse_prec(1)?;
         if self.eat_punct(Punct::Question) {
-            let cons = self.parse_assign_expr()?;
-            self.expect_punct(Punct::Colon)?;
-            let alt = self.parse_assign_expr()?;
-            return Ok(self.mk_expr(
-                start,
-                ExprKind::Conditional {
-                    test: Box::new(test),
-                    cons: Box::new(cons),
-                    alt: Box::new(alt),
-                },
-            ));
+            self.enter_depth()?;
+            let res = (|| {
+                let cons = self.parse_assign_expr()?;
+                self.expect_punct(Punct::Colon)?;
+                let alt = self.parse_assign_expr()?;
+                Ok(self.mk_expr(
+                    start,
+                    ExprKind::Conditional {
+                        test: Box::new(test),
+                        cons: Box::new(cons),
+                        alt: Box::new(alt),
+                    },
+                ))
+            })();
+            self.leave_depth();
+            return res;
         }
         Ok(test)
     }
@@ -184,7 +192,10 @@ impl Parser {
             };
             if let Some(op) = op {
                 self.bump();
-                let arg = self.parse_unary()?;
+                self.enter_depth()?;
+                let arg = self.parse_unary();
+                self.leave_depth();
+                let arg = arg?;
                 return Ok(self.mk_expr(
                     start,
                     ExprKind::Unary {
@@ -200,7 +211,10 @@ impl Parser {
                     UpdateOp::Dec
                 };
                 self.bump();
-                let arg = self.parse_unary()?;
+                self.enter_depth()?;
+                let arg = self.parse_unary();
+                self.leave_depth();
+                let arg = arg?;
                 return Ok(self.mk_expr(
                     start,
                     ExprKind::Update {
@@ -220,7 +234,10 @@ impl Parser {
             };
             if let Some(op) = op {
                 self.bump();
-                let arg = self.parse_unary()?;
+                self.enter_depth()?;
+                let arg = self.parse_unary();
+                self.leave_depth();
+                let arg = arg?;
                 return Ok(self.mk_expr(
                     start,
                     ExprKind::Unary {
@@ -231,7 +248,10 @@ impl Parser {
             }
             if word == "await" {
                 self.bump();
-                let arg = self.parse_unary()?;
+                self.enter_depth()?;
+                let arg = self.parse_unary();
+                self.leave_depth();
+                let arg = arg?;
                 return Ok(self.mk_expr(start, ExprKind::Await(Box::new(arg))));
             }
         }
@@ -536,13 +556,27 @@ impl Parser {
                 Ok(self.mk_expr(start, ExprKind::RegexLit { pattern, flags }))
             }
             TokenKind::Punct(Punct::LParen) => {
+                self.enter_depth()?;
                 self.bump();
-                let e = self.parse_expr()?;
-                self.expect_punct(Punct::RParen)?;
-                Ok(e)
+                let res = self.parse_expr().and_then(|e| {
+                    self.expect_punct(Punct::RParen)?;
+                    Ok(e)
+                });
+                self.leave_depth();
+                res
             }
-            TokenKind::Punct(Punct::LBracket) => self.parse_array_lit(),
-            TokenKind::Punct(Punct::LBrace) => self.parse_object_lit(),
+            TokenKind::Punct(Punct::LBracket) => {
+                self.enter_depth()?;
+                let res = self.parse_array_lit();
+                self.leave_depth();
+                res
+            }
+            TokenKind::Punct(Punct::LBrace) => {
+                self.enter_depth()?;
+                let res = self.parse_object_lit();
+                self.leave_depth();
+                res
+            }
             TokenKind::Ident(_) => self.parse_ident_primary(),
             other => {
                 let msg = format!("式が必要ですが {other:?} が見つかりました");
@@ -723,6 +757,99 @@ impl Parser {
         })
     }
 
+    /// 現在位置の `(` に対応する `)` の直後が `=>`（または `: <戻り型> =>`）かを
+    /// トークンの括弧対応のみで高速に先読みする（T-29: 投機パースの指数時間回避）。
+    fn lparen_followed_by_arrow(&self) -> bool {
+        let mut i = self.pos;
+        let len = self.tokens.len();
+        let mut paren = 0i32;
+        let mut bracket = 0i32;
+        let mut brace = 0i32;
+        while i < len {
+            match &self.tokens[i].kind {
+                TokenKind::Punct(Punct::LParen) => paren += 1,
+                TokenKind::Punct(Punct::RParen) => {
+                    paren -= 1;
+                    if paren == 0 && bracket == 0 && brace == 0 {
+                        i += 1;
+                        break;
+                    }
+                    if paren < 0 {
+                        return false;
+                    }
+                }
+                TokenKind::Punct(Punct::LBracket) => bracket += 1,
+                TokenKind::Punct(Punct::RBracket) => {
+                    bracket -= 1;
+                    if bracket < 0 {
+                        return false;
+                    }
+                }
+                TokenKind::Punct(Punct::LBrace) => brace += 1,
+                TokenKind::Punct(Punct::RBrace) => {
+                    brace -= 1;
+                    if brace < 0 {
+                        return false;
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        if paren != 0 || i >= len {
+            return false;
+        }
+        match &self.tokens[i].kind {
+            TokenKind::Punct(Punct::Arrow) => true,
+            TokenKind::Punct(Punct::Colon) => {
+                // 戻り型注釈の後ろに `=>` があるか走査する
+                i += 1;
+                let mut p = 0i32;
+                let mut br = 0i32;
+                let mut bc = 0i32;
+                while i < len {
+                    match &self.tokens[i].kind {
+                        TokenKind::Punct(Punct::Arrow) if p == 0 && br == 0 && bc == 0 => {
+                            return true;
+                        }
+                        TokenKind::Punct(Punct::LParen) => p += 1,
+                        TokenKind::Punct(Punct::RParen) => {
+                            if p == 0 {
+                                return false;
+                            }
+                            p -= 1;
+                        }
+                        TokenKind::Punct(Punct::LBracket) => br += 1,
+                        TokenKind::Punct(Punct::RBracket) => {
+                            if br == 0 {
+                                return false;
+                            }
+                            br -= 1;
+                        }
+                        TokenKind::Punct(Punct::LBrace) => bc += 1,
+                        TokenKind::Punct(Punct::RBrace) => {
+                            if bc == 0 {
+                                return false;
+                            }
+                            bc -= 1;
+                        }
+                        TokenKind::Punct(Punct::Semi | Punct::Eq)
+                            if p == 0 && br == 0 && bc == 0 =>
+                        {
+                            return false;
+                        }
+                        TokenKind::Eof => return false,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// アロー関数を投機的に解析する。マッチしなければ None を返し位置を戻す。
     pub(super) fn try_parse_arrow(&mut self) -> PResult<Option<Expr>> {
         // 大半の式は `(` / `async` / `ident =>` ではないため最速で弾く。
@@ -775,7 +902,7 @@ impl Parser {
             }
         }
 
-        if self.is_punct(Punct::LParen) {
+        if self.is_punct(Punct::LParen) && self.lparen_followed_by_arrow() {
             let attempt = self.parse_param_list();
             if let Ok(params) = attempt {
                 if self.eat_punct(Punct::Colon) {

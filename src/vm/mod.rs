@@ -22,14 +22,17 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
 use crate::bytecode::*;
+use crate::hash::FastHashMap;
 use crate::value::*;
 
 pub use ops::{
     array_values, is_callable, loose_eq, new_regex_value, number_to_js_string, to_int32, to_number,
     to_primitive, to_property_key_string, to_string_basic, to_uint32,
 };
-pub(crate) use ops::{number_to_js_string_into, to_string_into, with_str_buf_rc};
-pub(crate) use props::own_enumerable_keys;
+pub(crate) use ops::{
+    number_to_js_string_into, to_string_into, to_string_into_with_root, with_str_buf_rc,
+};
+pub(crate) use props::{is_internal_prop_key, own_enumerable_keys};
 
 /// 自動循環参照 GC の最小トリガー閾値（新規オブジェクト確保数）。
 pub(super) const GC_MIN_THRESHOLD: usize = 2048;
@@ -37,6 +40,15 @@ pub(super) const GC_MIN_THRESHOLD: usize = 2048;
 const MAX_FRAME_POOL: usize = 64;
 /// 引数バッファプールの最大保持数。
 const MAX_ARGS_POOL: usize = 32;
+/// ネイティブ再帰呼び出し（`new`・コールバック・スプレッド・同期 async 起動）の安全深さ上限（T-4）。
+/// Windows の既定 1MB スタック上の debug ビルドでもスタックオーバーフローしない安全値。
+pub(super) const MAX_NATIVE_CALL_DEPTH: u32 = 40;
+/// JS 呼び出しフレーム数の上限（T-4）。
+pub(super) const MAX_CALL_FRAMES: usize = 16_384;
+/// 密配列の最大要素数（T-12）。
+pub(crate) const MAX_ARRAY_LEN: usize = 1 << 24;
+/// 文字列構築の最大バイト長（T-12）。
+pub(crate) const MAX_STRING_BYTES: usize = 1 << 26;
 
 thread_local! {
     /// ASCII 単一文字の `Rc<str>` キャッシュ（`str[i]` のゼロ確保高速パス用）。
@@ -213,17 +225,38 @@ pub enum ModuleTaskState {
 /// ホストが後から解決/棄却できる Promise のハンドル。
 pub struct HostPromise {
     pub(super) promise: ObjRef,
+    pub(super) settled: Cell<bool>,
+    pub(super) pending_host_count: Rc<Cell<usize>>,
 }
 
 impl HostPromise {
     /// 紐づく JS `Promise` を指定値で解決（fulfill）する。
     pub fn resolve(&self, vm: &mut Vm, value: Value) {
-        vm.settle_host_promise(self.promise.clone(), Ok(value));
+        if self.settled.replace(true) {
+            return;
+        }
+        self.pending_host_count
+            .set(self.pending_host_count.get().saturating_sub(1));
+        vm.resolve_promise(self.promise.clone(), value);
     }
 
     /// 紐づく JS `Promise` を指定値で棄却（reject）する。
     pub fn reject(&self, vm: &mut Vm, value: Value) {
-        vm.settle_host_promise(self.promise.clone(), Err(value));
+        if self.settled.replace(true) {
+            return;
+        }
+        self.pending_host_count
+            .set(self.pending_host_count.get().saturating_sub(1));
+        vm.settle_promise(self.promise.clone(), Err(value));
+    }
+}
+
+impl Drop for HostPromise {
+    fn drop(&mut self) {
+        if !self.settled.replace(true) {
+            self.pending_host_count
+                .set(self.pending_host_count.get().saturating_sub(1));
+        }
     }
 }
 
@@ -242,19 +275,31 @@ pub(super) enum StackCalleeSlot {
 
 pub struct Vm {
     pub frames: Vec<Frame>,
+    /// async タスク起動や継続再開中に退避している呼び出し元フレーム列（GC ルートとして可視化、T-1）。
+    pub(super) suspended_callers: Vec<Vec<Frame>>,
     pub globals: HashMap<Rc<str>, Rc<RefCell<Value>>>,
     /// `console.log` 相当の出力フック。既定では標準出力へ。
     pub on_log: Box<dyn FnMut(&str)>,
     /// `Date` 等、非決定的な値をホストが注入するためのフック置き場。
     pub now_fn: Option<Rc<dyn Fn() -> f64>>,
-    pub(super) pending_module_exports: Option<Vec<(Rc<str>, Value)>>,
+    /// `Math.random()` 用の乱数フック（未設定時は決定的 PRNG を使用、T-15）。
+    pub random_fn: Option<Box<dyn FnMut() -> f64>>,
+    rng_state: Cell<u64>,
+    /// モジュール owner Promise ごとに紐づけた export 一覧（T-16）。
+    pub(super) pending_module_exports: FastHashMap<usize, Vec<(Rc<str>, Value)>>,
+    pub(super) awaited_module_owners: Vec<usize>,
+    /// `run_module_graph` 呼び出しを跨いで単調増加するモジュール名前空間カウンタ（T-19）。
+    pub(crate) module_ns_counter: u32,
 
     // ---------------- T3: Promise / イベントループ ----------------
     pub microtasks: VecDeque<MicrotaskJob>,
     pub(super) maybe_unhandled: Vec<ObjRef>,
     pub on_unhandled_rejection: Box<dyn FnMut(&Value)>,
-    pub(super) pending_host_count: usize,
+    pub(super) has_custom_unhandled_hook: bool,
+    pub(super) pending_host_count: Rc<Cell<usize>>,
     pub(super) native_call_depth: u32,
+    /// 実際の Rust スタック再帰深さ（`run_nested_call` / `spawn_async_task_from_function` / `resume_continuation`）。
+    pub(super) rust_call_depth: u32,
     pub(super) current_owner_promise: Option<ObjRef>,
 
     // ---------------- 循環参照回収 (GC) ----------------
@@ -273,15 +318,22 @@ impl Vm {
     pub fn new() -> Self {
         let mut vm = Vm {
             frames: Vec::new(),
+            suspended_callers: Vec::new(),
             globals: HashMap::new(),
             on_log: Box::new(|s: &str| println!("{s}")),
             now_fn: None,
-            pending_module_exports: None,
+            random_fn: None,
+            rng_state: Cell::new(0x243f_6a88_85a3_08d3),
+            pending_module_exports: FastHashMap::default(),
+            awaited_module_owners: Vec::new(),
+            module_ns_counter: 0,
             microtasks: VecDeque::new(),
             maybe_unhandled: Vec::new(),
             on_unhandled_rejection: Box::new(|_v: &Value| {}),
-            pending_host_count: 0,
+            has_custom_unhandled_hook: false,
+            pending_host_count: Rc::new(Cell::new(0)),
             native_call_depth: 0,
+            rust_call_depth: 0,
             current_owner_promise: None,
             gc_objects: RefCell::new(Vec::new()),
             gc_allocs_since_last: Cell::new(0),
@@ -293,6 +345,24 @@ impl Vm {
         };
         crate::builtins::install(&mut vm);
         vm
+    }
+
+    pub fn set_unhandled_rejection_hook(&mut self, f: impl FnMut(&Value) + 'static) {
+        self.on_unhandled_rejection = Box::new(f);
+        self.has_custom_unhandled_hook = true;
+    }
+
+    /// `Math.random()` 用の乱数値を返す（カスタムフック優先、未設定時は決定的 SplitMix64）。
+    pub(crate) fn next_random(&mut self) -> f64 {
+        if let Some(ref mut f) = self.random_fn {
+            return f();
+        }
+        let mut z = self.rng_state.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.rng_state.set(z);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
     }
 
     // ---------------- プール・フレーム管理 ----------------
@@ -407,7 +477,14 @@ impl Vm {
         fo: &Rc<FunctionObj>,
         argc: usize,
         callee_slot: StackCalleeSlot,
-    ) {
+    ) -> Result<(), Value> {
+        if self.frames.len() >= MAX_CALL_FRAMES {
+            let caller = self.frames.last_mut().unwrap();
+            let drop_cnt = argc + usize::from(callee_slot == StackCalleeSlot::Present) + 1;
+            let new_len = caller.stack.len().saturating_sub(drop_cnt);
+            caller.stack.truncate(new_len);
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
         let needs_raw = fo.chunk.needs_raw_args && argc > 0;
         let mut frame = self.acquire_pooled_frame(fo);
         let sp = fo.chunk.simple_param_count as usize;
@@ -461,6 +538,7 @@ impl Vm {
             frame.locals[0].set(this);
         }
         self.frames.push(frame);
+        Ok(())
     }
 
     // ---------------- オブジェクト確保ヘルパー ----------------
@@ -504,6 +582,7 @@ impl Vm {
             arity,
             f,
             captures: captures.into_boxed_slice(),
+            ctor_tag: None,
         }))))
     }
 
@@ -527,7 +606,7 @@ impl Vm {
     }
 
     pub fn run_module(&mut self, chunk: Rc<Chunk>) -> Result<Vec<(Rc<str>, Value)>, Value> {
-        match self.start_module_task(chunk)? {
+        match self.start_module_task_inner(chunk, true)? {
             ModuleTaskState::Settled(exports) => Ok(exports),
             ModuleTaskState::Pending => Err(self.type_error(
                 "トップレベル await が解決しませんでした（保留中のホスト Promise があります。\
@@ -537,11 +616,47 @@ impl Vm {
     }
 
     pub fn start_module_task(&mut self, chunk: Rc<Chunk>) -> Result<ModuleTaskState, Value> {
-        let frame = Frame::new(chunk, self.empty_upvalues.clone(), self.empty_args.clone());
-        self.frames = vec![frame];
+        self.start_module_task_inner(chunk, false)
+    }
+
+    fn start_module_task_inner(
+        &mut self,
+        chunk: Rc<Chunk>,
+        cancel_if_pending: bool,
+    ) -> Result<ModuleTaskState, Value> {
+        let mut frame = Frame::new(chunk, self.empty_upvalues.clone(), self.empty_args.clone());
+        // モジュールトップレベルの `this`（スロット 0）は undefined（T-23）。
+        if !frame.locals.is_empty() {
+            frame.locals[0].set(Value::Undefined);
+        }
+        let caller_frames = std::mem::replace(&mut self.frames, vec![frame]);
+        self.suspended_callers.push(caller_frames);
+
         let (_, owner) = self.new_pending_promise();
+        // 同期完了（または初回イベントループ内での失敗）は戻り値として直接返すため、
+        // 二重報告を防ぐ目的で最初は handled = true にしておく（T-20）。
+        if let ObjKind::Promise(ref mut pd) = owner.borrow_mut().kind {
+            pd.handled = true;
+        }
+        let owner_ptr = Rc::as_ptr(&owner) as usize;
+        self.awaited_module_owners.push(owner_ptr);
+
         self.drive_current_task(owner.clone());
+        self.frames = self.suspended_callers.pop().unwrap_or_default();
         self.run_event_loop();
+
+        if let Some(pos) = self
+            .awaited_module_owners
+            .iter()
+            .rposition(|&p| p == owner_ptr)
+        {
+            self.awaited_module_owners.remove(pos);
+        }
+        let exports = self
+            .pending_module_exports
+            .remove(&owner_ptr)
+            .unwrap_or_default();
+
         let state = {
             let b = owner.borrow();
             match &b.kind {
@@ -554,11 +669,31 @@ impl Vm {
             }
         };
         match state {
-            Some(Ok(_)) => Ok(ModuleTaskState::Settled(
-                self.pending_module_exports.take().unwrap_or_default(),
-            )),
+            Some(Ok(_)) => Ok(ModuleTaskState::Settled(exports)),
             Some(Err(e)) => Err(e),
-            None => Ok(ModuleTaskState::Pending),
+            None => {
+                if cancel_if_pending {
+                    // `run_module` が Pending で失敗する場合、保留中のタスクが後から
+                    // 副作用を実行しないよう owner をキャンセル済み状態にする（T-16）。
+                    let err = self.type_error(
+                        "トップレベル await が解決しませんでした（保留中のホスト Promise があります。\
+                         run_module は同期 API のため続行できません — run_event_loop を使ってください）",
+                    );
+                    if let ObjKind::Promise(ref mut pd) = owner.borrow_mut().kind {
+                        pd.state = PromiseState::Rejected(err.clone());
+                        pd.handled = true;
+                        pd.reactions.clear();
+                    }
+                    Err(err)
+                } else {
+                    // Pending のまま返す場合、後続の非同期失敗は未捕捉 reject として
+                    // ホストへ通知されるよう handled を戻す（T-16 / T-20）。
+                    if let ObjKind::Promise(ref mut pd) = owner.borrow_mut().kind {
+                        pd.handled = false;
+                    }
+                    Ok(ModuleTaskState::Pending)
+                }
+            }
         }
     }
 
@@ -594,12 +729,23 @@ impl Vm {
     }
 
     pub fn make_error(&self, name: &str, msg: String) -> Value {
+        use std::fmt::Write;
         let mut o = ObjData::new(ObjKind::Error);
         o.props.set_value(Rc::from("name"), Value::str(name));
         o.props
             .set_value(Rc::from("message"), Value::str(msg.clone()));
-        o.props
-            .set_value(Rc::from("stack"), Value::str(format!("{name}: {msg}")));
+        let mut stack = format!("{name}: {msg}");
+        for frame in self.frames.iter().rev() {
+            let fault_ip = frame.ip.saturating_sub(1);
+            let line = frame.chunk.lines.get(fault_ip).copied().unwrap_or(0);
+            let chunk_name = if frame.chunk.name.is_empty() {
+                "<anonymous>"
+            } else {
+                &frame.chunk.name
+            };
+            let _ = write!(stack, "\n    at {chunk_name}:{line}");
+        }
+        o.props.set_value(Rc::from("stack"), Value::str(stack));
         self.alloc_obj(o)
     }
 
@@ -631,8 +777,10 @@ impl Drop for Vm {
         // VM が保持する全ルートを先に解放する。循環参照を持たないオブジェクトは
         // この時点で通常の Rc::drop により即座に解放される。
         self.frames.clear();
+        self.suspended_callers.clear();
         self.globals.clear();
-        self.pending_module_exports = None;
+        self.pending_module_exports.clear();
+        self.awaited_module_owners.clear();
         self.microtasks.clear();
         self.maybe_unhandled.clear();
         self.current_owner_promise = None;

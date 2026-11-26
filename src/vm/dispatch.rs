@@ -10,7 +10,7 @@ use super::ops::{
     array_values, js_add, js_compare, loose_eq, to_int32, to_number, to_property_key_string,
     to_string_into, to_uint32, with_str_buf_rc,
 };
-use super::{ascii_char_rc, LocalSlot, RunOutcome, Vm};
+use super::{ascii_char_rc, LocalSlot, RunOutcome, Vm, MAX_ARRAY_LEN};
 
 /// `IncLocal`/`DecLocal` 共通のインプレース加減算。未初期化（TDZ）なら `false` を返す。
 #[inline]
@@ -64,7 +64,6 @@ impl Vm {
                 let mut slow: Option<(OpCode, usize)> = None;
                 let gc_due_ptr = &self.gc_allocs_since_last;
                 let gc_thresh = self.gc_threshold;
-                let native_depth = self.native_call_depth;
 
                 macro_rules! pop_v {
                     () => {
@@ -219,6 +218,14 @@ impl Vm {
                                 *cell = Rc::new(RefCell::new(cur));
                             }
                         }
+                        OpCode::FreshLocal(slot) => match &mut frame.locals[slot as usize] {
+                            LocalSlot::Boxed(cell) => {
+                                *cell = Rc::new(RefCell::new(Value::Uninit));
+                            }
+                            LocalSlot::Direct(v) => {
+                                *v = Value::Uninit;
+                            }
+                        },
                         OpCode::GetUpvalue(idx) => {
                             let v = frame.upvalues[idx as usize].borrow().clone();
                             if matches!(v, Value::Uninit) {
@@ -389,15 +396,17 @@ impl Vm {
                                 (Value::Object(o), Value::Number(num))
                                     if is_valid_array_index(*num) =>
                                 {
-                                    let mut b = o.borrow_mut();
-                                    if b.props.is_empty() {
-                                        if let ObjKind::Array(items) = &mut b.kind {
-                                            let idx = *num as usize;
-                                            if idx >= items.len() {
-                                                items.resize(idx + 1, Value::Undefined);
+                                    let idx = *num as usize;
+                                    if idx < MAX_ARRAY_LEN {
+                                        let mut b = o.borrow_mut();
+                                        if b.props.is_empty() {
+                                            if let ObjKind::Array(items) = &mut b.kind {
+                                                if idx >= items.len() {
+                                                    items.resize(idx + 1, Value::Undefined);
+                                                }
+                                                items[idx] = frame.stack[n - 1].clone();
+                                                done = true;
                                             }
-                                            items[idx] = frame.stack[n - 1].clone();
-                                            done = true;
                                         }
                                     }
                                 }
@@ -522,8 +531,7 @@ impl Vm {
                         OpCode::Jump(addr) => {
                             let target = addr as usize;
                             ip = target;
-                            if target <= op_ip && native_depth == 0 && gc_due_ptr.get() >= gc_thresh
-                            {
+                            if target <= op_ip && gc_due_ptr.get() >= gc_thresh {
                                 frame.ip = ip;
                                 break;
                             }
@@ -537,10 +545,7 @@ impl Vm {
                             if pop_v!().to_bool() {
                                 let target = addr as usize;
                                 ip = target;
-                                if target <= op_ip
-                                    && native_depth == 0
-                                    && gc_due_ptr.get() >= gc_thresh
-                                {
+                                if target <= op_ip && gc_due_ptr.get() >= gc_thresh {
                                     frame.ip = ip;
                                     break;
                                 }
@@ -643,6 +648,18 @@ impl Vm {
                                 o.borrow_mut().props.define_accessor(name, is_get, f);
                             }
                         }
+                        OpCode::ObjectDefineGetterComputed | OpCode::ObjectDefineSetterComputed => {
+                            let is_get = matches!(op, OpCode::ObjectDefineGetterComputed);
+                            let f = pop_v!();
+                            let key = pop_v!();
+                            if let Some(Value::Object(o)) = frame.stack.last() {
+                                let name: Rc<str> = match &key {
+                                    Value::Str(s) => s.clone(),
+                                    other => Rc::from(to_property_key_string(other).as_str()),
+                                };
+                                o.borrow_mut().props.define_accessor(name, is_get, f);
+                            }
+                        }
 
                         other => {
                             frame.ip = ip;
@@ -655,9 +672,7 @@ impl Vm {
             };
 
             let Some((op, op_ip)) = slow_op else {
-                if self.native_call_depth == 0 {
-                    self.maybe_collect_garbage();
-                }
+                self.maybe_gc_if_top_level();
                 continue;
             };
 
@@ -690,13 +705,20 @@ impl Vm {
                 let mut popped = self.frames.pop().unwrap();
                 let v = popped.stack.pop().expect("オペランドスタックが空です");
                 if self.frames.is_empty() && popped.chunk.is_module {
-                    let exports = popped
-                        .chunk
-                        .exports
-                        .iter()
-                        .map(|(name, slot)| (name.clone(), popped.locals[*slot as usize].get()))
-                        .collect();
-                    self.pending_module_exports = Some(exports);
+                    if let Some(owner) = &self.current_owner_promise {
+                        let owner_ptr = Rc::as_ptr(owner) as usize;
+                        if self.awaited_module_owners.contains(&owner_ptr) {
+                            let exports = popped
+                                .chunk
+                                .exports
+                                .iter()
+                                .map(|(name, slot)| {
+                                    (name.clone(), popped.locals[*slot as usize].get())
+                                })
+                                .collect();
+                            self.pending_module_exports.insert(owner_ptr, exports);
+                        }
+                    }
                 }
                 self.release_frame(popped);
                 if self.frames.len() > stop_depth {
@@ -935,8 +957,10 @@ impl Vm {
                             .props
                             .iter()
                             .filter_map(|(k, s)| match s {
-                                PropSlot::Value(v) => Some((k.clone(), v.clone())),
-                                PropSlot::Accessor(_) => None,
+                                PropSlot::Value(v) if !super::props::is_internal_prop_key(k) => {
+                                    Some((k.clone(), v.clone()))
+                                }
+                                _ => None,
                             })
                             .collect();
                         let arr_items = match &sb.kind {
@@ -981,7 +1005,9 @@ impl Vm {
                 let mut out = ObjData::new(ObjKind::Plain);
                 if let Value::Object(o) = &src {
                     for (k, s) in o.borrow().props.iter() {
-                        if exclude.iter().any(|e| e == &**k) {
+                        if super::props::is_internal_prop_key(k)
+                            || exclude.iter().any(|e| e == &**k)
+                        {
                             continue;
                         }
                         if let PropSlot::Value(v) = s {

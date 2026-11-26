@@ -29,9 +29,10 @@ pub(super) fn as_regex(v: &Value) -> Option<Rc<crate::regex::Regex>> {
 
 /// `new RegExp(...)` / `RegExp(...)` の実装。
 pub(super) fn install_regexp(vm: &mut Vm) {
-    vm.register_native(
+    let ctor = Value::native_ctor(
         "RegExp",
         2,
+        BuiltinCtorTag::RegExp,
         Rc::new(|vm, _this, args| {
             let (pattern, default_flags) = match args.first() {
                 Some(v) => match as_regex(v) {
@@ -50,6 +51,7 @@ pub(super) fn install_regexp(vm: &mut Vm) {
             }
         }),
     );
+    vm.define_global("RegExp", ctor);
 }
 
 /// 文字列引数またはコンパイル済み正規表現を `Rc<Regex>` に統一する。

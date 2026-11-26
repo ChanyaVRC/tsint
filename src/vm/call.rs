@@ -6,7 +6,9 @@ use crate::bytecode::*;
 use crate::value::*;
 
 use super::props::kind_tag_of;
-use super::{CallOutcome, KindTag, RunOutcome, StackCalleeSlot, Vm};
+use super::{
+    CallOutcome, KindTag, RunOutcome, StackCalleeSlot, Vm, MAX_CALL_FRAMES, MAX_NATIVE_CALL_DEPTH,
+};
 
 impl Vm {
     pub(super) fn build_closure(&self, tpl: &Rc<FunctionTemplate>) -> Rc<FunctionObj> {
@@ -117,6 +119,21 @@ impl Vm {
         args: Vec<Value>,
     ) -> Result<(), Value> {
         let callee = self.get_prop(&obj, key)?;
+        if !super::ops::is_callable(&callee) {
+            self.put_args_buf(args);
+            if matches!(
+                &callee,
+                Value::Object(o) if matches!(o.borrow().kind, ObjKind::Class(_))
+            ) {
+                return Err(self.type_error(format!(
+                    "'{key}' はクラスコンストラクタのため 'new' なしで呼び出せません"
+                )));
+            }
+            return Err(self.type_error(format!(
+                "'{key}' は {} のメソッドとして定義されていません（関数ではありません）",
+                obj.type_of()
+            )));
+        }
         let out = self.dispatch_call_slice(callee, obj, &args);
         self.put_args_buf(args);
         match out? {
@@ -135,11 +152,11 @@ impl Vm {
     ) -> Result<(), Value> {
         if fo.is_async {
             let (this, args) = self.pop_call_args_and_this(argc, slot);
-            let promise = self.spawn_async_task_from_function(&fo, this, &args);
+            let res = self.spawn_async_task_from_function(&fo, this, &args);
             self.put_args_buf(args);
-            self.push(promise);
+            self.push(res?);
         } else {
-            self.push_frame_from_caller_stack(&fo, argc, slot);
+            self.push_frame_from_caller_stack(&fo, argc, slot)?;
         }
         Ok(())
     }
@@ -310,6 +327,9 @@ impl Vm {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Value> {
+        if self.frames.len() >= MAX_CALL_FRAMES {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
         let depth_before = self.frames.len();
         let frame = self.acquire_frame_from_slice(&f, this, args);
         self.frames.push(frame);
@@ -317,8 +337,18 @@ impl Vm {
     }
 
     fn run_nested_call(&mut self, depth_before: usize) -> Result<Value, Value> {
+        if self.rust_call_depth >= MAX_NATIVE_CALL_DEPTH {
+            while self.frames.len() > depth_before {
+                if let Some(f) = self.frames.pop() {
+                    self.release_frame(f);
+                }
+            }
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
         self.native_call_depth += 1;
+        self.rust_call_depth += 1;
         let r = self.run_until(depth_before);
+        self.rust_call_depth -= 1;
         self.native_call_depth -= 1;
         match r {
             Ok(RunOutcome::Value(v)) => Ok(v),
@@ -353,8 +383,11 @@ impl Vm {
         match kind {
             CalleeKind::Fn(fo) => {
                 if fo.is_async {
-                    let promise = self.spawn_async_task_from_function(&fo, this, args);
+                    let promise = self.spawn_async_task_from_function(&fo, this, args)?;
                     return Ok(CallOutcome::Immediate(promise));
+                }
+                if self.frames.len() >= MAX_CALL_FRAMES {
+                    return Err(self.range_error("Maximum call stack size exceeded"));
                 }
                 let frame = self.acquire_frame_from_slice(&fo, this, args);
                 self.frames.push(frame);

@@ -13,6 +13,13 @@ enum LoopJumpKind {
 
 impl Parser {
     pub(super) fn parse_stmt(&mut self) -> PResult<Stmt> {
+        self.enter_depth()?;
+        let res = self.parse_stmt_inner();
+        self.leave_depth();
+        res
+    }
+
+    fn parse_stmt_inner(&mut self) -> PResult<Stmt> {
         let start = self.cur_span();
         if self.is_punct(Punct::Semi) {
             self.bump();

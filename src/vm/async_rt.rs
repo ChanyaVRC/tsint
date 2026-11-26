@@ -6,7 +6,7 @@ use std::rc::Rc;
 use crate::value::*;
 
 use super::ops::is_callable;
-use super::{HostPromise, MicrotaskJob, PumpState, RunOutcome, Vm};
+use super::{HostPromise, MicrotaskJob, PumpState, RunOutcome, Vm, MAX_NATIVE_CALL_DEPTH};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettleMode {
@@ -20,13 +20,19 @@ impl Vm {
         f: &Rc<FunctionObj>,
         this: Value,
         args: &[Value],
-    ) -> Value {
+    ) -> Result<Value, Value> {
+        if self.rust_call_depth >= MAX_NATIVE_CALL_DEPTH {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
         let frame = self.acquire_frame_from_slice(f, this, args);
         let caller_frames = std::mem::replace(&mut self.frames, vec![frame]);
+        self.suspended_callers.push(caller_frames);
         let (promise_val, promise_obj) = self.new_pending_promise();
+        self.rust_call_depth += 1;
         self.drive_current_task(promise_obj);
-        self.frames = caller_frames;
-        promise_val
+        self.rust_call_depth -= 1;
+        self.frames = self.suspended_callers.pop().unwrap_or_default();
+        Ok(promise_val)
     }
 
     pub(super) fn drive_current_task(&mut self, owner_promise: ObjRef) {
@@ -48,7 +54,20 @@ impl Vm {
             frames,
             owner_promise,
         } = cont;
+        // `run_module` でキャンセル済み（既に settled）のタスクは副作用を実行せず破棄する（T-16）。
+        let owner_pending = matches!(
+            owner_promise.borrow().kind,
+            ObjKind::Promise(ref pd) if matches!(pd.state, PromiseState::Pending)
+        );
+        if !owner_pending {
+            for f in frames {
+                self.release_frame(f);
+            }
+            return;
+        }
         let caller_frames = std::mem::replace(&mut self.frames, frames);
+        self.suspended_callers.push(caller_frames);
+        self.rust_call_depth += 1;
         let mut already_done = false;
         match outcome {
             Ok(v) => self.push(v),
@@ -62,7 +81,8 @@ impl Vm {
         if !already_done {
             self.drive_current_task(owner_promise);
         }
-        self.frames = caller_frames;
+        self.rust_call_depth -= 1;
+        self.frames = self.suspended_callers.pop().unwrap_or_default();
     }
 
     pub fn new_pending_promise(&mut self) -> (Value, ObjRef) {
@@ -74,22 +94,16 @@ impl Vm {
 
     pub fn new_host_promise(&mut self) -> (Value, HostPromise) {
         let (v, obj) = self.new_pending_promise();
-        self.pending_host_count += 1;
-        (v, HostPromise { promise: obj })
-    }
-
-    pub(super) fn settle_host_promise(&mut self, promise: ObjRef, outcome: Result<Value, Value>) {
-        let was_pending = matches!(
-            promise.borrow().kind,
-            ObjKind::Promise(ref pd) if matches!(pd.state, PromiseState::Pending)
-        );
-        if was_pending {
-            self.pending_host_count = self.pending_host_count.saturating_sub(1);
-        }
-        match outcome {
-            Ok(v) => self.resolve_promise(promise, v),
-            Err(e) => self.settle_promise(promise, Err(e)),
-        }
+        self.pending_host_count
+            .set(self.pending_host_count.get() + 1);
+        (
+            v,
+            HostPromise {
+                promise: obj,
+                settled: Cell::new(false),
+                pending_host_count: self.pending_host_count.clone(),
+            },
+        )
     }
 
     pub fn coerce_to_promise(&mut self, v: Value) -> ObjRef {
@@ -122,18 +136,19 @@ impl Vm {
                 );
                 return;
             }
-            let then_fn = {
-                let b = o.borrow();
-                match b.props.get("then") {
-                    Some(PropSlot::Value(v)) if is_callable(v) => Some(v.clone()),
-                    _ => None,
+            // プロトタイプ上のメソッドや getter も含めて `then` を参照する（T-28）。
+            let then_prop = match self.get_prop(&value, "then") {
+                Ok(v) => v,
+                Err(e) => {
+                    self.settle_promise(promise, Err(e));
+                    return;
                 }
             };
-            if let Some(then_fn) = then_fn {
+            if is_callable(&then_prop) {
                 self.microtasks.push_back(MicrotaskJob::ResolveThenable {
                     promise,
                     thenable: value,
-                    then_fn,
+                    then_fn: then_prop,
                 });
                 return;
             }
@@ -303,12 +318,20 @@ impl Vm {
                     }
                 };
                 if let Some(val) = rejected_val {
-                    (self.on_unhandled_rejection)(&val);
+                    if self.has_custom_unhandled_hook {
+                        (self.on_unhandled_rejection)(&val);
+                    } else {
+                        let msg = format!(
+                            "UnhandledPromiseRejection: {}",
+                            self.to_display_string(&val)
+                        );
+                        (self.on_log)(&msg);
+                    }
                 }
             }
         }
         self.maybe_gc_if_top_level();
-        if self.pending_host_count > 0 {
+        if self.pending_host_count.get() > 0 {
             PumpState::Waiting
         } else {
             PumpState::Idle
