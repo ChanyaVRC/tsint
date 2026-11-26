@@ -42,7 +42,7 @@ impl Compiler {
                 for p in props {
                     self.emit(OpCode::Dup, line);
                     if rest.is_some() && !matches!(p.key, PropertyKey::Computed(_)) {
-                        used_keys.push(property_key_static_name(&p.key).into_owned());
+                        used_keys.push(property_key_static_name(&p.key, line)?.into_owned());
                     }
                     self.emit_get_prop_key(&p.key, line)?;
                     self.compile_bind_pattern(&p.value, line)?;
@@ -106,7 +106,7 @@ impl Compiler {
                         ObjectProp::KeyValue { key, value, .. } => {
                             self.emit(OpCode::Dup, line);
                             if has_spread && !matches!(key, PropertyKey::Computed(_)) {
-                                used_keys.push(property_key_static_name(key).into_owned());
+                                used_keys.push(property_key_static_name(key, line)?.into_owned());
                             }
                             self.emit_get_prop_key(key, line)?;
                             self.compile_assign_target_leaf(value, line)?;
@@ -156,7 +156,7 @@ impl Compiler {
                         self.emit(OpCode::SetIndex, line);
                     }
                     _ => {
-                        let name = property_key_static_name(prop);
+                        let name = property_key_static_name(prop, line)?;
                         let c = self.add_const_str(&name);
                         self.emit(OpCode::SetProp(c), line);
                     }
@@ -175,9 +175,10 @@ impl Compiler {
         f: &Function,
         name: &str,
     ) -> CResult<FunctionTemplate> {
-        self.funcs.push(FuncCtx::new(name));
+        let line = f.span.start.line;
+        self.funcs.push(FuncCtx::new(name, f.is_async));
         if !f.is_arrow {
-            let this_slot = self.cur().alloc_slot();
+            let this_slot = self.cur().alloc_slot(line)?;
             self.cur().locals.push(LocalVar {
                 name: "%this".into(),
                 slot: this_slot,
@@ -190,7 +191,7 @@ impl Compiler {
             if !p.rest && p.default.is_none() {
                 if let Pattern::Ident(pname) = &p.pattern {
                     if self.cur().find_local(pname).is_none() {
-                        self.declare_local(pname);
+                        self.declare_local(pname, line)?;
                         simple_prefix += 1;
                         continue;
                     }
@@ -202,12 +203,11 @@ impl Compiler {
         self.cur().chunk.needs_raw_args = simple_prefix < f.params.len();
 
         for (i, p) in f.params.iter().enumerate().skip(simple_prefix) {
-            let line = f.span.start.line;
             if p.rest {
                 has_rest = true;
                 self.emit(OpCode::GetRestArgs(i as u16), line);
                 for name in pattern_names(&p.pattern) {
-                    self.declare_local(name);
+                    self.declare_local(name, line)?;
                 }
                 self.compile_bind_pattern(&p.pattern, line)?;
                 continue;
@@ -217,22 +217,23 @@ impl Compiler {
                 self.emit_default_if_undefined(def, line)?;
             }
             for name in pattern_names(&p.pattern) {
-                self.declare_local(name);
+                self.declare_local(name, line)?;
             }
             self.compile_bind_pattern(&p.pattern, line)?;
         }
 
         if let Some(body) = &f.body {
+            self.hoist_function_vars(body)?;
             self.hoist_and_compile(body)?;
-            let line = f.span.end.line;
-            self.emit(OpCode::LoadUndefined, line);
-            self.emit(OpCode::Return, line);
+            let end_line = f.span.end.line;
+            self.emit(OpCode::LoadUndefined, end_line);
+            self.emit(OpCode::Return, end_line);
         } else if let Some(expr_body) = &f.expr_body {
             self.compile_expr(expr_body)?;
             self.emit(OpCode::Return, expr_body.span.start.line);
         } else {
-            self.emit(OpCode::LoadUndefined, f.span.start.line);
-            self.emit(OpCode::Return, f.span.start.line);
+            self.emit(OpCode::LoadUndefined, line);
+            self.emit(OpCode::Return, line);
         }
 
         let fctx = self.funcs.pop().unwrap();
@@ -264,7 +265,7 @@ impl Compiler {
         let mut instance_fields = Vec::new();
 
         for m in &c.members {
-            let mname = property_key_static_name(&m.name);
+            let mname = property_key_static_name(&m.name, line)?;
             if mname == "<static-block>" {
                 continue;
             }
@@ -322,14 +323,15 @@ impl Compiler {
     }
 
     fn compile_field_initializer(&mut self, e: &Expr) -> CResult<Rc<FunctionTemplate>> {
-        self.funcs.push(FuncCtx::new("<field-init>"));
-        let this_slot = self.cur().alloc_slot();
+        let line = e.span.start.line;
+        self.funcs.push(FuncCtx::new("<field-init>", false));
+        let this_slot = self.cur().alloc_slot(line)?;
         self.cur().locals.push(LocalVar {
             name: "%this".into(),
             slot: this_slot,
         });
         self.compile_expr(e)?;
-        self.emit(OpCode::Return, e.span.start.line);
+        self.emit(OpCode::Return, line);
         let fctx = self.funcs.pop().unwrap();
         Ok(Rc::new(FunctionTemplate {
             name: Rc::from("<field-init>"),

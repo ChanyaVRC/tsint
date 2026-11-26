@@ -1,10 +1,11 @@
 //! `Array.prototype` メソッド群。
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
 use super::{arg, lookup_method, norm_index};
 use crate::value::*;
-use crate::vm::{array_values, Vm};
+use crate::vm::{array_values, to_number, Vm};
 
 const ARRAY_METHODS: &[(&str, usize)] = &[
     ("push", 1),
@@ -126,6 +127,10 @@ pub(super) fn call_array_method(
                 Some(Value::Str(s)) => Cow::Borrowed(&**s),
                 Some(v) => Cow::Owned(vm.to_display_string(v)),
             };
+            let root_ptr = match &this {
+                Value::Object(o) => Rc::as_ptr(o) as usize,
+                _ => 0,
+            };
             let rc = crate::vm::with_str_buf_rc(|out| {
                 with_array_ref(&this, |items| {
                     for (i, it) in items.iter().enumerate() {
@@ -133,7 +138,11 @@ pub(super) fn call_array_method(
                             out.push_str(&sep);
                         }
                         if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
-                            crate::vm::to_string_into(it, out);
+                            if root_ptr != 0 {
+                                crate::vm::to_string_into_with_root(it, root_ptr, out);
+                            } else {
+                                crate::vm::to_string_into(it, out);
+                            }
                         }
                     }
                 });
@@ -143,9 +152,15 @@ pub(super) fn call_array_method(
         "indexOf" => {
             let target = args.first().unwrap_or(&Value::Undefined);
             let idx = with_array_ref(&this, |items| {
-                items
-                    .iter()
-                    .position(|v| crate::value::strict_eq(v, target))
+                let start = array_from_index(args.get(1), items.len());
+                if start >= items.len() {
+                    None
+                } else {
+                    items[start..]
+                        .iter()
+                        .position(|v| crate::value::strict_eq(v, target))
+                        .map(|rel| start + rel)
+                }
             })
             .flatten();
             Ok(Value::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
@@ -153,7 +168,12 @@ pub(super) fn call_array_method(
         "includes" => {
             let target = args.first().unwrap_or(&Value::Undefined);
             let found = with_array_ref(&this, |items| {
-                items.iter().any(|v| same_value_zero(v, target))
+                let start = array_from_index(args.get(1), items.len());
+                if start >= items.len() {
+                    false
+                } else {
+                    items[start..].iter().any(|v| same_value_zero(v, target))
+                }
             })
             .unwrap_or(false);
             Ok(Value::Bool(found))
@@ -234,6 +254,36 @@ pub(super) fn call_array_method(
         .map(|ok| Value::Bool(ok.unwrap_or(true))),
         _ => return None,
     })
+}
+
+/// `Array.prototype.{indexOf, includes}` の第 2 引数 `fromIndex` を正規化する（T-14）。
+fn array_from_index(arg: Option<&Value>, len: usize) -> usize {
+    let Some(v) = arg else {
+        return 0;
+    };
+    if matches!(v, Value::Undefined) {
+        return 0;
+    }
+    let n = to_number(v);
+    if n.is_nan() || (n.is_infinite() && n.is_sign_negative()) {
+        return 0;
+    }
+    if n.is_infinite() {
+        return len;
+    }
+    let t = n.trunc();
+    if t >= len as f64 {
+        len
+    } else if t < 0.0 {
+        let idx = (len as f64) + t;
+        if idx <= 0.0 {
+            0
+        } else {
+            idx as usize
+        }
+    } else {
+        t as usize
+    }
 }
 
 /// 配列を先頭から `len` 件走査し、配列全体を複製せずにコールバックを呼び出す共通ヘルパー。

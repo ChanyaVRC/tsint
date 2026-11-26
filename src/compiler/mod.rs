@@ -19,6 +19,8 @@ use pattern::pattern_names;
 
 /// 定数重複排除用のハッシュマップを遅延確保する閾値。
 const CONST_DEDUP_THRESHOLD: usize = 16;
+/// コンパイラの再帰深さ上限（T-6）。
+pub(super) const MAX_COMPILE_DEPTH: u32 = 128;
 
 #[derive(Debug, Clone)]
 pub struct CompileError {
@@ -68,6 +70,8 @@ pub(super) enum Ctrl {
     },
     TryFinally {
         finally: Rc<[Stmt]>,
+        /// この `try`/`catch` 本体内にインライン展開された `finally` コピーの命令範囲（T-13）。
+        excluded_ranges: Vec<(u32, u32)>,
     },
     FuncBoundary,
 }
@@ -75,12 +79,14 @@ pub(super) enum Ctrl {
 pub(super) struct FuncCtx {
     pub(super) chunk: ChunkBuilder,
     pub(super) locals: Vec<LocalVar>,
-    pub(super) next_slot: LocalIdx,
+    pub(super) next_slot: u32,
     pub(super) upvalues: Vec<UpvalueDesc>,
     pub(super) upvalue_names: Vec<Rc<str>>,
     pub(super) control: Vec<Ctrl>,
-    /// 例外の再送出に使う一時ローカルスロット（finally を含む関数のみ確保）。
-    exc_slot: Option<LocalIdx>,
+    /// `await` 式を許可するコンテキストか（async 関数・モジュールトップレベル、T-21）。
+    pub(super) allow_await: bool,
+    /// 現在ネストしているループの深さ（T-2 のループ内ブロックスコープ再束縛判定用）。
+    pub(super) loop_depth: u32,
     /// 定数表の重複排除キャッシュ（定数が多い関数でのみ遅延確保）。
     #[allow(clippy::box_collection)]
     str_consts: Option<Box<FastHashMap<Rc<str>, ConstIdx>>>,
@@ -89,7 +95,7 @@ pub(super) struct FuncCtx {
 }
 
 impl FuncCtx {
-    pub(super) fn new(name: impl Into<Rc<str>>) -> Self {
+    pub(super) fn new(name: impl Into<Rc<str>>, allow_await: bool) -> Self {
         FuncCtx {
             chunk: ChunkBuilder::new(name),
             locals: Vec::new(),
@@ -97,14 +103,18 @@ impl FuncCtx {
             upvalues: Vec::new(),
             upvalue_names: Vec::new(),
             control: vec![Ctrl::FuncBoundary],
-            exc_slot: None,
+            allow_await,
+            loop_depth: 0,
             str_consts: None,
             num_consts: None,
         }
     }
 
-    pub(super) fn alloc_slot(&mut self) -> LocalIdx {
-        let s = self.next_slot;
+    pub(super) fn alloc_slot(&mut self, line: u32) -> CResult<LocalIdx> {
+        if self.next_slot >= u16::MAX as u32 {
+            return Err(err(line, "ローカル変数スロット数が上限(65535)を超えました"));
+        }
+        let s = self.next_slot as LocalIdx;
         self.next_slot += 1;
         if self.next_slot as usize > self.chunk.num_locals {
             self.chunk.num_locals = self.next_slot as usize;
@@ -112,7 +122,7 @@ impl FuncCtx {
                 .captured_locals
                 .resize(self.chunk.num_locals, false);
         }
-        s
+        Ok(s)
     }
 
     pub(super) fn find_local(&self, name: &str) -> Option<LocalIdx> {
@@ -121,15 +131,6 @@ impl FuncCtx {
             .rev()
             .find(|l| &*l.name == name)
             .map(|l| l.slot)
-    }
-
-    pub(super) fn exc_slot(&mut self) -> LocalIdx {
-        if let Some(s) = self.exc_slot {
-            return s;
-        }
-        let s = self.alloc_slot();
-        self.exc_slot = Some(s);
-        s
     }
 }
 
@@ -141,6 +142,7 @@ pub(super) enum VarLoc {
 
 pub struct Compiler {
     pub(super) funcs: Vec<FuncCtx>,
+    pub(super) depth: u32,
 }
 
 // =====================================================================
@@ -150,12 +152,13 @@ pub struct Compiler {
 /// モジュール全体をトップレベル「関数」としてコンパイルする。
 pub fn compile_module(module: &Module) -> CResult<Rc<Chunk>> {
     let mut c = Compiler {
-        funcs: vec![FuncCtx::new(module.name.clone())],
+        funcs: vec![FuncCtx::new(module.name.clone(), true)],
+        depth: 0,
     };
     c.cur().chunk.is_module = true;
     // モジュールトップレベルの `this` は undefined（strict mode 相当）。
     // スロット 0 を this 用として予約しておく（LoadThis が読む）。
-    let this_slot = c.cur().alloc_slot();
+    let this_slot = c.cur().alloc_slot(0)?;
     c.cur().locals.push(LocalVar {
         name: "%this".into(),
         slot: this_slot,
@@ -264,7 +267,10 @@ pub fn compile_dynamic_function(param_names: &[String], body_src: &str) -> CResu
         _ => return Err(err(0, "new Function: 内部エラー（文の形が想定外です）")),
     };
 
-    let mut c = Compiler { funcs: Vec::new() };
+    let mut c = Compiler {
+        funcs: Vec::new(),
+        depth: 0,
+    };
     let template = c.compile_function(func_expr, "anonymous")?;
     Ok(template.chunk.clone())
 }
@@ -381,17 +387,50 @@ impl Compiler {
         }
     }
 
-    pub(super) fn declare_local(&mut self, name: &str) -> LocalIdx {
-        let slot = self.cur().alloc_slot();
+    pub(super) fn declare_local(&mut self, name: &str, line: u32) -> CResult<LocalIdx> {
+        let slot = self.cur().alloc_slot(line)?;
         self.cur().locals.push(LocalVar {
             name: Rc::from(name),
             slot,
         });
-        slot
+        Ok(slot)
     }
 
-    pub(super) fn temp_slot(&mut self) -> LocalIdx {
-        self.declare_local("%tmp")
+    pub(super) fn temp_slot(&mut self, line: u32) -> CResult<LocalIdx> {
+        self.declare_local("%tmp", line)
+    }
+
+    /// ブロックスコープ終了時に `locals` を切り詰め、非キャプチャスロットを再利用可能に戻す（T-11）。
+    pub(super) fn restore_scope(&mut self, saved_len: usize, saved_next_slot: u32) {
+        let f = self.cur();
+        f.locals.truncate(saved_len);
+        let mut rewind_to = saved_next_slot;
+        for s in saved_next_slot..f.next_slot {
+            if f.chunk
+                .captured_locals
+                .get(s as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                rewind_to = s + 1;
+            }
+        }
+        f.next_slot = rewind_to;
+    }
+
+    pub(super) fn enter_depth(&mut self, line: u32) -> CResult<()> {
+        if self.depth >= MAX_COMPILE_DEPTH {
+            return Err(err(
+                line,
+                "構文のネストが深すぎます（コンパイル深さ上限超過）",
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    pub(super) fn leave_depth(&mut self) {
+        self.depth -= 1;
     }
 
     fn resolve_upvalue(&mut self, level: usize, name: &str) -> Option<UpvalueIdx> {

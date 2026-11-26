@@ -1,13 +1,25 @@
 //! JSON（ストリーミングシリアライザ / バイトベースパーサ）。
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{define_props_obj, native, value_as_cow_str};
 use crate::value::*;
-use crate::vm::{number_to_js_string_into, with_str_buf_rc, Vm};
+use crate::vm::{is_internal_prop_key, number_to_js_string_into, with_str_buf_rc, Vm};
 
 /// `f64` で正確に表現できる JSON 整数桁数の高速パス上限。
 const FAST_INT_MAX_DIGITS: usize = 15;
+/// `JSON.stringify` / `JSON.parse` の最大ネスト深さ（T-6）。
+const MAX_JSON_DEPTH: usize = 128;
+
+thread_local! {
+    static JSON_VISITED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+enum JsonStringifyErr {
+    Circular,
+    MaxDepth,
+}
 
 pub(super) fn install_json(vm: &mut Vm) {
     define_props_obj(
@@ -16,17 +28,43 @@ pub(super) fn install_json(vm: &mut Vm) {
         [
             (
                 "stringify",
-                native("stringify", 1, |_vm, _this, args| {
-                    let indent = match args.get(2) {
-                        Some(Value::Number(n)) => n.max(0.0) as usize,
-                        _ => 0,
+                native("stringify", 1, |vm, _this, args| {
+                    // ES 仕様準拠: 数値は 0..=10 に丸め、文字列は先頭 10 文字に切る（T-12）。
+                    let indent_str: String = match args.get(2) {
+                        Some(Value::Number(n)) if n.is_finite() => {
+                            let count = n.trunc().clamp(0.0, 10.0) as usize;
+                            " ".repeat(count)
+                        }
+                        Some(Value::Number(n)) if *n > 0.0 => " ".repeat(10),
+                        Some(Value::Str(s)) => s.chars().take(10).collect(),
+                        _ => String::new(),
                     };
                     let target = args.first().unwrap_or(&Value::Undefined);
-                    let mut ok = false;
+                    let mut result: Result<bool, JsonStringifyErr> = Ok(false);
                     let rc = with_str_buf_rc(|out| {
-                        ok = json_stringify_into(target, indent, 0, out);
+                        JSON_VISITED.with(|cell| {
+                            if let Ok(mut visited) = cell.try_borrow_mut() {
+                                visited.clear();
+                                result =
+                                    json_stringify_into(target, &indent_str, 0, &mut visited, out);
+                                visited.clear();
+                            } else {
+                                let mut local = Vec::new();
+                                result =
+                                    json_stringify_into(target, &indent_str, 0, &mut local, out);
+                            }
+                        });
                     });
-                    Ok(if ok { Value::Str(rc) } else { Value::Undefined })
+                    match result {
+                        Ok(true) => Ok(Value::Str(rc)),
+                        Ok(false) => Ok(Value::Undefined),
+                        Err(JsonStringifyErr::Circular) => {
+                            Err(vm.type_error("Converting circular structure to JSON"))
+                        }
+                        Err(JsonStringifyErr::MaxDepth) => {
+                            Err(vm.range_error("Maximum JSON serialization depth exceeded"))
+                        }
+                    }
                 }),
             ),
             (
@@ -77,22 +115,28 @@ fn json_quote_into(s: &str, out: &mut String) {
     out.push('"');
 }
 
-fn push_indent(out: &mut String, spaces: usize) {
-    for _ in 0..spaces {
-        out.push(' ');
+fn push_indent(out: &mut String, indent: &str, level: usize) {
+    for _ in 0..level {
+        out.push_str(indent);
     }
 }
 
-fn json_stringify_into(v: &Value, indent: usize, depth: usize, out: &mut String) -> bool {
+fn json_stringify_into(
+    v: &Value,
+    indent: &str,
+    depth: usize,
+    visited: &mut Vec<usize>,
+    out: &mut String,
+) -> Result<bool, JsonStringifyErr> {
     match v {
-        Value::Undefined | Value::Uninit => false,
+        Value::Undefined | Value::Uninit => Ok(false),
         Value::Null => {
             out.push_str("null");
-            true
+            Ok(true)
         }
         Value::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });
-            true
+            Ok(true)
         }
         Value::Number(n) => {
             if n.is_finite() {
@@ -100,51 +144,68 @@ fn json_stringify_into(v: &Value, indent: usize, depth: usize, out: &mut String)
             } else {
                 out.push_str("null");
             }
-            true
+            Ok(true)
         }
         Value::Str(s) => {
             json_quote_into(s, out);
-            true
+            Ok(true)
         }
         Value::Object(o) => {
             let b = o.borrow();
-            match &b.kind {
-                ObjKind::Function(_) | ObjKind::Native(_) | ObjKind::Class(_) => false,
+            if matches!(
+                b.kind,
+                ObjKind::Function(_) | ObjKind::Native(_) | ObjKind::Class(_)
+            ) {
+                return Ok(false);
+            }
+            let ptr = Rc::as_ptr(o) as usize;
+            if visited.contains(&ptr) {
+                return Err(JsonStringifyErr::Circular);
+            }
+            if depth >= MAX_JSON_DEPTH {
+                return Err(JsonStringifyErr::MaxDepth);
+            }
+            visited.push(ptr);
+            let res = match &b.kind {
                 ObjKind::Array(items) => {
                     if items.is_empty() {
                         out.push_str("[]");
-                        return true;
-                    }
-                    out.push('[');
-                    if indent > 0 {
-                        out.push('\n');
-                    }
-                    for (i, it) in items.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                            if indent > 0 {
-                                out.push('\n');
+                        Ok(true)
+                    } else {
+                        out.push('[');
+                        if !indent.is_empty() {
+                            out.push('\n');
+                        }
+                        for (i, it) in items.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                                if !indent.is_empty() {
+                                    out.push('\n');
+                                }
+                            }
+                            if !indent.is_empty() {
+                                push_indent(out, indent, depth + 1);
+                            }
+                            if !json_stringify_into(it, indent, depth + 1, visited, out)? {
+                                out.push_str("null");
                             }
                         }
-                        if indent > 0 {
-                            push_indent(out, indent * (depth + 1));
+                        if !indent.is_empty() {
+                            out.push('\n');
+                            push_indent(out, indent, depth);
                         }
-                        if !json_stringify_into(it, indent, depth + 1, out) {
-                            out.push_str("null");
-                        }
+                        out.push(']');
+                        Ok(true)
                     }
-                    if indent > 0 {
-                        out.push('\n');
-                        push_indent(out, indent * depth);
-                    }
-                    out.push(']');
-                    true
                 }
                 _ => {
                     let start_len = out.len();
                     out.push('{');
                     let mut count = 0usize;
                     for (k, slot) in b.props.iter() {
+                        if is_internal_prop_key(k) {
+                            continue;
+                        }
                         let PropSlot::Value(val) = slot else {
                             continue;
                         };
@@ -152,13 +213,13 @@ fn json_stringify_into(v: &Value, indent: usize, depth: usize, out: &mut String)
                         if count > 0 {
                             out.push(',');
                         }
-                        if indent > 0 {
+                        if !indent.is_empty() {
                             out.push('\n');
-                            push_indent(out, indent * (depth + 1));
+                            push_indent(out, indent, depth + 1);
                         }
                         json_quote_into(k, out);
                         out.push(':');
-                        if json_stringify_into(val, indent, depth + 1, out) {
+                        if json_stringify_into(val, indent, depth + 1, visited, out)? {
                             count += 1;
                         } else {
                             out.truncate(entry_mark);
@@ -167,16 +228,19 @@ fn json_stringify_into(v: &Value, indent: usize, depth: usize, out: &mut String)
                     if count == 0 {
                         out.truncate(start_len);
                         out.push_str("{}");
-                        return true;
+                        Ok(true)
+                    } else {
+                        if !indent.is_empty() {
+                            out.push('\n');
+                            push_indent(out, indent, depth);
+                        }
+                        out.push('}');
+                        Ok(true)
                     }
-                    if indent > 0 {
-                        out.push('\n');
-                        push_indent(out, indent * depth);
-                    }
-                    out.push('}');
-                    true
                 }
-            }
+            };
+            visited.pop();
+            res
         }
     }
 }
@@ -196,6 +260,7 @@ struct JsonParser<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 fn json_parse(vm: &Vm, s: &str) -> Result<Value, JsonError> {
@@ -203,6 +268,7 @@ fn json_parse(vm: &Vm, s: &str) -> Result<Value, JsonError> {
         src: s,
         bytes: s.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     p.skip_ws();
     let v = p.parse_value(vm)?;
@@ -289,69 +355,85 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object(&mut self, vm: &Vm) -> Result<Value, JsonError> {
-        self.expect(b'{')?;
-        let mut obj_data = ObjData::new(ObjKind::Plain);
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(vm.alloc_obj(obj_data));
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(JsonError("JSON のネストが深すぎます".to_string()));
         }
-        loop {
+        self.depth += 1;
+        let res = (|| {
+            self.expect(b'{')?;
+            let mut obj_data = ObjData::new(ObjKind::Plain);
             self.skip_ws();
-            let key = self.parse_string_rc()?;
-            self.skip_ws();
-            self.expect(b':')?;
-            let val = self.parse_value(vm)?;
-            obj_data.props.set_value(key, val);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => {
-                    return Err(JsonError(format!(
-                        "',' か '}}' を期待しました（位置 {}）",
-                        self.pos
-                    )))
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Ok(vm.alloc_obj(obj_data));
+            }
+            loop {
+                self.skip_ws();
+                let key = self.parse_string_rc()?;
+                self.skip_ws();
+                self.expect(b':')?;
+                let val = self.parse_value(vm)?;
+                obj_data.props.set_value(key, val);
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        self.pos += 1;
+                    }
+                    Some(b'}') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => {
+                        return Err(JsonError(format!(
+                            "',' か '}}' を期待しました（位置 {}）",
+                            self.pos
+                        )))
+                    }
                 }
             }
-        }
-        Ok(vm.alloc_obj(obj_data))
+            Ok(vm.alloc_obj(obj_data))
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn parse_array(&mut self, vm: &Vm) -> Result<Value, JsonError> {
-        self.expect(b'[')?;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(vm.alloc_array(items));
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(JsonError("JSON のネストが深すぎます".to_string()));
         }
-        loop {
-            let v = self.parse_value(vm)?;
-            items.push(v);
+        self.depth += 1;
+        let res = (|| {
+            self.expect(b'[')?;
+            let mut items = Vec::new();
             self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => {
-                    return Err(JsonError(format!(
-                        "',' か ']' を期待しました（位置 {}）",
-                        self.pos
-                    )))
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Ok(vm.alloc_array(items));
+            }
+            loop {
+                let v = self.parse_value(vm)?;
+                items.push(v);
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        self.pos += 1;
+                    }
+                    Some(b']') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => {
+                        return Err(JsonError(format!(
+                            "',' か ']' を期待しました（位置 {}）",
+                            self.pos
+                        )))
+                    }
                 }
             }
-        }
-        Ok(vm.alloc_array(items))
+            Ok(vm.alloc_array(items))
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn parse_string_rc(&mut self) -> Result<Rc<str>, JsonError> {
@@ -390,16 +472,42 @@ impl<'a> JsonParser<'a> {
                         Some(b'b') => out.push('\u{8}'),
                         Some(b'f') => out.push('\u{c}'),
                         Some(b'u') => {
-                            if self.pos + 5 > self.bytes.len() {
-                                return Err(JsonError("不正な \\u エスケープです".to_string()));
-                            }
-                            let hex = &self.src[self.pos + 1..self.pos + 5];
-                            let code = u32::from_str_radix(hex, 16)
-                                .map_err(|_| JsonError("不正な \\u エスケープです".to_string()))?;
-                            if let Some(c) = char::from_u32(code) {
-                                out.push(c);
-                            }
+                            // バイト境界パニックを避けるため raw bytes から 4 桁 ASCII hex を読む（T-10）。
+                            let code = self
+                                .bytes
+                                .get(self.pos + 1..self.pos + 5)
+                                .and_then(parse_hex4_bytes)
+                                .ok_or_else(|| {
+                                    JsonError("不正な \\u エスケープです".to_string())
+                                })?;
                             self.pos += 4;
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                // サロゲートペアの結合（T-25）。
+                                let low =
+                                    if self.bytes.get(self.pos + 1..self.pos + 3) == Some(b"\\u") {
+                                        self.bytes
+                                            .get(self.pos + 3..self.pos + 7)
+                                            .and_then(parse_hex4_bytes)
+                                            .filter(|c| (0xDC00..=0xDFFF).contains(c))
+                                    } else {
+                                        None
+                                    };
+                                if let Some(lo) = low {
+                                    let cp = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                                    out.push(
+                                        char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
+                                    );
+                                    self.pos += 6;
+                                } else {
+                                    out.push(char::REPLACEMENT_CHARACTER);
+                                }
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                out.push(char::REPLACEMENT_CHARACTER);
+                            } else {
+                                out.push(
+                                    char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER),
+                                );
+                            }
                         }
                         _ => return Err(JsonError("不正なエスケープです".to_string())),
                     }
@@ -473,4 +581,22 @@ impl<'a> JsonParser<'a> {
             .map(Value::Number)
             .map_err(|_| JsonError("不正な数値です".to_string()))
     }
+}
+
+#[inline]
+fn parse_hex4_bytes(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    let mut v = 0u32;
+    for &b in bytes {
+        let d = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            _ => return None,
+        };
+        v = (v << 4) | d;
+    }
+    Some(v)
 }

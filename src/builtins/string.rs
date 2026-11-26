@@ -11,7 +11,7 @@ use super::{
     lookup_method, norm_index, slice_to_val, value_as_cow_str, with_chars_buf, with_regex_scratch,
 };
 use crate::value::*;
-use crate::vm::{ascii_char_rc, to_number, to_string_basic, with_str_buf_rc, Vm};
+use crate::vm::{ascii_char_rc, to_number, to_string_basic, with_str_buf_rc, Vm, MAX_STRING_BYTES};
 
 const STRING_METHODS: &[(&str, usize)] = &[
     ("slice", 2),
@@ -31,7 +31,43 @@ const STRING_METHODS: &[(&str, usize)] = &[
     ("codePointAt", 1),
     ("repeat", 1),
     ("padStart", 2),
+    ("padEnd", 2),
 ];
+
+#[inline]
+fn str_char_len(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
+    }
+}
+
+#[inline]
+fn char_pos_to_byte_offset(s: &str, char_pos: usize) -> usize {
+    if s.is_ascii() {
+        char_pos.min(s.len())
+    } else {
+        s.char_indices().nth(char_pos).map_or(s.len(), |(bi, _)| bi)
+    }
+}
+
+#[inline]
+fn clamp_str_pos(arg: Option<&Value>, default: usize, max: usize) -> usize {
+    match arg {
+        None | Some(Value::Undefined) => default,
+        Some(v) => {
+            let n = to_number(v);
+            if n.is_nan() || n <= 0.0 {
+                0
+            } else if n >= max as f64 {
+                max
+            } else {
+                n as usize
+            }
+        }
+    }
+}
 
 #[inline]
 fn str_code_at(s: &str, idx: usize) -> Option<f64> {
@@ -183,30 +219,65 @@ pub(super) fn call_string_method(
         "startsWith" => {
             let s = value_as_cow_str(&this);
             let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            Ok(Value::Bool(s.starts_with(p.as_ref())))
+            let matched = match args.get(1) {
+                None | Some(Value::Undefined) => s.starts_with(p.as_ref()),
+                pos_arg => {
+                    let len = str_char_len(&s);
+                    let start_char = clamp_str_pos(pos_arg, 0, len);
+                    let byte_start = char_pos_to_byte_offset(&s, start_char);
+                    s[byte_start..].starts_with(p.as_ref())
+                }
+            };
+            Ok(Value::Bool(matched))
         }
         "endsWith" => {
             let s = value_as_cow_str(&this);
             let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            Ok(Value::Bool(s.ends_with(p.as_ref())))
+            let matched = match args.get(1) {
+                None | Some(Value::Undefined) => s.ends_with(p.as_ref()),
+                pos_arg => {
+                    let len = str_char_len(&s);
+                    let end_char = clamp_str_pos(pos_arg, len, len);
+                    let byte_end = char_pos_to_byte_offset(&s, end_char);
+                    s[..byte_end].ends_with(p.as_ref())
+                }
+            };
+            Ok(Value::Bool(matched))
         }
         "includes" => {
             let s = value_as_cow_str(&this);
             let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
-            Ok(Value::Bool(s.contains(p.as_ref())))
+            let matched = match args.get(1) {
+                None | Some(Value::Undefined) => s.contains(p.as_ref()),
+                pos_arg => {
+                    let len = str_char_len(&s);
+                    let start_char = clamp_str_pos(pos_arg, 0, len);
+                    let byte_start = char_pos_to_byte_offset(&s, start_char);
+                    s[byte_start..].contains(p.as_ref())
+                }
+            };
+            Ok(Value::Bool(matched))
         }
         "indexOf" => {
             let s = value_as_cow_str(&this);
             let p = value_as_cow_str(args.first().unwrap_or(&Value::Undefined));
+            let (start_char, byte_start) = match args.get(1) {
+                None | Some(Value::Undefined) => (0usize, 0usize),
+                pos_arg => {
+                    let len = str_char_len(&s);
+                    let sc = clamp_str_pos(pos_arg, 0, len);
+                    (sc, char_pos_to_byte_offset(&s, sc))
+                }
+            };
             if p.is_empty() {
-                Ok(Value::Number(0.0))
-            } else if let Some(byte_idx) = s.find(p.as_ref()) {
-                let char_idx = if s.is_ascii() {
-                    byte_idx
+                Ok(Value::Number(start_char as f64))
+            } else if let Some(rel_byte) = s[byte_start..].find(p.as_ref()) {
+                let char_off = if s.is_ascii() {
+                    rel_byte
                 } else {
-                    s[..byte_idx].chars().count()
+                    s[byte_start..byte_start + rel_byte].chars().count()
                 };
-                Ok(Value::Number(char_idx as f64))
+                Ok(Value::Number((start_char + char_off) as f64))
             } else {
                 Ok(Value::Number(-1.0))
             }
@@ -307,49 +378,88 @@ pub(super) fn call_string_method(
         "repeat" => {
             let s = value_as_cow_str(&this);
             let n = to_number(args.first().unwrap_or(&Value::Undefined));
-            if n < 0.0 || !n.is_finite() {
+            if n < 0.0 || n.is_infinite() {
                 Err(vm.range_error("repeat count は非負の有限数である必要があります"))
             } else {
-                let count = n as usize;
-                Ok(Value::Str(with_str_buf_rc(|out| {
-                    out.reserve(s.len().saturating_mul(count));
-                    for _ in 0..count {
-                        out.push_str(&s);
+                let count = if n.is_nan() {
+                    0usize
+                } else if n > (MAX_STRING_BYTES as f64) {
+                    if s.is_empty() {
+                        0usize
+                    } else {
+                        return Some(Err(vm.range_error(format!(
+                            "repeat の結果文字列長が上限 ({MAX_STRING_BYTES}B) を超えています"
+                        ))));
                     }
-                })))
+                } else {
+                    n as usize
+                };
+                let total_bytes = s.len().saturating_mul(count);
+                if total_bytes > MAX_STRING_BYTES {
+                    Err(vm.range_error(format!(
+                        "repeat の結果文字列長が上限 ({MAX_STRING_BYTES}B) を超えています"
+                    )))
+                } else {
+                    Ok(Value::Str(with_str_buf_rc(|out| {
+                        out.reserve(total_bytes);
+                        for _ in 0..count {
+                            out.push_str(&s);
+                        }
+                    })))
+                }
             }
         }
-        "padStart" => {
+        "padStart" | "padEnd" => {
+            let is_start = name == "padStart";
             let s = value_as_cow_str(&this);
-            let target_len = to_number(args.first().unwrap_or(&Value::Undefined)) as usize;
+            let target_n = to_number(args.first().unwrap_or(&Value::Undefined));
             let pad = match args.get(1) {
+                Some(Value::Undefined) | None => Cow::Borrowed(" "),
                 Some(v) => value_as_cow_str(v),
-                None => Cow::Borrowed(" "),
             };
-            let cur_len = if s.is_ascii() {
-                s.len()
-            } else {
-                s.chars().count()
-            };
-            if cur_len >= target_len || pad.is_empty() {
+            let cur_len = str_char_len(&s);
+            if target_n.is_nan() || target_n <= cur_len as f64 || pad.is_empty() {
                 if let Value::Str(rc) = &this {
                     Ok(Value::Str(rc.clone()))
                 } else {
                     Ok(Value::str(s.as_ref()))
                 }
+            } else if target_n.is_infinite() || target_n > (MAX_STRING_BYTES as f64) {
+                Err(vm.range_error(format!(
+                    "{name} の結果文字列長が上限 ({MAX_STRING_BYTES}B) を超えています"
+                )))
             } else {
+                let target_len = target_n as usize;
                 let need = target_len - cur_len;
                 let pad_chars: Vec<char> = pad.chars().collect();
-                Ok(Value::Str(with_str_buf_rc(|out| {
-                    out.reserve(need + s.len());
-                    let mut written = 0usize;
-                    while written < need {
-                        let take = (need - written).min(pad_chars.len());
-                        out.extend(&pad_chars[..take]);
-                        written += take;
-                    }
-                    out.push_str(&s);
-                })))
+                let full_reps = need / pad_chars.len();
+                let rem_chars = need % pad_chars.len();
+                let rem_bytes: usize = pad_chars[..rem_chars].iter().map(|c| c.len_utf8()).sum();
+                let pad_total_bytes = full_reps
+                    .saturating_mul(pad.len())
+                    .saturating_add(rem_bytes);
+                let result_bytes = s.len().saturating_add(pad_total_bytes);
+                if result_bytes > MAX_STRING_BYTES {
+                    Err(vm.range_error(format!(
+                        "{name} の結果文字列長が上限 ({MAX_STRING_BYTES}B) を超えています"
+                    )))
+                } else {
+                    Ok(Value::Str(with_str_buf_rc(|out| {
+                        out.reserve(result_bytes);
+                        if !is_start {
+                            out.push_str(&s);
+                        }
+                        for _ in 0..full_reps {
+                            out.push_str(&pad);
+                        }
+                        if rem_chars > 0 {
+                            out.extend(&pad_chars[..rem_chars]);
+                        }
+                        if is_start {
+                            out.push_str(&s);
+                        }
+                    })))
+                }
             }
         }
         _ => return None,

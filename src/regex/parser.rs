@@ -44,11 +44,15 @@ enum ClassEscape {
     Atom(ClassAtom),
 }
 
+/// 正規表現のグループネスト上限（T-6: スタックオーバーフロー防止、`MAX_LOOK_DEPTH` より大きい値）。
+const MAX_GROUP_DEPTH: usize = 280;
+
 pub(super) struct Parser {
     chars: Vec<char>,
     pos: usize,
     pub(super) ncaptures: usize,
     total_captures: usize,
+    depth: usize,
 }
 
 /// パターン全体を前もって走査し、キャプチャグループの総数を数える
@@ -84,6 +88,7 @@ impl Parser {
             pos: 0,
             ncaptures: 0,
             total_captures,
+            depth: 0,
         }
     }
 
@@ -278,6 +283,18 @@ impl Parser {
     }
 
     fn parse_group(&mut self) -> Result<Ast, RegexError> {
+        if self.depth >= MAX_GROUP_DEPTH {
+            return Err(RegexError(
+                "正規表現のグループネストが深すぎます".to_string(),
+            ));
+        }
+        self.depth += 1;
+        let res = self.parse_group_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_group_inner(&mut self) -> Result<Ast, RegexError> {
         self.pos += 1; // '('
         let wrap: Option<fn(Box<Ast>) -> Ast> = if self.eat('?') {
             if self.eat(':') {

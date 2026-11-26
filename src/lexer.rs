@@ -187,6 +187,21 @@ fn regex_allowed_after(kind: &TokenKind) -> bool {
 }
 
 #[inline]
+/// 16/8/2 進整数リテラルを `u64` 範囲外でも黙って 0 にせず `f64` へ変換する（T-24）。
+fn parse_radix_int_f64(digits: &str, radix: u32) -> f64 {
+    if let Ok(n) = u64::from_str_radix(digits, radix) {
+        return n as f64;
+    }
+    let mut acc = 0.0f64;
+    let base = radix as f64;
+    for c in digits.chars() {
+        if let Some(d) = c.to_digit(radix) {
+            acc = acc * base + d as f64;
+        }
+    }
+    acc
+}
+
 fn is_ascii_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b == b'$'
 }
@@ -506,13 +521,13 @@ impl<'a> Lexer<'a> {
             // BigInt サフィックス 'n' は読み飛ばす（値としては通常数値扱い）。
             self.eat_byte(b'n');
             let v = if !has_sep {
-                i64::from_str_radix(&self.src[dig_start..dig_end], radix).unwrap_or(0) as f64
+                parse_radix_int_f64(&self.src[dig_start..dig_end], radix)
             } else {
                 let digits: String = self.src[dig_start..dig_end]
                     .chars()
                     .filter(|&c| c != '_')
                     .collect();
-                i64::from_str_radix(&digits, radix).unwrap_or(0) as f64
+                parse_radix_int_f64(&digits, radix)
             };
             return Ok(TokenKind::Number(v));
         }
@@ -632,26 +647,38 @@ impl<'a> Lexer<'a> {
         Ok(TokenKind::Str(s))
     }
 
-    fn read_fixed_hex_escape(&mut self, digits: usize, out: &mut String) {
+    fn read_fixed_hex_escape(&mut self, digits: usize) -> Result<u32, LexError> {
         let mut code = 0u32;
-        let mut ok = true;
         for _ in 0..digits {
-            if let Some(h) = self.peek_char() {
-                self.advance_char();
-                if let Some(d) = h.to_digit(16) {
-                    code = (code << 4) | d;
-                } else {
-                    ok = false;
-                }
-            } else {
-                ok = false;
-            }
+            let Some(h) = self.peek_char() else {
+                return Err(self.err("不正な16進/Unicodeエスケープです"));
+            };
+            let Some(d) = h.to_digit(16) else {
+                // 不正な文字（閉じ引用符など）を消費せずに即エラーにする（T-25）。
+                return Err(self.err("不正な16進/Unicodeエスケープです"));
+            };
+            self.advance_char();
+            code = (code << 4) | d;
         }
-        if ok {
-            if let Some(ch) = char::from_u32(code) {
-                out.push(ch);
-            }
+        Ok(code)
+    }
+
+    fn peek_low_surrogate_escape(&self) -> Option<u32> {
+        let rest = self.bytes.get(self.pos..self.pos + 6)?;
+        if rest[0] != b'\\' || rest[1] != b'u' {
+            return None;
         }
+        let mut lo = 0u32;
+        for &b in &rest[2..6] {
+            let d = match b {
+                b'0'..=b'9' => (b - b'0') as u32,
+                b'a'..=b'f' => (b - b'a' + 10) as u32,
+                b'A'..=b'F' => (b - b'A' + 10) as u32,
+                _ => return None,
+            };
+            lo = (lo << 4) | d;
+        }
+        (0xDC00..=0xDFFF).contains(&lo).then_some(lo)
     }
 
     fn read_escape(&mut self, out: &mut String) -> Result<(), LexError> {
@@ -670,35 +697,50 @@ impl<'a> Lexer<'a> {
             '\r' => {
                 self.eat_byte(b'\n');
             }
-            'x' => self.read_fixed_hex_escape(2, out),
+            'x' => {
+                let code = self.read_fixed_hex_escape(2)?;
+                out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
             'u' => {
                 if self.peek_byte() == Some(b'{') {
                     self.advance_ascii();
                     let mut code = 0u32;
                     let mut any = false;
-                    let mut ok = true;
                     while let Some(h) = self.peek_char() {
                         if h == '}' {
                             break;
                         }
+                        let Some(d) = h.to_digit(16) else {
+                            return Err(self.err("不正な \\u{...} エスケープです"));
+                        };
                         self.advance_char();
                         any = true;
-                        match h
-                            .to_digit(16)
-                            .and_then(|d| code.checked_mul(16).and_then(|v| v.checked_add(d)))
-                        {
-                            Some(next) => code = next,
-                            None => ok = false,
-                        }
+                        code = code
+                            .checked_mul(16)
+                            .and_then(|v| v.checked_add(d))
+                            .ok_or_else(|| self.err("Unicode コードポイントが範囲外です"))?;
                     }
-                    self.eat_byte(b'}');
-                    if any && ok {
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
-                        }
+                    if !any || !self.eat_byte(b'}') || code > 0x10_FFFF {
+                        return Err(self.err("不正な \\u{...} エスケープです"));
                     }
+                    out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
                 } else {
-                    self.read_fixed_hex_escape(4, out);
+                    let code = self.read_fixed_hex_escape(4)?;
+                    if (0xD800..=0xDBFF).contains(&code) {
+                        // UTF-16 サロゲートペアを結合する（T-25）。
+                        if let Some(lo) = self.peek_low_surrogate_escape() {
+                            self.pos += 6;
+                            self.col += 6;
+                            let cp = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                            out.push(char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER));
+                        } else {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                        }
+                    } else if (0xDC00..=0xDFFF).contains(&code) {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                    } else {
+                        out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+                    }
                 }
             }
             other => out.push(other),

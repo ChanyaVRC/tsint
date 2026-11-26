@@ -5,7 +5,42 @@ use std::rc::Rc;
 use crate::value::*;
 
 use super::ops::{to_number, to_property_key_string};
-use super::{KindTag, Vm};
+use super::{KindTag, Vm, MAX_ARRAY_LEN};
+
+/// `#private` や `%time` 等の内部プロパティキーかどうか（T-23）。
+#[inline]
+pub(crate) fn is_internal_prop_key(k: &str) -> bool {
+    k.starts_with('#') || k.starts_with('%')
+}
+
+/// ES 仕様の正規な配列添字文字列か判定して `usize` へ変換する（T-23）。
+/// `"01"`・`"+1"`・空白付き等は配列添字として扱わない。
+#[inline]
+pub(crate) fn parse_canonical_array_index(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.len() == 1 {
+        let b = bytes[0];
+        return (b.is_ascii_digit()).then_some((b - b'0') as usize);
+    }
+    if !(b'1'..=b'9').contains(&bytes[0]) || bytes.len() > 10 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + (b - b'0') as u64;
+    }
+    if val < u32::MAX as u64 {
+        usize::try_from(val).ok()
+    } else {
+        None
+    }
+}
 
 /// オブジェクトまたは配列の列挙可能な own キー一覧を返す（`for...in` / `Object.keys` 共通）。
 pub(crate) fn own_enumerable_keys(v: &Value) -> Vec<Value> {
@@ -19,7 +54,7 @@ pub(crate) fn own_enumerable_keys(v: &Value) -> Vec<Value> {
                 _ => b
                     .props
                     .iter()
-                    .filter(|(_, s)| matches!(s, PropSlot::Value(_)))
+                    .filter(|(k, s)| matches!(s, PropSlot::Value(_)) && !is_internal_prop_key(k))
                     .map(|(k, _)| Value::Str(k.clone()))
                     .collect(),
             }
@@ -46,10 +81,9 @@ fn kind_prop_lookup(kind: &ObjKind, name: &str) -> Option<Value> {
         ObjKind::Array(items) => {
             if name == "length" {
                 Some(Value::Number(items.len() as f64))
-            } else if let Ok(idx) = name.parse::<usize>() {
-                Some(items.get(idx).cloned().unwrap_or(Value::Undefined))
             } else {
-                None
+                parse_canonical_array_index(name)
+                    .map(|idx| items.get(idx).cloned().unwrap_or(Value::Undefined))
             }
         }
         ObjKind::Map(m) => (name == "size").then(|| Value::Number(m.entries.len() as f64)),
@@ -264,10 +298,27 @@ impl Vm {
             }
             if let ObjKind::Array(items) = &mut b.kind {
                 if name == "length" {
-                    let n = to_number(&value).max(0.0) as usize;
-                    items.resize(n, Value::Undefined);
+                    let n = to_number(&value);
+                    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > (u32::MAX as f64) {
+                        drop(b);
+                        return Err(self.range_error("Invalid array length"));
+                    }
+                    let new_len = n as usize;
+                    if new_len > MAX_ARRAY_LEN {
+                        drop(b);
+                        return Err(self.range_error(format!(
+                            "Invalid array length: 上限 ({MAX_ARRAY_LEN}) を超えています"
+                        )));
+                    }
+                    items.resize(new_len, Value::Undefined);
                     return Ok(());
-                } else if let Ok(idx) = name.parse::<usize>() {
+                } else if let Some(idx) = parse_canonical_array_index(name) {
+                    if idx >= MAX_ARRAY_LEN {
+                        drop(b);
+                        return Err(self.range_error(format!(
+                            "配列添字 {idx} が上限 ({MAX_ARRAY_LEN}) を超えています"
+                        )));
+                    }
                     if idx >= items.len() {
                         items.resize(idx + 1, Value::Undefined);
                     }
@@ -294,22 +345,24 @@ impl Vm {
     }
 
     fn find_proto_accessor_setter(&self, obj_rc: &ObjRef, name: &str) -> Option<Value> {
-        let b = obj_rc.borrow();
-        if let Some(PropSlot::Accessor(acc)) = b.props.get(name) {
-            return acc.set.clone();
+        let mut cur = Some(obj_rc.clone());
+        while let Some(o) = cur {
+            let b = o.borrow();
+            if let Some(slot) = b.props.get(name) {
+                return match slot {
+                    PropSlot::Accessor(acc) => acc.set.clone(),
+                    PropSlot::Value(_) => None,
+                };
+            }
+            cur = b.proto.clone();
         }
-        if b.props.get(name).is_some() {
-            return None;
-        }
-        let proto = b.proto.clone();
-        drop(b);
-        proto.and_then(|p| self.find_proto_accessor_setter(&p, name))
+        None
     }
 
     pub(super) fn delete_prop(&mut self, obj: &Value, name: &str) -> bool {
         if let Value::Object(o) = obj {
             if let ObjKind::Array(items) = &mut o.borrow_mut().kind {
-                if let Ok(idx) = name.parse::<usize>() {
+                if let Some(idx) = parse_canonical_array_index(name) {
                     if idx < items.len() {
                         items[idx] = Value::Undefined;
                         return true;
@@ -322,20 +375,21 @@ impl Vm {
     }
 
     pub fn has_prop(&self, o: &ObjRef, name: &str) -> bool {
-        let b = o.borrow();
-        if b.props.get(name).is_some() {
-            return true;
-        }
-        if let ObjKind::Array(items) = &b.kind {
-            if name == "length" {
+        let mut cur = Some(o.clone());
+        while let Some(obj) = cur {
+            let b = obj.borrow();
+            if b.props.get(name).is_some() {
                 return true;
             }
-            if let Ok(i) = name.parse::<usize>() {
-                return i < items.len();
+            if let ObjKind::Array(items) = &b.kind {
+                if name == "length" {
+                    return true;
+                }
+                if let Some(i) = parse_canonical_array_index(name) {
+                    return i < items.len();
+                }
             }
-        }
-        if let Some(p) = &b.proto {
-            return self.has_prop(p, name);
+            cur = b.proto.clone();
         }
         false
     }
@@ -366,32 +420,88 @@ impl Vm {
     }
 
     pub(super) fn op_instanceof(&self, left: &Value, right: &Value) -> Result<Value, Value> {
-        let proto_target = match right {
+        enum RightTarget {
+            Proto(ObjRef),
+            Builtin(BuiltinCtorTag),
+            CallableNoProto,
+        }
+        let target = match right {
             Value::Object(o) => {
                 let b = o.borrow();
                 match &b.kind {
-                    ObjKind::Class(cd) => Some(cd.prototype.clone()),
-                    _ => match b.props.get("prototype") {
-                        Some(PropSlot::Value(Value::Object(p))) => Some(p.clone()),
-                        _ => None,
+                    ObjKind::Class(cd) => Some(RightTarget::Proto(cd.prototype.clone())),
+                    ObjKind::Native(n) => {
+                        if let Some(tag) = n.ctor_tag {
+                            Some(RightTarget::Builtin(tag))
+                        } else if let Some(PropSlot::Value(Value::Object(p))) =
+                            b.props.get("prototype")
+                        {
+                            Some(RightTarget::Proto(p.clone()))
+                        } else {
+                            Some(RightTarget::CallableNoProto)
+                        }
+                    }
+                    ObjKind::Function(_) => match b.props.get("prototype") {
+                        Some(PropSlot::Value(Value::Object(p))) => {
+                            Some(RightTarget::Proto(p.clone()))
+                        }
+                        _ => Some(RightTarget::CallableNoProto),
                     },
+                    _ => None,
                 }
             }
             _ => None,
         };
-        let Some(proto) = proto_target else {
+        let Some(target) = target else {
             return Err(self.type_error("instanceof の右辺はコンストラクタではありません"));
         };
         let Value::Object(lo) = left else {
             return Ok(Value::Bool(false));
         };
-        let mut cur = lo.borrow().proto.clone();
-        while let Some(p) = cur {
-            if Rc::ptr_eq(&p, &proto) {
-                return Ok(Value::Bool(true));
+        match target {
+            RightTarget::CallableNoProto => Ok(Value::Bool(false)),
+            RightTarget::Builtin(tag) => {
+                let lb = lo.borrow();
+                let matched = match tag {
+                    BuiltinCtorTag::Object => true,
+                    BuiltinCtorTag::Function => matches!(
+                        lb.kind,
+                        ObjKind::Function(_) | ObjKind::Native(_) | ObjKind::Class(_)
+                    ),
+                    BuiltinCtorTag::Array => matches!(lb.kind, ObjKind::Array(_)),
+                    BuiltinCtorTag::Map => matches!(lb.kind, ObjKind::Map(_)),
+                    BuiltinCtorTag::Set => matches!(lb.kind, ObjKind::Set(_)),
+                    BuiltinCtorTag::Promise => matches!(lb.kind, ObjKind::Promise(_)),
+                    BuiltinCtorTag::RegExp => matches!(lb.kind, ObjKind::Regex(_)),
+                    BuiltinCtorTag::Date => {
+                        matches!(lb.kind, ObjKind::Plain) && lb.props.get("%time").is_some()
+                    }
+                    BuiltinCtorTag::Error => matches!(lb.kind, ObjKind::Error),
+                    BuiltinCtorTag::TypeError => is_error_named(&lb, "TypeError"),
+                    BuiltinCtorTag::RangeError => is_error_named(&lb, "RangeError"),
+                    BuiltinCtorTag::ReferenceError => is_error_named(&lb, "ReferenceError"),
+                    BuiltinCtorTag::SyntaxError => is_error_named(&lb, "SyntaxError"),
+                };
+                Ok(Value::Bool(matched))
             }
-            cur = p.borrow().proto.clone();
+            RightTarget::Proto(proto) => {
+                let mut cur = lo.borrow().proto.clone();
+                while let Some(p) = cur {
+                    if Rc::ptr_eq(&p, &proto) {
+                        return Ok(Value::Bool(true));
+                    }
+                    cur = p.borrow().proto.clone();
+                }
+                Ok(Value::Bool(false))
+            }
         }
-        Ok(Value::Bool(false))
     }
+}
+
+fn is_error_named(b: &ObjData, expected: &str) -> bool {
+    matches!(b.kind, ObjKind::Error)
+        && matches!(
+            b.props.get("name"),
+            Some(PropSlot::Value(Value::Str(s))) if &**s == expected
+        )
 }

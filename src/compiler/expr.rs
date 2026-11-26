@@ -81,6 +81,13 @@ impl Compiler {
 
     pub(super) fn compile_expr(&mut self, e: &Expr) -> CResult<()> {
         let line = e.span.start.line;
+        self.enter_depth(line)?;
+        let res = self.compile_expr_inner(e, line);
+        self.leave_depth();
+        res
+    }
+
+    fn compile_expr_inner(&mut self, e: &Expr, line: u32) -> CResult<()> {
         match &e.kind {
             ExprKind::NumberLit(n) => {
                 if n.fract() == 0.0
@@ -198,6 +205,12 @@ impl Compiler {
             }
             ExprKind::Spread(_) => return Err(err(line, "スプレッドはここでは使えません")),
             ExprKind::Await(inner) => {
+                if !self.cur().allow_await {
+                    return Err(err(
+                        line,
+                        "await は async 関数またはモジュールトップレベルでのみ使用できます",
+                    ));
+                }
                 self.compile_expr(inner)?;
                 self.emit(OpCode::Await, line);
             }
@@ -256,7 +269,7 @@ impl Compiler {
                         self.emit(OpCode::ObjectSetComputed, line);
                     }
                     _ => {
-                        let name = property_key_static_name(key);
+                        let name = property_key_static_name(key, line)?;
                         self.compile_expr(value)?;
                         let c = self.add_const_str(&name);
                         self.emit(OpCode::ObjectSetProp(c), line);
@@ -266,18 +279,31 @@ impl Compiler {
                     key,
                     function,
                     kind,
-                } => {
-                    let name = property_key_static_name(key);
-                    let tpl = self.compile_function(function, &name)?;
-                    let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
-                    self.emit(OpCode::MakeClosure(c), line);
-                    let nc = self.add_const_str(&name);
-                    match kind {
-                        MethodKind::Normal => self.emit(OpCode::ObjectSetMethod(nc), line),
-                        MethodKind::Get => self.emit(OpCode::ObjectDefineGetter(nc), line),
-                        MethodKind::Set => self.emit(OpCode::ObjectDefineSetter(nc), line),
-                    };
-                }
+                } => match key {
+                    PropertyKey::Computed(ke) => {
+                        self.compile_expr(ke)?;
+                        let tpl = self.compile_function(function, "")?;
+                        let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
+                        self.emit(OpCode::MakeClosure(c), line);
+                        match kind {
+                            MethodKind::Normal => self.emit(OpCode::ObjectSetComputed, line),
+                            MethodKind::Get => self.emit(OpCode::ObjectDefineGetterComputed, line),
+                            MethodKind::Set => self.emit(OpCode::ObjectDefineSetterComputed, line),
+                        };
+                    }
+                    _ => {
+                        let name = property_key_static_name(key, line)?;
+                        let tpl = self.compile_function(function, &name)?;
+                        let c = self.add_const(Const::FunctionTemplate(Rc::new(tpl)));
+                        self.emit(OpCode::MakeClosure(c), line);
+                        let nc = self.add_const_str(&name);
+                        match kind {
+                            MethodKind::Normal => self.emit(OpCode::ObjectSetMethod(nc), line),
+                            MethodKind::Get => self.emit(OpCode::ObjectDefineGetter(nc), line),
+                            MethodKind::Set => self.emit(OpCode::ObjectDefineSetter(nc), line),
+                        };
+                    }
+                },
                 ObjectProp::Spread(e) => {
                     self.compile_expr(e)?;
                     self.emit(OpCode::ObjectSpread, line);
@@ -328,7 +354,7 @@ impl Compiler {
                         self.emit(OpCode::DeleteIndex, line);
                     }
                     _ => {
-                        let name = property_key_static_name(prop);
+                        let name = property_key_static_name(prop, line)?;
                         let c = self.add_const_str(&name);
                         self.emit(OpCode::DeleteProp(c), line);
                     }
@@ -358,18 +384,18 @@ impl Compiler {
         prop: &PropertyKey,
         line: u32,
     ) -> CResult<MemberTarget> {
-        let tmp_obj = self.temp_slot();
+        let tmp_obj = self.temp_slot(line)?;
         self.compile_expr(obj)?;
         self.emit(OpCode::BindLocal(tmp_obj), line);
         let key = match prop {
             PropertyKey::Computed(ke) => {
-                let t = self.temp_slot();
+                let t = self.temp_slot(line)?;
                 self.compile_expr(ke)?;
                 self.emit(OpCode::BindLocal(t), line);
                 MemberKey::Computed(t)
             }
             _ => {
-                let name = property_key_static_name(prop);
+                let name = property_key_static_name(prop, line)?;
                 MemberKey::Static(self.add_const_str(&name))
             }
         };
@@ -390,7 +416,7 @@ impl Compiler {
     }
 
     /// スタック最上位の値を `target` に書き戻し、書き込んだ値をスタックに残す。
-    fn emit_member_set_top(&mut self, target: MemberTarget, line: u32) {
+    fn emit_member_set_top(&mut self, target: MemberTarget, line: u32) -> CResult<()> {
         match target.key {
             MemberKey::Static(c) => {
                 self.emit(OpCode::GetLocal(target.tmp_obj), line);
@@ -398,7 +424,7 @@ impl Compiler {
                 self.emit(OpCode::SetProp(c), line);
             }
             MemberKey::Computed(t) => {
-                let tmp_val = self.temp_slot();
+                let tmp_val = self.temp_slot(line)?;
                 self.emit(OpCode::BindLocal(tmp_val), line);
                 self.emit(OpCode::GetLocal(target.tmp_obj), line);
                 self.emit(OpCode::GetLocal(t), line);
@@ -406,6 +432,7 @@ impl Compiler {
                 self.emit(OpCode::SetIndex, line);
             }
         }
+        Ok(())
     }
 
     fn compile_update(&mut self, op: UpdateOp, arg: &Expr, prefix: bool, line: u32) -> CResult<()> {
@@ -428,11 +455,13 @@ impl Compiler {
                 }
             }
             ExprKind::Member { obj, prop, .. } => {
+                let saved_len = self.cur().locals.len();
+                let saved_next = self.cur().next_slot;
                 let target = self.prepare_member_target(obj, prop, line)?;
                 self.emit_member_get(target, line);
                 self.emit(OpCode::Pos, line);
                 let tmp_old = if !prefix {
-                    let t = self.temp_slot();
+                    let t = self.temp_slot(line)?;
                     self.emit(OpCode::Dup, line);
                     self.emit(OpCode::BindLocal(t), line);
                     Some(t)
@@ -441,11 +470,12 @@ impl Compiler {
                 };
                 self.emit(OpCode::LoadSmallInt(delta), line);
                 self.emit(OpCode::Add, line);
-                self.emit_member_set_top(target, line);
+                self.emit_member_set_top(target, line)?;
                 if let Some(t) = tmp_old {
                     self.emit(OpCode::Pop, line);
                     self.emit(OpCode::GetLocal(t), line);
                 }
+                self.restore_scope(saved_len, saved_next);
             }
             _ => return Err(err(line, "++/-- の対象として使えない式です")),
         }
@@ -501,7 +531,7 @@ impl Compiler {
                         }
                         _ => {
                             self.compile_expr(value)?;
-                            let name = property_key_static_name(prop);
+                            let name = property_key_static_name(prop, line)?;
                             let c = self.add_const_str(&name);
                             self.emit(OpCode::SetProp(c), line);
                         }
@@ -532,6 +562,8 @@ impl Compiler {
                 }
             },
             ExprKind::Member { obj, prop, .. } => {
+                let saved_len = self.cur().locals.len();
+                let saved_next = self.cur().next_slot;
                 let target = self.prepare_member_target(obj, prop, line)?;
                 self.emit_member_get(target, line);
                 match compound {
@@ -539,16 +571,17 @@ impl Compiler {
                         let j = self.emit_jump(jump_op, line);
                         self.emit(OpCode::Pop, line);
                         self.compile_expr(value)?;
-                        self.emit_member_set_top(target, line);
+                        self.emit_member_set_top(target, line)?;
                         let end = self.cur_addr();
                         self.patch_jump(j, end);
                     }
                     CompoundAssignOp::Binary(plain_op) => {
                         self.compile_expr(value)?;
                         self.emit(plain_op, line);
-                        self.emit_member_set_top(target, line);
+                        self.emit_member_set_top(target, line)?;
                     }
                 }
+                self.restore_scope(saved_len, saved_next);
             }
             _ => return Err(err(line, "代入の左辺として使えない式です")),
         }
@@ -563,7 +596,7 @@ impl Compiler {
                 self.emit(OpCode::GetIndex, line);
             }
             _ => {
-                let name = property_key_static_name(prop);
+                let name = property_key_static_name(prop, line)?;
                 let c = self.add_const_str(&name);
                 self.emit(OpCode::GetProp(c), line);
             }
@@ -602,7 +635,7 @@ impl Compiler {
                             && args.len() <= u16::MAX as usize
                             && args.iter().all(is_pure_call_arg)
                         {
-                            let name = property_key_static_name(prop);
+                            let name = property_key_static_name(prop, line)?;
                             let c = self.add_const_str(&name);
                             if c <= u16::MAX as u32 {
                                 self.compile_chain_or_base(obj, patches)?;
@@ -750,11 +783,13 @@ fn binary_opcode(op: BinaryOp) -> OpCode {
     }
 }
 
-pub(super) fn property_key_static_name(key: &PropertyKey) -> Cow<'_, str> {
+pub(super) fn property_key_static_name(key: &PropertyKey, line: u32) -> CResult<Cow<'_, str>> {
     match key {
-        PropertyKey::Ident(s) | PropertyKey::Str(s) => Cow::Borrowed(s.as_str()),
-        PropertyKey::Num(n) => Cow::Owned(crate::vm::number_to_js_string(*n)),
-        PropertyKey::Computed(_) => panic!("computed key を静的名として扱おうとしました"),
+        PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(Cow::Borrowed(s.as_str())),
+        PropertyKey::Num(n) => Ok(Cow::Owned(crate::vm::number_to_js_string(*n))),
+        PropertyKey::Computed(_) => {
+            Err(err(line, "computed プロパティキーはこの構文では未対応です"))
+        }
     }
 }
 

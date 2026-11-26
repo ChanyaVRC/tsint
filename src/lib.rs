@@ -114,11 +114,17 @@ impl Interpreter {
         self.vm.now_fn = Some(Rc::new(f));
     }
 
+    /// `Math.random()` が使う乱数生成器をホストから注入する。
+    /// 未設定時は固定シードの決定的 PRNG が `[0.0, 1.0)` の値を返す。
+    pub fn set_random_fn(&mut self, f: impl FnMut() -> f64 + 'static) {
+        self.vm.random_fn = Some(Box::new(f));
+    }
+
     /// 未捕捉の Promise reject をホストへ報告するフックを差し替える
-    /// （既定は何もしない）。`Vm::run_event_loop` がマイクロタスクを
+    /// （既定では `on_log` へ出力する）。`Vm::run_event_loop` がマイクロタスクを
     /// 汲み尽くした時点でまだ誰も観測していない reject に対して呼ばれる。
     pub fn set_unhandled_rejection_hook(&mut self, f: impl FnMut(&value::Value) + 'static) {
-        self.vm.on_unhandled_rejection = Box::new(f);
+        self.vm.set_unhandled_rejection_hook(f);
     }
 
     /// ホスト側が非同期に解決する `Promise` を返すネイティブ関数を登録する

@@ -16,16 +16,31 @@ enum SettleMode {
 }
 
 pub(super) fn install_promise(vm: &mut Vm) {
-    let ctor = native("Promise", 1, |vm, _this, args| {
-        let executor = arg(args, 0);
-        let (promise_val, promise_obj) = vm.new_pending_promise();
-        let resolve_fn = settle_forward_fn(vm, promise_obj.clone(), SettleMode::Resolve);
-        let reject_fn = settle_forward_fn(vm, promise_obj.clone(), SettleMode::Reject);
-        if let Err(e) = vm.call_value(executor, Value::Undefined, &[resolve_fn, reject_fn]) {
-            vm.settle_promise(promise_obj, Err(e));
-        }
-        Ok(promise_val)
-    });
+    let ctor = Value::native_ctor(
+        "Promise",
+        1,
+        BuiltinCtorTag::Promise,
+        Rc::new(|vm, _this, args| {
+            let executor = arg(args, 0);
+            if !is_callable(&executor) {
+                return Err(vm.type_error("Promise の executor は関数である必要があります"));
+            }
+            let (promise_val, promise_obj) = vm.new_pending_promise();
+            // resolve と reject で共有の settled フラグを持ち、`resolve(pendingPromise); reject(e)`
+            // のような呼び出しで後から reject が効くのを防ぐ（T-28）。
+            let called = Rc::new(Cell::new(false));
+            let resolve_fn =
+                settle_guarded_fn(vm, promise_obj.clone(), called.clone(), SettleMode::Resolve);
+            let reject_fn =
+                settle_guarded_fn(vm, promise_obj.clone(), called.clone(), SettleMode::Reject);
+            if let Err(e) = vm.call_value(executor, Value::Undefined, &[resolve_fn, reject_fn]) {
+                if !called.replace(true) {
+                    vm.settle_promise(promise_obj, Err(e));
+                }
+            }
+            Ok(promise_val)
+        }),
+    );
 
     let resolve = native("resolve", 1, |vm, _this, args| {
         let v = arg(args, 0);
@@ -119,8 +134,30 @@ pub(super) fn install_promise(vm: &mut Vm) {
     vm.define_global("Promise", ctor);
 }
 
+fn settle_guarded_fn(vm: &Vm, target: ObjRef, called: Rc<Cell<bool>>, mode: SettleMode) -> Value {
+    let weak = Rc::downgrade(&target);
+    vm.alloc_native_with_captures(
+        "",
+        1,
+        vec![target],
+        Rc::new(move |vm, _this, args| {
+            if called.replace(true) {
+                return Ok(Value::Undefined);
+            }
+            if let Some(t) = weak.upgrade() {
+                let v = arg(args, 0);
+                match mode {
+                    SettleMode::Resolve => vm.resolve_promise(t, v),
+                    SettleMode::Reject => vm.settle_promise(t, Err(v)),
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    )
+}
+
 /// 引数の値/例外で `target` を確定させ、戻り値は捨てるネイティブ関数を生成する
-/// （`new Promise` の resolve/reject および `Promise.race` / `Promise.all` で共通利用）。
+/// （`Promise.race` / `Promise.all` で共通利用）。
 fn settle_forward_fn(vm: &Vm, target: ObjRef, mode: SettleMode) -> Value {
     let weak = Rc::downgrade(&target);
     vm.alloc_native_with_captures(
@@ -192,10 +229,15 @@ pub(super) fn call_promise_method(
         "catch" => (None, as_callable(0)),
         "finally" => {
             let cb = arg(args, 0);
-            (
-                Some(finally_wrapper(vm, &cb, false)),
-                Some(finally_wrapper(vm, &cb, true)),
-            )
+            if is_callable(&cb) {
+                (
+                    Some(finally_wrapper(vm, &cb, false)),
+                    Some(finally_wrapper(vm, &cb, true)),
+                )
+            } else {
+                // 非関数を渡した場合は素通しする（ES 仕様、T-28）。
+                (None, None)
+            }
         }
         _ => return None,
     };

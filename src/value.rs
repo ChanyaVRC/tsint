@@ -12,7 +12,7 @@
 //! - `Value::Uninit` は TDZ 判定専用の内部マーカー。JS コードから直接
 //!   観測されることはない。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 
@@ -96,6 +96,24 @@ impl Value {
                 arity,
                 f,
                 captures: Box::new([]),
+                ctor_tag: None,
+            }),
+        )))))
+    }
+
+    pub(crate) fn native_ctor(
+        name: &str,
+        arity: usize,
+        ctor_tag: BuiltinCtorTag,
+        f: NativeFn,
+    ) -> Value {
+        Value::Object(Rc::new(RefCell::new(ObjData::new(ObjKind::Native(
+            Box::new(NativeObj {
+                name: name.into(),
+                arity,
+                f,
+                captures: Box::new([]),
+                ctor_tag: Some(ctor_tag),
             }),
         )))))
     }
@@ -384,6 +402,77 @@ impl PropMap {
 /// クラス／プロトタイプ相当。`ObjData::proto` で連鎖する。
 pub type ObjRef = Rc<RefCell<ObjData>>;
 
+thread_local! {
+    /// 深い連結構造の解放が Rust コールスタックを再帰消費してスタックオーバーフローするのを
+    /// 防ぐためのスレッドローカル反復解放キュー（T-5）。
+    static DROP_QUEUE: RefCell<Vec<ObjRef>> = const { RefCell::new(Vec::new()) };
+    static DROPPING: Cell<bool> = const { Cell::new(false) };
+}
+
+struct DropGuard;
+
+impl Drop for DropGuard {
+    fn drop(&mut self) {
+        let _ = DROP_QUEUE.try_with(|q| {
+            if let Ok(mut v) = q.try_borrow_mut() {
+                if v.capacity() > 4096 {
+                    v.shrink_to(1024);
+                }
+            }
+        });
+        let _ = DROPPING.try_with(|d| d.set(false));
+    }
+}
+
+#[inline]
+fn extract_value_obj(v: &mut Value, push: &mut impl FnMut(ObjRef)) {
+    if matches!(v, Value::Object(_)) {
+        if let Value::Object(o) = std::mem::replace(v, Value::Undefined) {
+            push(o);
+        }
+    }
+}
+
+fn extract_upvalues_objs(upvalues: Rc<Vec<Rc<RefCell<Value>>>>, push: &mut impl FnMut(ObjRef)) {
+    if let Ok(cells) = Rc::try_unwrap(upvalues) {
+        for cell in cells {
+            if let Ok(rc) = Rc::try_unwrap(cell) {
+                let mut v = rc.into_inner();
+                extract_value_obj(&mut v, push);
+            }
+        }
+    }
+}
+
+fn extract_fn_objs(fo: Rc<FunctionObj>, push: &mut impl FnMut(ObjRef)) {
+    if let Ok(f) = Rc::try_unwrap(fo) {
+        extract_upvalues_objs(f.upvalues, push);
+    }
+}
+
+fn extract_frame_objs(mut frame: crate::vm::Frame, push: &mut impl FnMut(ObjRef)) {
+    for mut v in frame.stack.drain(..) {
+        extract_value_obj(&mut v, push);
+    }
+    for slot in frame.locals.drain(..) {
+        match slot {
+            crate::vm::LocalSlot::Direct(mut v) => extract_value_obj(&mut v, push),
+            crate::vm::LocalSlot::Boxed(cell) => {
+                if let Ok(rc) = Rc::try_unwrap(cell) {
+                    let mut v = rc.into_inner();
+                    extract_value_obj(&mut v, push);
+                }
+            }
+        }
+    }
+    extract_upvalues_objs(frame.upvalues, push);
+    if let Ok(args) = Rc::try_unwrap(frame.raw_args) {
+        for mut v in args {
+            extract_value_obj(&mut v, push);
+        }
+    }
+}
+
 pub struct ObjData {
     pub kind: ObjKind,
     pub props: PropMap,
@@ -406,6 +495,164 @@ impl ObjData {
             proto: None,
         }
     }
+
+    fn drain_child_objs(&mut self, push: &mut impl FnMut(ObjRef)) {
+        if let Some(p) = self.proto.take() {
+            push(p);
+        }
+        if !self.props.entries.is_empty() {
+            for (_, slot) in self.props.entries.drain(..).flatten() {
+                match slot {
+                    PropSlot::Value(mut v) => extract_value_obj(&mut v, push),
+                    PropSlot::Accessor(mut acc) => {
+                        if let Some(mut v) = acc.get.take() {
+                            extract_value_obj(&mut v, push);
+                        }
+                        if let Some(mut v) = acc.set.take() {
+                            extract_value_obj(&mut v, push);
+                        }
+                    }
+                }
+            }
+            self.props.index = None;
+        }
+        match std::mem::replace(&mut self.kind, ObjKind::Plain) {
+            ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_) => {}
+            ObjKind::Array(items) => {
+                for mut v in items {
+                    extract_value_obj(&mut v, push);
+                }
+            }
+            ObjKind::Map(m) => {
+                for (mut k, mut v) in m.entries {
+                    extract_value_obj(&mut k, push);
+                    extract_value_obj(&mut v, push);
+                }
+            }
+            ObjKind::Set(s) => {
+                for mut v in s.values {
+                    extract_value_obj(&mut v, push);
+                }
+            }
+            ObjKind::Function(fo) => extract_fn_objs(fo, push),
+            ObjKind::Native(n) => {
+                for o in Vec::from(n.captures) {
+                    push(o);
+                }
+            }
+            ObjKind::Class(mut cd) => {
+                push(cd.prototype);
+                if let Some(ctor) = cd.ctor.take() {
+                    extract_fn_objs(ctor, push);
+                }
+                if let Some(fields) = Rc::get_mut(&mut cd.instance_fields) {
+                    for (_, init) in fields.iter_mut() {
+                        if let Some(fo) = init.take() {
+                            extract_fn_objs(fo, push);
+                        }
+                    }
+                }
+            }
+            ObjKind::Promise(pd) => {
+                match pd.state {
+                    PromiseState::Pending => {}
+                    PromiseState::Fulfilled(mut v) | PromiseState::Rejected(mut v) => {
+                        extract_value_obj(&mut v, push);
+                    }
+                }
+                for r in pd.reactions {
+                    match r {
+                        PromiseReaction::Then {
+                            mut on_fulfilled,
+                            mut on_rejected,
+                            result_promise,
+                        } => {
+                            if let Some(mut v) = on_fulfilled.take() {
+                                extract_value_obj(&mut v, push);
+                            }
+                            if let Some(mut v) = on_rejected.take() {
+                                extract_value_obj(&mut v, push);
+                            }
+                            push(result_promise);
+                        }
+                        PromiseReaction::Await(cont) => {
+                            push(cont.owner_promise);
+                            for frame in cont.frames {
+                                extract_frame_objs(frame, push);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ObjData {
+    fn drop(&mut self) {
+        if self.proto.is_none()
+            && self.props.entries.is_empty()
+            && matches!(
+                self.kind,
+                ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_)
+            )
+        {
+            return;
+        }
+        let mut pushed_any = false;
+        let push_to_tls = &mut |o: ObjRef| {
+            let queued = DROP_QUEUE
+                .try_with(|q| {
+                    q.borrow_mut().push(o);
+                    true
+                })
+                .unwrap_or(false);
+            if queued {
+                pushed_any = true;
+            }
+        };
+        self.drain_child_objs(push_to_tls);
+        if !pushed_any {
+            return;
+        }
+        let already_dropping = DROPPING.try_with(|d| d.replace(true)).unwrap_or(true);
+        if already_dropping {
+            return;
+        }
+        let _guard = DropGuard;
+        loop {
+            let next = DROP_QUEUE.try_with(|q| q.borrow_mut().pop()).ok().flatten();
+            let Some(obj) = next else {
+                break;
+            };
+            if Rc::strong_count(&obj) == 1 {
+                if let Ok(mut b) = obj.try_borrow_mut() {
+                    b.drain_child_objs(&mut |child| {
+                        let _ = DROP_QUEUE.try_with(|q| q.borrow_mut().push(child));
+                    });
+                }
+            }
+            drop(obj);
+        }
+    }
+}
+
+/// `instanceof` で組み込みコンストラクタを判定するためのタグ（T-7）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinCtorTag {
+    Object,
+    Function,
+    Array,
+    Map,
+    Set,
+    Promise,
+    RegExp,
+    Date,
+    Error,
+    TypeError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
 }
 
 #[derive(Clone)]
@@ -416,6 +663,7 @@ pub struct NativeObj {
     /// ビルトイン（Promise の resolve/reject/finally 等）が Rust クロージャ内に
     /// Weak で参照している JS オブジェクトの強い参照を GC から可視化するためのリスト。
     pub(crate) captures: Box<[ObjRef]>,
+    pub(crate) ctor_tag: Option<BuiltinCtorTag>,
 }
 
 /// バイトコード関数（クロージャ）。

@@ -19,20 +19,123 @@ impl Compiler {
     /// ブロック（文リスト）を新しいレキシカルスコープでコンパイルする。
     pub(super) fn compile_block_new_scope(&mut self, stmts: &[Stmt]) -> CResult<()> {
         let saved_len = self.cur().locals.len();
+        let saved_next_slot = self.cur().next_slot;
         self.hoist_and_compile(stmts)?;
-        self.cur().locals.truncate(saved_len);
+        self.restore_scope(saved_len, saved_next_slot);
         Ok(())
     }
 
-    /// モジュール/関数のトップレベル文列。
+    /// モジュール/関数のトップレベル文列（`var` 宣言の関数/モジュールスコープ巻き上げ込み）。
     pub(super) fn compile_top_level_stmts(&mut self, stmts: &[Stmt]) -> CResult<()> {
+        self.hoist_function_vars(stmts)?;
         self.hoist_and_compile(stmts)
     }
 
-    /// 文リストの巻き上げ（1st: 名前予約, 2nd: 関数宣言初期化, 3rd: 文コンパイル）。
-    pub(super) fn hoist_and_compile(&mut self, stmts: &[Stmt]) -> CResult<()> {
+    /// 関数・モジュールスコープ内のすべての `var` 宣言を巻き上げ、`undefined` で初期化する（T-23）。
+    pub(super) fn hoist_function_vars(&mut self, stmts: &[Stmt]) -> CResult<()> {
         for s in stmts {
-            self.hoist_stmt_names(s)?;
+            self.hoist_vars_in_stmt(s)?;
+        }
+        Ok(())
+    }
+
+    fn hoist_var_decls(&mut self, decls: &[VarDeclarator], line: u32) -> CResult<()> {
+        for d in decls {
+            for name in pattern_names(&d.name) {
+                if self.cur().find_local(name).is_none() {
+                    let slot = self.declare_local(name, line)?;
+                    self.emit(OpCode::LoadUndefined, line);
+                    self.emit(OpCode::BindLocal(slot), line);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn hoist_vars_in_stmt(&mut self, s: &Stmt) -> CResult<()> {
+        let line = s.span.start.line;
+        self.enter_depth(line)?;
+        let res = (|| -> CResult<()> {
+            match &s.kind {
+                StmtKind::VarDecl {
+                    kind: VarKind::Var,
+                    decls,
+                } => self.hoist_var_decls(decls, line)?,
+                StmtKind::Block(stmts) | StmtKind::TsModule { body: stmts, .. } => {
+                    for st in stmts {
+                        self.hoist_vars_in_stmt(st)?;
+                    }
+                }
+                StmtKind::If { cons, alt, .. } => {
+                    self.hoist_vars_in_stmt(cons)?;
+                    if let Some(a) = alt {
+                        self.hoist_vars_in_stmt(a)?;
+                    }
+                }
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::Labeled { body, .. } => self.hoist_vars_in_stmt(body)?,
+                StmtKind::For { init, body, .. } => {
+                    if let Some(init) = init {
+                        if let ForInit::VarDecl(VarKind::Var, decls) = init.as_ref() {
+                            self.hoist_var_decls(decls, line)?;
+                        }
+                    }
+                    self.hoist_vars_in_stmt(body)?;
+                }
+                StmtKind::ForIn { left, body, .. } => {
+                    if let ForInit::VarDecl(VarKind::Var, decls) = left.as_ref() {
+                        self.hoist_var_decls(decls, line)?;
+                    }
+                    self.hoist_vars_in_stmt(body)?;
+                }
+                StmtKind::Switch { cases, .. } => {
+                    for c in cases {
+                        for st in &c.body {
+                            self.hoist_vars_in_stmt(st)?;
+                        }
+                    }
+                }
+                StmtKind::Try {
+                    block,
+                    handler,
+                    finalizer,
+                } => {
+                    for st in block {
+                        self.hoist_vars_in_stmt(st)?;
+                    }
+                    if let Some(h) = handler {
+                        for st in &h.body {
+                            self.hoist_vars_in_stmt(st)?;
+                        }
+                    }
+                    if let Some(fin) = finalizer {
+                        for st in fin {
+                            self.hoist_vars_in_stmt(st)?;
+                        }
+                    }
+                }
+                StmtKind::ExportDecl(inner) => self.hoist_vars_in_stmt(inner)?,
+                _ => {}
+            }
+            Ok(())
+        })();
+        self.leave_depth();
+        res
+    }
+
+    /// 文リストの巻き上げ（1st: 名前予約, 2nd: ループ内 FreshLocal, 3rd: 関数宣言初期化, 4th: 文コンパイル）。
+    pub(super) fn hoist_and_compile(&mut self, stmts: &[Stmt]) -> CResult<()> {
+        let mut hoisted_slots: Vec<(LocalIdx, u32)> = Vec::new();
+        for s in stmts {
+            self.hoist_stmt_names(s, &mut hoisted_slots)?;
+        }
+        // ループ本体（およびループ内の入れ子ブロック）で宣言されるレキシカル変数は
+        // 反復ごとに新しいセル＋TDZ へリセットする（T-2）。
+        if self.cur().loop_depth > 0 {
+            for &(slot, line) in &hoisted_slots {
+                self.emit(OpCode::FreshLocal(slot), line);
+            }
         }
         for s in stmts {
             if let StmtKind::FunctionDecl(f) = &s.kind {
@@ -50,28 +153,40 @@ impl Compiler {
         Ok(())
     }
 
-    fn hoist_stmt_names(&mut self, s: &Stmt) -> CResult<()> {
+    fn hoist_stmt_names(
+        &mut self,
+        s: &Stmt,
+        hoisted_slots: &mut Vec<(LocalIdx, u32)>,
+    ) -> CResult<()> {
+        let line = s.span.start.line;
         match &s.kind {
-            StmtKind::VarDecl { decls, .. } => {
-                for d in decls {
-                    for name in pattern_names(&d.name) {
-                        self.declare_local(name);
+            StmtKind::VarDecl { kind, decls } => {
+                // `var` は関数/モジュールスコープへ巻き上げ済み（T-23）。
+                if *kind != VarKind::Var {
+                    for d in decls {
+                        for name in pattern_names(&d.name) {
+                            let slot = self.declare_local(name, line)?;
+                            hoisted_slots.push((slot, line));
+                        }
                     }
                 }
             }
             StmtKind::FunctionDecl(f) => {
                 if let Some(name) = &f.name {
-                    self.declare_local(name);
+                    let slot = self.declare_local(name, line)?;
+                    hoisted_slots.push((slot, line));
                 }
             }
             StmtKind::ClassDecl(c) => {
                 if let Some(name) = &c.name {
-                    self.declare_local(name);
+                    let slot = self.declare_local(name, line)?;
+                    hoisted_slots.push((slot, line));
                 }
             }
-            StmtKind::ExportDecl(inner) => self.hoist_stmt_names(inner)?,
+            StmtKind::ExportDecl(inner) => self.hoist_stmt_names(inner, hoisted_slots)?,
             StmtKind::ExportDefault(_) => {
-                self.declare_local("default");
+                let slot = self.declare_local("default", line)?;
+                hoisted_slots.push((slot, line));
             }
             _ => {}
         }
@@ -80,20 +195,28 @@ impl Compiler {
 
     pub(super) fn compile_stmt(&mut self, s: &Stmt) -> CResult<()> {
         let line = s.span.start.line;
+        self.enter_depth(line)?;
+        let res = self.compile_stmt_inner(s, line);
+        self.leave_depth();
+        res
+    }
+
+    fn compile_stmt_inner(&mut self, s: &Stmt, line: u32) -> CResult<()> {
         match &s.kind {
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::Expr(e) => {
                 self.compile_expr_discard(e)?;
             }
             StmtKind::Block(b) => self.compile_block_new_scope(b)?,
-            StmtKind::VarDecl { decls, .. } => {
+            StmtKind::VarDecl { kind, decls } => {
                 for d in decls {
                     if let Some(init) = &d.init {
                         self.compile_expr(init)?;
-                    } else {
+                        self.compile_bind_pattern(&d.name, line)?;
+                    } else if *kind != VarKind::Var {
                         self.emit(OpCode::LoadUndefined, line);
+                        self.compile_bind_pattern(&d.name, line)?;
                     }
-                    self.compile_bind_pattern(&d.name, line)?;
                 }
             }
             StmtKind::FunctionDecl(_) => {}
@@ -201,7 +324,10 @@ impl Compiler {
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
         });
-        self.compile_stmt(body)?;
+        self.cur().loop_depth += 1;
+        let body_res = self.compile_stmt(body);
+        self.cur().loop_depth -= 1;
+        body_res?;
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
         self.emit(OpCode::Jump(test_addr), line);
@@ -224,7 +350,10 @@ impl Compiler {
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
         });
-        self.compile_stmt(body)?;
+        self.cur().loop_depth += 1;
+        let body_res = self.compile_stmt(body);
+        self.cur().loop_depth -= 1;
+        body_res?;
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
         self.compile_expr(test)?;
@@ -244,23 +373,29 @@ impl Compiler {
     ) -> CResult<()> {
         let line = body.span.start.line;
         let saved_len = self.cur().locals.len();
+        let saved_next_slot = self.cur().next_slot;
+        let in_outer_loop = self.cur().loop_depth > 0;
         let mut per_iter_slots: Vec<LocalIdx> = Vec::new();
         if let Some(init) = init {
             match init {
                 ForInit::VarDecl(kind, decls) => {
                     for d in decls {
-                        for name in pattern_names(&d.name) {
-                            let slot = self.declare_local(name);
-                            if *kind != ast::VarKind::Var {
+                        if *kind != ast::VarKind::Var {
+                            for name in pattern_names(&d.name) {
+                                let slot = self.declare_local(name, line)?;
+                                if in_outer_loop {
+                                    self.emit(OpCode::FreshLocal(slot), line);
+                                }
                                 per_iter_slots.push(slot);
                             }
                         }
                         if let Some(e) = &d.init {
                             self.compile_expr(e)?;
-                        } else {
+                            self.compile_bind_pattern(&d.name, line)?;
+                        } else if *kind != ast::VarKind::Var {
                             self.emit(OpCode::LoadUndefined, line);
+                            self.compile_bind_pattern(&d.name, line)?;
                         }
-                        self.compile_bind_pattern(&d.name, line)?;
                     }
                 }
                 ForInit::Expr(e) => {
@@ -282,7 +417,10 @@ impl Compiler {
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
         });
-        self.compile_stmt(body)?;
+        self.cur().loop_depth += 1;
+        let body_res = self.compile_stmt(body);
+        self.cur().loop_depth -= 1;
+        body_res?;
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
         let update_has_closure = update.is_some_and(expr_contains_closure);
@@ -300,7 +438,7 @@ impl Compiler {
             self.patch_jump(jf, end);
         }
         self.pop_loop_breaks(end);
-        self.cur().locals.truncate(saved_len);
+        self.restore_scope(saved_len, saved_next_slot);
         Ok(())
     }
 
@@ -314,16 +452,17 @@ impl Compiler {
         line: u32,
     ) -> CResult<()> {
         let saved_len = self.cur().locals.len();
+        let saved_next_slot = self.cur().next_slot;
         self.compile_expr(right)?;
         if is_of {
             self.emit(OpCode::MakeIterArray, line);
         } else {
             self.emit(OpCode::ObjectKeysArray, line);
         }
-        let arr_slot = self.declare_local("%iter_arr");
+        let arr_slot = self.declare_local("%iter_arr", line)?;
         self.emit(OpCode::BindLocal(arr_slot), line);
         self.emit(OpCode::LoadSmallInt(0), line);
-        let idx_slot = self.declare_local("%iter_idx");
+        let idx_slot = self.declare_local("%iter_idx", line)?;
         self.emit(OpCode::BindLocal(idx_slot), line);
 
         let test_addr = self.cur_addr();
@@ -339,21 +478,29 @@ impl Compiler {
             continue_patches: Vec::new(),
         });
         let body_saved_len = self.cur().locals.len();
+        let body_saved_next_slot = self.cur().next_slot;
         self.emit(OpCode::GetLocal(arr_slot), line);
         self.emit(OpCode::GetLocal(idx_slot), line);
         self.emit(OpCode::GetIndex, line);
         match left {
-            ForInit::VarDecl(_, decls) => {
+            ForInit::VarDecl(kind, decls) => {
                 let pat = &decls[0].name;
-                for name in pattern_names(pat) {
-                    self.declare_local(name);
+                if *kind != ast::VarKind::Var {
+                    for name in pattern_names(pat) {
+                        let slot = self.declare_local(name, line)?;
+                        // 反復ごとに新しいセル＋TDZ にリセット（T-2）。
+                        self.emit(OpCode::FreshLocal(slot), line);
+                    }
                 }
                 self.compile_bind_pattern(pat, line)?;
             }
             ForInit::Expr(e) => self.compile_assign_target_expr(e, line)?,
         }
-        self.compile_stmt(body)?;
-        self.cur().locals.truncate(body_saved_len);
+        self.cur().loop_depth += 1;
+        let body_res = self.compile_stmt(body);
+        self.cur().loop_depth -= 1;
+        body_res?;
+        self.restore_scope(body_saved_len, body_saved_next_slot);
         let cont_addr = self.cur_addr();
         self.resolve_loop_continue(cont_addr);
         self.emit(OpCode::IncLocal(idx_slot), line);
@@ -362,7 +509,7 @@ impl Compiler {
         let end = self.cur_addr();
         self.patch_jump(jf, end);
         self.pop_loop_breaks(end);
-        self.cur().locals.truncate(saved_len);
+        self.restore_scope(saved_len, saved_next_slot);
         Ok(())
     }
 
@@ -424,9 +571,16 @@ impl Compiler {
     fn compile_switch(&mut self, disc: &Expr, cases: &[SwitchCase], line: u32) -> CResult<()> {
         self.compile_expr(disc)?;
         let saved_len = self.cur().locals.len();
+        let saved_next_slot = self.cur().next_slot;
+        let mut hoisted_slots = Vec::new();
         for c in cases {
             for s in &c.body {
-                self.hoist_stmt_names(s)?;
+                self.hoist_stmt_names(s, &mut hoisted_slots)?;
+            }
+        }
+        if self.cur().loop_depth > 0 {
+            for &(slot, sline) in &hoisted_slots {
+                self.emit(OpCode::FreshLocal(slot), sline);
             }
         }
         for c in cases {
@@ -492,7 +646,7 @@ impl Compiler {
         if let Some(Ctrl::Switch { break_patches }) = self.cur().control.pop() {
             self.patch_all(break_patches, end);
         }
-        self.cur().locals.truncate(saved_len);
+        self.restore_scope(saved_len, saved_next_slot);
         Ok(())
     }
 
@@ -508,7 +662,7 @@ impl Compiler {
         let mut target_idx = None;
         for i in (0..self.cur().control.len()).rev() {
             match &self.cur().control[i] {
-                Ctrl::TryFinally { finally } => finallies.push((i, finally.clone())),
+                Ctrl::TryFinally { finally, .. } => finallies.push((i, finally.clone())),
                 Ctrl::Loop { label: l, .. } if label.is_none() || l.as_deref() == label => {
                     target_idx = Some(i);
                     break;
@@ -578,15 +732,27 @@ impl Compiler {
         let mut finallies: Vec<(usize, Rc<[Stmt]>)> = Vec::new();
         for i in (0..len).rev() {
             match &self.cur().control[i] {
-                Ctrl::TryFinally { finally } => finallies.push((i, finally.clone())),
+                Ctrl::TryFinally { finally, .. } => finallies.push((i, finally.clone())),
                 Ctrl::FuncBoundary => break,
                 _ => {}
             }
         }
-        for (idx, fb) in &finallies {
-            self.compile_finally_copy(*idx, fb)?;
+        if !finallies.is_empty() {
+            // `finally` 内で inner `try { throw } catch {}` が起きても戻り値が
+            // オペランドスタック巻き戻しで消えないよう専用ローカルへ退避する（T-3）。
+            let saved_next = self.cur().next_slot;
+            let ret_slot = self.cur().alloc_slot(line)?;
+            self.emit(OpCode::BindLocal(ret_slot), line);
+            for (idx, fb) in &finallies {
+                self.compile_finally_copy(*idx, fb)?;
+            }
+            self.emit(OpCode::GetLocal(ret_slot), line);
+            self.emit(OpCode::Return, line);
+            let cur_len = self.cur().locals.len();
+            self.restore_scope(cur_len, saved_next);
+        } else {
+            self.emit(OpCode::Return, line);
         }
-        self.emit(OpCode::Return, line);
         Ok(())
     }
 
@@ -604,6 +770,7 @@ impl Compiler {
         let control_idx = if let Some(fin) = &finally_rc {
             self.cur().control.push(Ctrl::TryFinally {
                 finally: fin.clone(),
+                excluded_ranges: Vec::new(),
             });
             Some(self.cur().control.len() - 1)
         } else {
@@ -623,16 +790,21 @@ impl Compiler {
         let mut jump_after_catch = None;
         if let Some(h) = handler {
             let saved_len = self.cur().locals.len();
+            let saved_next_slot = self.cur().next_slot;
             if let Some(pat) = &h.param {
+                let in_loop = self.cur().loop_depth > 0;
                 for name in pattern_names(pat) {
-                    self.declare_local(name);
+                    let slot = self.declare_local(name, line)?;
+                    if in_loop {
+                        self.emit(OpCode::FreshLocal(slot), line);
+                    }
                 }
                 self.compile_bind_pattern(pat, line)?;
             } else {
                 self.emit(OpCode::Pop, line);
             }
             self.hoist_and_compile(&h.body)?;
-            self.cur().locals.truncate(saved_len);
+            self.restore_scope(saved_len, saved_next_slot);
             catch_end = self.cur_addr();
             if let (Some(fin), Some(idx)) = (&finally_rc, control_idx) {
                 self.compile_finally_copy(idx, fin)?;
@@ -640,17 +812,30 @@ impl Compiler {
             jump_after_catch = Some(self.emit_jump(OpCode::Jump, line));
         }
 
-        if let Some(idx) = control_idx {
-            self.cur().control.remove(idx);
-        }
+        let mut excluded_ranges = if let Some(idx) = control_idx {
+            match self.cur().control.remove(idx) {
+                Ctrl::TryFinally {
+                    excluded_ranges, ..
+                } => excluded_ranges,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        excluded_ranges.sort_unstable_by_key(|&(s, _)| s);
 
         let unwind_addr = if let Some(fin) = &finally_rc {
             let addr = self.cur_addr();
-            let exc_slot = self.cur().exc_slot();
+            // try 文ごとに専用の例外退避スロットを確保し、入れ子の巻き戻しで
+            // 外側の例外値が上書きされるのを防ぐ（T-13）。
+            let saved_next = self.cur().next_slot;
+            let exc_slot = self.cur().alloc_slot(line)?;
             self.emit(OpCode::BindLocal(exc_slot), line);
             self.compile_block_new_scope(fin)?;
             self.emit(OpCode::GetLocal(exc_slot), line);
             self.emit(OpCode::Throw, line);
+            let cur_len = self.cur().locals.len();
+            self.restore_scope(cur_len, saved_next);
             Some(addr)
         } else {
             None
@@ -663,32 +848,86 @@ impl Compiler {
         }
 
         if handler.is_some() {
-            self.cur().chunk.exception_table.push(ExceptionEntry {
+            push_exception_entries(
+                &mut self.cur().chunk.exception_table,
                 try_start,
                 try_end,
-                handler_addr: catch_addr,
-            });
+                catch_addr,
+                &excluded_ranges,
+            );
             if let Some(unwind) = unwind_addr {
-                self.cur().chunk.exception_table.push(ExceptionEntry {
-                    try_start: catch_addr,
-                    try_end: catch_end,
-                    handler_addr: unwind,
-                });
+                push_exception_entries(
+                    &mut self.cur().chunk.exception_table,
+                    catch_addr,
+                    catch_end,
+                    unwind,
+                    &excluded_ranges,
+                );
             }
         } else if let Some(unwind) = unwind_addr {
-            self.cur().chunk.exception_table.push(ExceptionEntry {
+            push_exception_entries(
+                &mut self.cur().chunk.exception_table,
                 try_start,
                 try_end,
-                handler_addr: unwind,
-            });
+                unwind,
+                &excluded_ranges,
+            );
         }
         Ok(())
     }
 
     fn compile_finally_copy(&mut self, control_idx: usize, finally: &[Stmt]) -> CResult<()> {
-        let saved = self.cur().control.remove(control_idx);
+        let saved_tail: Vec<Ctrl> = self.cur().control.drain(control_idx..).collect();
+        let copy_start = self.cur_addr();
         let r = self.compile_block_new_scope(finally);
-        self.cur().control.insert(control_idx, saved);
+        let copy_end = self.cur_addr();
+        self.cur().control.extend(saved_tail);
+        if copy_end > copy_start {
+            for ctrl in &mut self.cur().control[control_idx..] {
+                if let Ctrl::TryFinally {
+                    excluded_ranges, ..
+                } = ctrl
+                {
+                    excluded_ranges.push((copy_start, copy_end));
+                }
+            }
+        }
         r
+    }
+}
+
+/// `[range_start, range_end)` から `excluded`（昇順ソート済み）を除いた区間列を
+/// 例外テーブルへ登録する（T-13）。
+fn push_exception_entries(
+    table: &mut Vec<ExceptionEntry>,
+    range_start: u32,
+    range_end: u32,
+    handler_addr: u32,
+    excluded: &[(u32, u32)],
+) {
+    let mut cur = range_start;
+    for &(ex_start, ex_end) in excluded {
+        if ex_end <= cur || ex_start >= range_end {
+            continue;
+        }
+        let cut_start = ex_start.max(cur);
+        if cut_start > cur {
+            table.push(ExceptionEntry {
+                try_start: cur,
+                try_end: cut_start,
+                handler_addr,
+            });
+        }
+        cur = ex_end.min(range_end);
+        if cur >= range_end {
+            break;
+        }
+    }
+    if cur < range_end {
+        table.push(ExceptionEntry {
+            try_start: cur,
+            try_end: range_end,
+            handler_addr,
+        });
     }
 }

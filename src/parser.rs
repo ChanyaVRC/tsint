@@ -74,6 +74,9 @@ impl<T> SmallStage<T> {
     }
 }
 
+/// パーサの再帰深さ上限（T-6: debug ビルドでもスタックオーバーフローしない安全上限）。
+const MAX_PARSE_DEPTH: u32 = 64;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -86,6 +89,8 @@ pub struct Parser {
     /// 投機的パース（`begin_speculate`）のネスト深さ。0 のときは現在トークンの
     /// `String` をクローンせず `std::mem::take` で AST へ直接ムーブできる。
     speculative_depth: u32,
+    /// 再帰下降の現在深さ（スタックオーバーフロー防止、T-6）。
+    depth: u32,
 }
 
 impl Parser {
@@ -97,7 +102,22 @@ impl Parser {
             next_id: 0,
             pending_angle_closes: 0,
             speculative_depth: 0,
+            depth: 0,
         })
+    }
+
+    #[inline]
+    fn enter_depth(&mut self) -> PResult<()> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.err("構文のネストが深すぎます"));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn leave_depth(&mut self) {
+        self.depth -= 1;
     }
 
     fn fresh_id(&mut self) -> NodeId {

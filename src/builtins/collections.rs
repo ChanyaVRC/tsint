@@ -29,9 +29,10 @@ const SET_METHODS: &[(&str, usize)] = &[
 ];
 
 pub(super) fn install_map_set_ctors(vm: &mut Vm) {
-    vm.register_native(
+    let map_ctor = Value::native_ctor(
         "Map",
         0,
+        BuiltinCtorTag::Map,
         Rc::new(|vm, _this, args| {
             let mut data = MapData::default();
             if let Some(it) = args.first() {
@@ -47,9 +48,11 @@ pub(super) fn install_map_set_ctors(vm: &mut Vm) {
             Ok(vm.alloc_obj(ObjData::new(ObjKind::Map(Box::new(data)))))
         }),
     );
-    vm.register_native(
+    vm.define_global("Map", map_ctor);
+    let set_ctor = Value::native_ctor(
         "Set",
         0,
+        BuiltinCtorTag::Set,
         Rc::new(|vm, _this, args| {
             let mut data = SetData::default();
             if let Some(it) = args.first() {
@@ -62,6 +65,7 @@ pub(super) fn install_map_set_ctors(vm: &mut Vm) {
             Ok(vm.alloc_obj(ObjData::new(ObjKind::Set(Box::new(data)))))
         }),
     );
+    vm.define_global("Set", set_ctor);
 }
 
 #[inline]

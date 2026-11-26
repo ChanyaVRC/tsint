@@ -2,6 +2,18 @@
 
 use super::charclass::CharClass;
 use super::parser::{Ast, LookaheadKind, QuantifierMode, WordBoundary};
+use super::RegexError;
+
+/// コンパイル後の正規表現命令数の上限（T-12: 巨大量指定子による OOM 防止）。
+const MAX_COMPILED_INSTS: usize = 100_000;
+
+/// 単一文字にマッチするアトム（`GreedyAtomRepeat` 命令用、T-18）。
+#[derive(Debug, Clone, Copy)]
+pub(super) enum AtomMatcher {
+    Char(char),
+    Any,
+    Class(u32),
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Inst {
@@ -9,6 +21,12 @@ pub(super) enum Inst {
     Any,
     /// `Regex::classes` の添字。
     Class(u32),
+    /// 単一文字アトム（Char/Any/Class）の貪欲無制限繰り返し（`*` / `+` / `{n,}`）。
+    /// 1 文字ごとの `Split` フレーム消費を避け O(1) スタック深さで実行する（T-18）。
+    GreedyAtomRepeat {
+        atom: AtomMatcher,
+        min: u32,
+    },
     Save(u32),
     Jmp(u32),
     Split(u32, u32),
@@ -53,9 +71,14 @@ impl Compiler {
         }
     }
 
-    pub(super) fn emit(&mut self, i: Inst) -> usize {
+    pub(super) fn emit(&mut self, i: Inst) -> Result<usize, RegexError> {
+        if self.prog.len() >= MAX_COMPILED_INSTS {
+            return Err(RegexError(format!(
+                "正規表現の展開サイズ上限 ({MAX_COMPILED_INSTS} 命令) を超えました"
+            )));
+        }
         self.prog.push(i);
-        self.prog.len() - 1
+        Ok(self.prog.len() - 1)
     }
 
     fn here(&self) -> u32 {
@@ -84,35 +107,35 @@ impl Compiler {
         }
     }
 
-    pub(super) fn compile(&mut self, ast: &Ast) {
+    pub(super) fn compile(&mut self, ast: &Ast) -> Result<(), RegexError> {
         match ast {
             Ast::Empty => {}
             Ast::Char(c) => {
-                self.emit(Inst::Char(*c));
+                self.emit(Inst::Char(*c))?;
             }
             Ast::Any => {
-                self.emit(Inst::Any);
+                self.emit(Inst::Any)?;
             }
             Ast::Class(cc) => {
                 let idx = self.classes.len() as u32;
                 self.classes.push(cc.clone());
-                self.emit(Inst::Class(idx));
+                self.emit(Inst::Class(idx))?;
             }
             Ast::Concat(items) => {
                 for it in items {
-                    self.compile(it);
+                    self.compile(it)?;
                 }
             }
             Ast::Alt(branches) => {
                 let mut jmp_ends = vec![];
                 for (i, b) in branches.iter().enumerate() {
                     if i + 1 == branches.len() {
-                        self.compile(b);
+                        self.compile(b)?;
                     } else {
-                        let split_pc = self.emit(Inst::Split(0, 0));
+                        let split_pc = self.emit(Inst::Split(0, 0))?;
                         let branch_start = self.here();
-                        self.compile(b);
-                        let jmp_pc = self.emit(Inst::Jmp(0));
+                        self.compile(b)?;
+                        let jmp_pc = self.emit(Inst::Jmp(0))?;
                         jmp_ends.push(jmp_pc);
                         let next_branch_start = self.here();
                         if let Inst::Split(ref mut a, ref mut b2) = self.prog[split_pc] {
@@ -130,33 +153,33 @@ impl Compiler {
             }
             Ast::Group(idx, inner) => {
                 let slot = (*idx * 2) as u32;
-                self.emit(Inst::Save(slot));
-                self.compile(inner);
-                self.emit(Inst::Save(slot + 1));
+                self.emit(Inst::Save(slot))?;
+                self.compile(inner)?;
+                self.emit(Inst::Save(slot + 1))?;
             }
-            Ast::NonCap(inner) => self.compile(inner),
-            Ast::Repeat(inner, min, max, mode) => self.compile_repeat(inner, *min, *max, *mode),
+            Ast::NonCap(inner) => self.compile(inner)?,
+            Ast::Repeat(inner, min, max, mode) => self.compile_repeat(inner, *min, *max, *mode)?,
             Ast::Start => {
-                self.emit(Inst::Bol);
+                self.emit(Inst::Bol)?;
             }
             Ast::End => {
-                self.emit(Inst::Eol);
+                self.emit(Inst::Eol)?;
             }
             Ast::WordB(wb) => {
-                self.emit(Inst::WordB(*wb));
+                self.emit(Inst::WordB(*wb))?;
             }
             Ast::Backref(n) => {
-                self.emit(Inst::Backref(*n as u32));
+                self.emit(Inst::Backref(*n as u32))?;
             }
             Ast::Look(inner, kind) => {
                 let look_pc = self.emit(Inst::Look {
                     sub_pc: 0,
                     after_pc: 0,
                     kind: *kind,
-                });
+                })?;
                 let sub_start = self.here();
-                self.compile(inner);
-                self.emit(Inst::Match);
+                self.compile(inner)?;
+                self.emit(Inst::Match)?;
                 let after = self.here();
                 if let Inst::Look {
                     ref mut sub_pc,
@@ -169,52 +192,99 @@ impl Compiler {
                 }
             }
         }
+        Ok(())
     }
 
     /// 量指定子本体を地続きの命令列としてインライン展開する。
-    fn compile_repeat(&mut self, inner: &Ast, min: u32, max: Option<u32>, mode: QuantifierMode) {
+    fn compile_repeat(
+        &mut self,
+        inner: &Ast,
+        min: u32,
+        max: Option<u32>,
+        mode: QuantifierMode,
+    ) -> Result<(), RegexError> {
+        if min as usize > MAX_COMPILED_INSTS || max.is_some_and(|m| m as usize > MAX_COMPILED_INSTS)
+        {
+            return Err(RegexError(format!(
+                "正規表現の量指定子が展開上限 ({MAX_COMPILED_INSTS}) を超えています"
+            )));
+        }
+        // 単一文字アトム（Char/Any/Class）の貪欲無制限繰り返しは専用命令へ落とす（T-18）。
+        if max.is_none() && mode == QuantifierMode::Greedy {
+            let atom = match inner {
+                Ast::Char(c) => Some(AtomMatcher::Char(*c)),
+                Ast::Any => Some(AtomMatcher::Any),
+                Ast::Class(cc) => {
+                    let idx = self.classes.len() as u32;
+                    self.classes.push(cc.clone());
+                    Some(AtomMatcher::Class(idx))
+                }
+                _ => None,
+            };
+            if let Some(atom) = atom {
+                self.emit(Inst::GreedyAtomRepeat { atom, min })?;
+                return Ok(());
+            }
+        }
         for _ in 0..min {
-            self.compile(inner);
+            self.compile(inner)?;
         }
         match max {
             Some(m) => {
                 let extra = m.saturating_sub(min);
-                self.compile_optional_chain(inner, extra, mode);
+                self.compile_optional_chain(inner, extra, mode)?;
             }
-            None => self.compile_unbounded_loop(inner, mode),
+            None => self.compile_unbounded_loop(inner, mode)?,
         }
+        Ok(())
     }
 
     /// 「あってもなくても良い」コピーを `remaining` 個、入れ子の `Split` で展開する。
-    fn compile_optional_chain(&mut self, inner: &Ast, remaining: u32, mode: QuantifierMode) {
+    fn compile_optional_chain(
+        &mut self,
+        inner: &Ast,
+        remaining: u32,
+        mode: QuantifierMode,
+    ) -> Result<(), RegexError> {
         if remaining == 0 {
-            return;
+            return Ok(());
+        }
+        if remaining as usize > MAX_COMPILED_INSTS {
+            return Err(RegexError(format!(
+                "正規表現の量指定子が展開上限 ({MAX_COMPILED_INSTS}) を超えています"
+            )));
         }
         let mut splits = Vec::with_capacity(remaining as usize);
         for _ in 0..remaining {
-            let split_pc = self.emit(Inst::Split(0, 0));
+            let split_pc = self.emit(Inst::Split(0, 0))?;
             let body_start = self.here();
             splits.push((split_pc, body_start));
-            self.compile(inner);
+            self.compile(inner)?;
         }
         let after = self.here();
         for (split_pc, body_start) in splits {
             self.patch_split(split_pc, body_start, after, mode);
         }
+        Ok(())
     }
 
     /// `*`/`+`/`{n,}` の無制限部分（Kleene 的ループ）。
-    fn compile_unbounded_loop(&mut self, inner: &Ast, mode: QuantifierMode) {
+    fn compile_unbounded_loop(
+        &mut self,
+        inner: &Ast,
+        mode: QuantifierMode,
+    ) -> Result<(), RegexError> {
         let mark_slot = self.alloc_scratch();
-        let split_pc = self.emit(Inst::Split(0, 0));
+        let split_pc = self.emit(Inst::Split(0, 0))?;
         let body_start = self.here();
-        self.emit(Inst::Save(mark_slot));
-        self.compile(inner);
+        self.emit(Inst::Save(mark_slot))?;
+        self.compile(inner)?;
         self.emit(Inst::LoopBack {
             mark_slot,
             loop_pc: split_pc as u32,
-        });
+        })?;
         let after = self.here();
         self.patch_split(split_pc, body_start, after, mode);
+        Ok(())
     }
 }

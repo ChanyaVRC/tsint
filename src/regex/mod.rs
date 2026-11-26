@@ -54,7 +54,7 @@ mod tests;
 use std::rc::Rc;
 
 use charclass::CharClass;
-use compiler::{Compiler, Inst};
+use compiler::{AtomMatcher, Compiler, Inst};
 use engine::{BacktrackFrame, Exec, Saved, Trail, DEFAULT_MAX_DEPTH, DEFAULT_MAX_STEPS};
 use parser::{count_capturing_groups, Parser};
 
@@ -161,10 +161,10 @@ impl Regex {
         let ast = p.parse_pattern()?;
         let ncaptures = p.ncaptures;
         let mut c = Compiler::new(2 * (ncaptures + 1));
-        c.emit(Inst::Save(0));
-        c.compile(&ast);
-        c.emit(Inst::Save(1));
-        c.emit(Inst::Match);
+        c.emit(Inst::Save(0))?;
+        c.compile(&ast)?;
+        c.emit(Inst::Save(1))?;
+        c.emit(Inst::Match)?;
         for cc in &mut c.classes {
             cc.compile_bitmap(ignore_case);
         }
@@ -210,6 +210,8 @@ impl Regex {
             return Ok(None);
         }
         let nslots = self.total_slots as usize;
+        // 大きな入力での線形走査でステップ上限が誤発火しないよう入力長に比例させる（T-18）。
+        let max_steps = DEFAULT_MAX_STEPS.max((chars.len() as u64).saturating_mul(64));
         let mut exec = Exec::new(
             &self.prog,
             &self.classes,
@@ -217,7 +219,7 @@ impl Regex {
             self.ignore_case,
             self.multiline,
             self.dot_all,
-            DEFAULT_MAX_STEPS,
+            max_steps,
             DEFAULT_MAX_DEPTH,
         );
         scratch.saved.clear();
@@ -313,6 +315,14 @@ fn derive_start_filter(prog: &[Inst], multiline: bool, ignore_case: bool) -> Sta
         Some(Inst::Bol) if !multiline => StartFilter::AnchoredStart,
         Some(Inst::Char(ch)) if !ignore_case => StartFilter::FirstChar(*ch),
         Some(Inst::Class(cc_idx)) => StartFilter::FirstClass(*cc_idx),
+        Some(Inst::GreedyAtomRepeat {
+            atom: AtomMatcher::Char(ch),
+            min,
+        }) if *min >= 1 && !ignore_case => StartFilter::FirstChar(*ch),
+        Some(Inst::GreedyAtomRepeat {
+            atom: AtomMatcher::Class(cc_idx),
+            min,
+        }) if *min >= 1 => StartFilter::FirstClass(*cc_idx),
         _ => StartFilter::None,
     }
 }

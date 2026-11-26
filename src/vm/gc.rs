@@ -62,17 +62,28 @@ impl Vm {
     }
 
     #[inline]
-    pub(super) fn maybe_collect_garbage(&mut self) {
+    pub(super) fn maybe_gc_if_top_level(&mut self) {
         if self.gc_allocs_since_last.get() >= self.gc_threshold {
-            self.collect_garbage();
+            if self.native_call_depth == 0 {
+                self.collect_garbage();
+            } else {
+                // `native_call_depth > 0` の間でも死んだ弱参照だけは刈り取り、
+                // 解放済みオブジェクトの殻が際限なく溜まるのを防ぐ（T-26）。
+                self.prune_dead_gc_weaks();
+            }
         }
     }
 
-    #[inline]
-    pub(super) fn maybe_gc_if_top_level(&mut self) {
-        if self.native_call_depth == 0 {
-            self.maybe_collect_garbage();
+    fn prune_dead_gc_weaks(&mut self) {
+        let mut weaks = self.gc_objects.borrow_mut();
+        weaks.retain(|w| w.strong_count() > 0);
+        let live_count = weaks.len();
+        let cap_limit = live_count.saturating_mul(4).max(GC_MIN_THRESHOLD);
+        if weaks.capacity() > cap_limit {
+            weaks.shrink_to(live_count.saturating_mul(2).max(GC_MIN_THRESHOLD));
         }
+        self.gc_allocs_since_last.set(0);
+        self.gc_threshold = (live_count * 2).max(GC_MIN_THRESHOLD);
     }
 
     /// マーク＋厳密外部参照カウント検査（trial-deletion）による循環参照回収。
@@ -86,12 +97,17 @@ impl Vm {
         for frame in &self.frames {
             gc_visit_frame_raw(frame, &mut |o| gc_mark_obj(o, &mut marked, &mut worklist));
         }
+        for caller_stack in &self.suspended_callers {
+            for frame in caller_stack {
+                gc_visit_frame_raw(frame, &mut |o| gc_mark_obj(o, &mut marked, &mut worklist));
+            }
+        }
         for cell in self.globals.values() {
             if let Ok(v) = cell.try_borrow() {
                 gc_mark_value(&v, &mut marked, &mut worklist);
             }
         }
-        if let Some(exports) = &self.pending_module_exports {
+        for exports in self.pending_module_exports.values() {
             for (_, v) in exports {
                 gc_mark_value(v, &mut marked, &mut worklist);
             }
@@ -190,25 +206,69 @@ impl Vm {
         }
 
         // ---- Phase 3: 候補集合内部の参照カウントを差し引く（trial-deletion） ----
+        // 中間 Rc（FunctionObj / upvalues Vec / Boxed セル / raw_args）についても
+        // 候補内参照数と元の strong_count を突き合わせ、候補外から保持されている
+        // セルや関数が指すオブジェクトは外部参照として保護する（T-1）。
         let mut external_refs: Vec<usize> = candidates
             .iter()
             .map(|(_, rc)| Rc::strong_count(rc).saturating_sub(1))
             .collect();
 
-        let mut dedup = GcDedupState::default();
+        {
+            let mut p3 = Phase3State::default();
 
-        for (i, (_, rc)) in candidates.iter().enumerate() {
-            let Ok(b) = rc.try_borrow() else {
-                external_refs[i] = external_refs[i].saturating_add(1);
-                continue;
-            };
-            gc_visit_obj_data(&b, Some(&mut dedup), &mut |target| {
+            for (i, (_, rc)) in candidates.iter().enumerate() {
+                let Ok(b) = rc.try_borrow() else {
+                    external_refs[i] = external_refs[i].saturating_add(1);
+                    continue;
+                };
+                gc_collect_phase3_edges(&b, &mut p3, &mut |target| {
+                    let tptr = Rc::as_ptr(target) as usize;
+                    if let Some(&tidx) = candidate_idx.get(&tptr) {
+                        debug_assert!(external_refs[tidx] > 0);
+                        external_refs[tidx] = external_refs[tidx].saturating_sub(1);
+                    }
+                });
+            }
+
+            let mut sub_direct = |target: &ObjRef| {
                 let tptr = Rc::as_ptr(target) as usize;
                 if let Some(&tidx) = candidate_idx.get(&tptr) {
                     debug_assert!(external_refs[tidx] > 0);
                     external_refs[tidx] = external_refs[tidx].saturating_sub(1);
                 }
-            });
+            };
+
+            // 候補集合内部のみで完結している FunctionObj の upvalues を数える
+            for (orig_strong, in_cand, fo) in p3.fns.values() {
+                if *in_cand == *orig_strong {
+                    record_rc(&mut p3.upvals, &fo.upvalues);
+                }
+            }
+            // 候補集合内部のみで完結している upvalues Vec の各セルを数える
+            for (orig_strong, in_cand, upvals) in p3.upvals.values() {
+                if *in_cand == *orig_strong {
+                    for cell in upvals.iter() {
+                        record_rc(&mut p3.cells, cell);
+                    }
+                }
+            }
+            // 候補集合内部のみで完結している Boxed セルのみ中身への参照を差し引く
+            for (orig_strong, in_cand, cell) in p3.cells.values() {
+                if *in_cand == *orig_strong {
+                    if let Ok(v) = cell.try_borrow() {
+                        gc_visit_value(&v, &mut sub_direct);
+                    }
+                }
+            }
+            // 候補集合内部のみで完結している raw_args のみ要素への参照を差し引く
+            for (orig_strong, in_cand, raw_args) in p3.raw_args.values() {
+                if *in_cand == *orig_strong {
+                    for v in raw_args.iter() {
+                        gc_visit_value(v, &mut sub_direct);
+                    }
+                }
+            }
         }
 
         // ---- Phase 4: 外部参照が残る候補から到達可能なものをすべて生存保護 ----
@@ -271,6 +331,108 @@ fn gc_mark_value(v: &Value, marked: &mut FastHashSet<usize>, worklist: &mut Vec<
 fn gc_visit_value(v: &Value, f: &mut impl FnMut(&ObjRef)) {
     if let Value::Object(o) = v {
         f(o);
+    }
+}
+
+type RcRefMap<T> = FastHashMap<usize, (usize, usize, Rc<T>)>;
+type UpvaluesVec = Vec<Rc<RefCell<Value>>>;
+
+#[derive(Default)]
+struct Phase3State {
+    fns: RcRefMap<FunctionObj>,
+    upvals: RcRefMap<UpvaluesVec>,
+    cells: RcRefMap<RefCell<Value>>,
+    raw_args: RcRefMap<Vec<Value>>,
+}
+
+fn record_rc<T>(map: &mut FastHashMap<usize, (usize, usize, Rc<T>)>, rc: &Rc<T>) {
+    let ptr = Rc::as_ptr(rc) as usize;
+    if let Some(entry) = map.get_mut(&ptr) {
+        entry.1 += 1;
+    } else {
+        let orig_strong = Rc::strong_count(rc);
+        map.insert(ptr, (orig_strong, 1, rc.clone()));
+    }
+}
+
+fn gc_collect_phase3_edges(b: &ObjData, p3: &mut Phase3State, direct: &mut impl FnMut(&ObjRef)) {
+    gc_visit_props_and_proto(b, direct);
+    match &b.kind {
+        ObjKind::Plain | ObjKind::Error | ObjKind::Regex(_) => {}
+        ObjKind::Array(items) => {
+            for v in items {
+                gc_visit_value(v, direct);
+            }
+        }
+        ObjKind::Map(m) => {
+            for (k, v) in &m.entries {
+                gc_visit_value(k, direct);
+                gc_visit_value(v, direct);
+            }
+        }
+        ObjKind::Set(s) => {
+            for v in &s.values {
+                gc_visit_value(v, direct);
+            }
+        }
+        ObjKind::Function(fo) => record_rc(&mut p3.fns, fo),
+        ObjKind::Native(n) => {
+            for cap in &n.captures {
+                direct(cap);
+            }
+        }
+        ObjKind::Class(cd) => {
+            direct(&cd.prototype);
+            if let Some(ctor) = &cd.ctor {
+                record_rc(&mut p3.fns, ctor);
+            }
+            for (_, init) in cd.instance_fields.iter() {
+                if let Some(fo) = init {
+                    record_rc(&mut p3.fns, fo);
+                }
+            }
+        }
+        ObjKind::Promise(pd) => {
+            match &pd.state {
+                PromiseState::Pending => {}
+                PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => {
+                    gc_visit_value(v, direct);
+                }
+            }
+            for r in &pd.reactions {
+                match r {
+                    PromiseReaction::Then {
+                        on_fulfilled,
+                        on_rejected,
+                        result_promise,
+                    } => {
+                        if let Some(v) = on_fulfilled {
+                            gc_visit_value(v, direct);
+                        }
+                        if let Some(v) = on_rejected {
+                            gc_visit_value(v, direct);
+                        }
+                        direct(result_promise);
+                    }
+                    PromiseReaction::Await(cont) => {
+                        for frame in &cont.frames {
+                            for slot in &frame.locals {
+                                match slot {
+                                    LocalSlot::Direct(v) => gc_visit_value(v, direct),
+                                    LocalSlot::Boxed(cell) => record_rc(&mut p3.cells, cell),
+                                }
+                            }
+                            record_rc(&mut p3.upvals, &frame.upvalues);
+                            for v in &frame.stack {
+                                gc_visit_value(v, direct);
+                            }
+                            record_rc(&mut p3.raw_args, &frame.raw_args);
+                        }
+                        direct(&cont.owner_promise);
+                    }
+                }
+            }
+        }
     }
 }
 

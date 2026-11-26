@@ -45,6 +45,27 @@ pub fn to_number(v: &Value) -> f64 {
     }
 }
 
+fn parse_radix_digits_f64(digits: &str, radix: u32) -> f64 {
+    if digits.is_empty() {
+        return f64::NAN;
+    }
+    let mut acc = 0.0f64;
+    let base = radix as f64;
+    for b in digits.bytes() {
+        let d = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'z' => (b - b'a' + 10) as u32,
+            b'A'..=b'Z' => (b - b'A' + 10) as u32,
+            _ => return f64::NAN,
+        };
+        if d >= radix {
+            return f64::NAN;
+        }
+        acc = acc * base + d as f64;
+    }
+    acc
+}
+
 fn parse_js_number_str(s: &str) -> f64 {
     let t = s.trim();
     if t.is_empty() {
@@ -54,11 +75,18 @@ fn parse_js_number_str(s: &str) -> f64 {
     } else if t == "-Infinity" {
         f64::NEG_INFINITY
     } else if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN)
-    } else {
+        parse_radix_digits_f64(hex, 16)
+    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        parse_radix_digits_f64(bin, 2)
+    } else if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        parse_radix_digits_f64(oct, 8)
+    } else if t
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-' | b'e' | b'E'))
+    {
         t.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        f64::NAN
     }
 }
 
@@ -72,19 +100,20 @@ fn to_number_from_primitive(v: &Value) -> f64 {
 #[inline]
 pub fn to_int32(v: &Value) -> i32 {
     let n = to_number(v);
-    if !n.is_finite() {
+    if !n.is_finite() || n == 0.0 {
         return 0;
     }
-    n as i64 as i32
+    let u = n.trunc().rem_euclid(4_294_967_296.0) as u32;
+    u as i32
 }
 
 #[inline]
 pub fn to_uint32(v: &Value) -> u32 {
     let n = to_number(v);
-    if !n.is_finite() {
+    if !n.is_finite() || n == 0.0 {
         return 0;
     }
-    n as i64 as u32
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 pub fn to_primitive(v: &Value) -> Value {
@@ -168,7 +197,39 @@ pub fn number_to_js_string(n: f64) -> String {
     s
 }
 
+const MAX_TO_STRING_DEPTH: usize = 256;
+
 pub(crate) fn to_string_into(v: &Value, out: &mut String) {
+    match v {
+        Value::Str(s) => out.push_str(s),
+        Value::Number(n) => number_to_js_string_into(*n, out),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Undefined | Value::Uninit => out.push_str("undefined"),
+        Value::Null => out.push_str("null"),
+        Value::Object(_) => {
+            let mut visited = Vec::new();
+            to_string_into_inner(v, out, &mut visited, 0);
+        }
+    }
+}
+
+/// ルートオブジェクト（例: `Array.prototype.join` のレシーバ配列）を訪問済みとして
+/// 事前登録したうえで `to_string_into` を実行する（T-6）。
+pub(crate) fn to_string_into_with_root(v: &Value, root_ptr: usize, out: &mut String) {
+    match v {
+        Value::Str(s) => out.push_str(s),
+        Value::Number(n) => number_to_js_string_into(*n, out),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Undefined | Value::Uninit => out.push_str("undefined"),
+        Value::Null => out.push_str("null"),
+        Value::Object(_) => {
+            let mut visited = vec![root_ptr];
+            to_string_into_inner(v, out, &mut visited, 1);
+        }
+    }
+}
+
+fn to_string_into_inner(v: &Value, out: &mut String, visited: &mut Vec<usize>, depth: usize) {
     use std::fmt::Write;
     match v {
         Value::Str(s) => out.push_str(s),
@@ -180,14 +241,20 @@ pub(crate) fn to_string_into(v: &Value, out: &mut String) {
             let b = o.borrow();
             match &b.kind {
                 ObjKind::Array(items) => {
+                    let ptr = Rc::as_ptr(o) as usize;
+                    if visited.contains(&ptr) || depth >= MAX_TO_STRING_DEPTH {
+                        return;
+                    }
+                    visited.push(ptr);
                     for (i, it) in items.iter().enumerate() {
                         if i > 0 {
                             out.push(',');
                         }
                         if !matches!(it, Value::Undefined | Value::Null | Value::Uninit) {
-                            to_string_into(it, out);
+                            to_string_into_inner(it, out, visited, depth + 1);
                         }
                     }
+                    visited.pop();
                 }
                 ObjKind::Function(f) => {
                     let _ = write!(out, "function {}() {{ [native code] }}", f.name);
@@ -219,19 +286,28 @@ pub(crate) fn to_string_into(v: &Value, out: &mut String) {
                 ObjKind::Map(_) => out.push_str("[object Map]"),
                 ObjKind::Set(_) => out.push_str("[object Set]"),
                 ObjKind::Plain => out.push_str("[object Object]"),
-                ObjKind::Promise(pd) => match &pd.state {
-                    PromiseState::Pending => out.push_str("Promise { <pending> }"),
-                    PromiseState::Fulfilled(v) => {
-                        out.push_str("Promise { ");
-                        to_string_into(v, out);
-                        out.push_str(" }");
+                ObjKind::Promise(pd) => {
+                    let ptr = Rc::as_ptr(o) as usize;
+                    if visited.contains(&ptr) || depth >= MAX_TO_STRING_DEPTH {
+                        out.push_str("Promise { <circular> }");
+                        return;
                     }
-                    PromiseState::Rejected(v) => {
-                        out.push_str("Promise { <rejected> ");
-                        to_string_into(v, out);
-                        out.push_str(" }");
+                    visited.push(ptr);
+                    match &pd.state {
+                        PromiseState::Pending => out.push_str("Promise { <pending> }"),
+                        PromiseState::Fulfilled(v) => {
+                            out.push_str("Promise { ");
+                            to_string_into_inner(v, out, visited, depth + 1);
+                            out.push_str(" }");
+                        }
+                        PromiseState::Rejected(v) => {
+                            out.push_str("Promise { <rejected> ");
+                            to_string_into_inner(v, out, visited, depth + 1);
+                            out.push_str(" }");
+                        }
                     }
-                },
+                    visited.pop();
+                }
             }
         }
     }

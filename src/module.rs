@@ -191,13 +191,13 @@ struct Loader<'i, 'h> {
     cache: FastHashMap<String, Rc<str>>,
     /// resolved specifier -> export 名一覧（`export * from` 用）。
     export_names: FastHashMap<String, Vec<Rc<str>>>,
-    next_id: u32,
 }
 
 impl<'i, 'h> Loader<'i, 'h> {
     fn fresh_name(&mut self, prefix: &str) -> String {
-        self.next_id += 1;
-        format!("__tsint_mod_{prefix}_{}", self.next_id)
+        let vm = self.interp.vm();
+        vm.module_ns_counter = vm.module_ns_counter.wrapping_add(1);
+        format!("__tsint_mod_{prefix}_{}", vm.module_ns_counter)
     }
 
     fn resolve(&self, specifier: &str, referrer: &str) -> Result<String, ModuleError> {
@@ -414,9 +414,17 @@ impl Interpreter {
             host,
             cache: FastHashMap::default(),
             export_names: FastHashMap::default(),
-            next_id: 0,
         };
         let resolved = loader.resolve(entry_specifier, "<entry>")?;
+        // 依存モジュールがエントリ自身を循環 import した際にエントリが二重評価
+        // されるのを防ぐため、依存ロード前にエントリもキャッシュ登録する（T-19）。
+        let entry_ns_name: Rc<str> = Rc::from(loader.fresh_name("ns"));
+        let entry_ns_obj = Value::new_plain_object();
+        loader.cache.insert(resolved.clone(), entry_ns_name.clone());
+        loader
+            .interp
+            .define_global(&entry_ns_name, entry_ns_obj.clone());
+
         let chunk = loader.compile_resolved(&resolved)?;
         let outcome = loader
             .interp
@@ -427,7 +435,15 @@ impl Interpreter {
                 message: loader.interp.vm().to_display_string(&thrown),
             })?;
         Ok(match outcome {
-            ModuleTaskState::Settled(exports) => ModuleOutcome::Settled(exports),
+            ModuleTaskState::Settled(exports) => {
+                if let Value::Object(o) = &entry_ns_obj {
+                    let mut b = o.borrow_mut();
+                    for (k, v) in &exports {
+                        b.props.set_value(k.clone(), v.clone());
+                    }
+                }
+                ModuleOutcome::Settled(exports)
+            }
             ModuleTaskState::Pending => ModuleOutcome::Pending,
         })
     }
